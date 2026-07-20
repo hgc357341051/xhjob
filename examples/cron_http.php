@@ -27,6 +27,12 @@ $taskId = Xhjob::task()
     ->timeout(30)
     ->dispatch();
 
+if (str_starts_with($taskId, 'error:')) {
+    fwrite(STDERR, "Failed to dispatch cron HTTP task: {$taskId}\n");
+    xhjob_stop();
+    exit(1);
+}
+
 echo "Cron HTTP task dispatched.\n";
 echo "Task ID: {$taskId}\n";
 echo "The daemon will fire this URL every minute, even after this PHP script exits.\n";

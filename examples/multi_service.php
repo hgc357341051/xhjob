@@ -29,21 +29,36 @@ $s2 = xhjob_status('queue-svc');
 echo "cron-svc  running={$s1['running']} pid=" . ($s1['pid'] ?? 'N/A') . "\n";
 echo "queue-svc running={$s2['running']} pid=" . ($s2['pid'] ?? 'N/A') . "\n";
 
-// 2. 通过 Xhjob::service($name)->task()->... 链式 API 分别 dispatch
+// 2. 通过 Xhjob::task()->service($name)->... 链式 API 分别 dispatch
+// 注意：service() 是实例方法，必须用 Xhjob::task()->service($name) 顺序调用，
+// 而非 Xhjob::service($name)->task()（后者会把 service 当静态方法调用，触发 fatal error，
+// 且 task() 会返回全新实例、丢弃 service 绑定）。
 $cmd = PHP_OS_FAMILY === 'Windows'
     ? 'cmd /C echo from-cron-svc'
     : 'echo from-cron-svc';
 
-$id1 = Xhjob::service('cron-svc')->task()
+$id1 = Xhjob::task()
+    ->service('cron-svc')
     ->viaShell($cmd)
     ->timeout(10)
     ->dispatch();
+if (str_starts_with($id1, 'error:')) {
+    fwrite(STDERR, "Failed to dispatch cron-svc task: {$id1}\n");
+    xhjob_stop('cron-svc'); xhjob_stop('queue-svc');
+    exit(1);
+}
 echo "cron-svc dispatched: {$id1}\n";
 
-$id2 = Xhjob::service('queue-svc')->task()
+$id2 = Xhjob::task()
+    ->service('queue-svc')
     ->viaShell('echo from-queue-svc')
     ->timeout(10)
     ->dispatch();
+if (str_starts_with($id2, 'error:')) {
+    fwrite(STDERR, "Failed to dispatch queue-svc task: {$id2}\n");
+    xhjob_stop('cron-svc'); xhjob_stop('queue-svc');
+    exit(1);
+}
 echo "queue-svc dispatched: {$id2}\n";
 
 // 3. 轮询各自服务的任务状态

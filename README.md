@@ -174,23 +174,9 @@ ssh new-host 'mkdir -p /var/lib/xhjob && tar xzf /tmp/xhjob-backup-*.tar.gz -C /
 ssh new-host 'php -d extension=xhjob.so -r "xhjob_start(\"cron-svc\", \"/var/lib/xhjob\");"'
 ```
 
-### 函数 API（服务名参数）
-
-所有顶层函数均接受可选的服务名参数：
-
-```php
-xhjob_start(string $name = "default"): bool
-xhjob_stop(string $name = "default"): bool
-xhjob_restart(string $name = "default"): bool
-xhjob_status(string $name = "default"): array
-xhjob_dispatch(string $task_json, string $name = "default"): string
-xhjob_state(string $id, string $name = "default"): array
-xhjob_result(string $id, string $name = "default"): array
-```
-
 ### 链式 API（服务名绑定）
 
-通过 `Xhjob::service($name)->task()->...` 将 builder 绑定到指定服务：
+通过 `Xhjob::task()->service($name)->...` 将 builder 绑定到指定服务：
 
 ```php
 <?php
@@ -198,12 +184,14 @@ xhjob_start('cron-svc');
 xhjob_start('queue-svc');
 
 // dispatch 到 cron-svc
-$id1 = Xhjob::service('cron-svc')->task()
+$id1 = Xhjob::task()
+    ->service('cron-svc')
     ->viaShell('echo hello-from-cron-svc')
     ->dispatch();
 
 // dispatch 到 queue-svc
-$id2 = Xhjob::service('queue-svc')->task()
+$id2 = Xhjob::task()
+    ->service('queue-svc')
     ->viaHttp('GET', 'https://httpbin.org/get')
     ->dispatch();
 
@@ -322,9 +310,9 @@ xhjob_stop();
 | `xhjob_stop($name="default", $data_dir=null): bool` | 停止指定服务的 daemon |
 | `xhjob_restart($name="default", $data_dir=null): bool` | 重启指定服务的 daemon |
 | `xhjob_status($name="default", $data_dir=null): array` | 查询 daemon 运行状态（`running`、`pid`） |
-| `xhjob_dispatch($task_json, $name="default", $data_dir=null): string` | 通过 JSON 字符串 dispatch 任务，返回 task_id |
+| `xhjob_dispatch($task_json, $name="default", $data_dir=null): string` | 通过 JSON 字符串 dispatch 任务，返回 task_id；失败时返回 `error: <msg>` 字符串，用 `str_starts_with($id, 'error:')` 判断 |
 | `xhjob_state($id, $name="default", $data_dir=null): array` | 查询任务状态（`state`、`attempts`、`created_at`、`started_at`、`finished_at`、`last_error`） |
-| `xhjob_result($id, $name="default", $data_dir=null): array` | 查询任务结果（`body`、`status_code`、`stdout`、`stderr`、`exit_code`） |
+| `xhjob_result($id, $name="default", $data_dir=null): array` | 查询任务结果（`body`、`status_code`、`stdout`、`stderr`、`exit_code`）；任务在产出结果前失败时返回 `error` 字段，提示查 `xhjob_state()` 的 `last_error` |
 
 ### `Xhjob` 类（链式 API）
 
@@ -348,7 +336,7 @@ xhjob_stop();
 | `maxInstances(int $n): $this` | 最大并发实例数 |
 | `coalesce(bool $c): $this` | 是否合并错过的触发 |
 | `persist(bool $p): $this` | 是否启用 SQLite 持久化 |
-| `dispatch(): string` | 提交任务到 daemon，返回 task_id |
+| `dispatch(): string` | 提交任务到 daemon，返回 task_id；失败时返回 `error: <msg>` 字符串 |
 
 ## 环境变量
 

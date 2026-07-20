@@ -243,8 +243,12 @@ pub fn spawn_daemon(daemon_main: fn() -> (), service_name: &str, data_dir: Optio
 ///
 /// Returns true if daemon is now running (either already running, or just started).
 pub fn start(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>) -> Result<bool> {
+    // Fast path: a daemon is already running. Check BOTH PID liveness AND IPC
+    // socket readiness — checking only PID is racy when the previous daemon is
+    // shutting down (PID still alive, socket already closed). Without the
+    // socket check, an immediate dispatch would fail with "Connection refused".
     if let Some(pid) = read_pid(service_name, data_dir) {
-        if is_process_alive(pid) {
+        if is_process_alive(pid) && ipc_socket_ready(service_name, data_dir) {
             return Ok(true);
         }
     }

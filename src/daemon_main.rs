@@ -44,10 +44,10 @@ async fn run_daemon() -> Result<()> {
 
     // Choose store
     let use_persist = std::env::var("XHJOB_PERSIST").map(|v| v == "1" || v == "true").unwrap_or(false);
-    let data_dir = crate::service::current_data_dir();
     let store: Arc<dyn TaskStore> = if use_persist {
         #[cfg(feature = "persist")]
         {
+            let data_dir = crate::service::current_data_dir();
             let path = crate::store::db_path_for(&service_name, data_dir.as_deref());
             // Ensure the data directory exists (user-specified data_dir may not exist yet)
             if let Some(parent) = std::path::Path::new(&path).parent() {

@@ -38,9 +38,10 @@ $id3 = Xhjob::task()
     ->dispatch();
 echo "HTTP proxy+auth task dispatched: {$id3}\n";
 
-// 轮询结果
+// 轮询结果（350 次 × 100ms = 35s，略大于任务 timeout 30s）
 foreach ([$id1, $id2, $id3] as $id) {
-    for ($i = 0; $i < 100; $i++) {
+    $polled = false;
+    for ($i = 0; $i < 350; $i++) {
         $s = xhjob_state($id);
         $state = $s['state'] ?? 'UNKNOWN';
         if ($state === 'SUCCESS' || $state === 'FAILED') {
@@ -49,9 +50,13 @@ foreach ([$id1, $id2, $id3] as $id) {
             if (isset($r['status_code'])) echo "  status_code={$r['status_code']}\n";
             if (isset($r['body']))        echo "  body={$r['body']}\n";
             if (isset($r['error']))       echo "  error={$r['error']}\n";
+            $polled = true;
             break;
         }
         usleep(100000);
+    }
+    if (!$polled) {
+        echo "Task {$id}: still pending after 35s polling, exiting\n";
     }
 }
 

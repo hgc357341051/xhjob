@@ -149,7 +149,7 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<
     });
     match result {
         Ok(id) => id,
-        Err(e) => e,
+        Err(e) => format!("error: {}", e),
     }
 }
 
@@ -219,7 +219,7 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
         if let Some(e) = r.stderr { out.push(("stderr".to_string(), e)); }
         if let Some(c) = r.exit_code { out.push(("exit_code".to_string(), c.to_string())); }
     } else {
-        out.push(("error".to_string(), "result not found or daemon not running".to_string()));
+        out.push(("error".to_string(), "no result record for this task (it may have failed before producing output; check xhjob_state() last_error)".to_string()));
     }
     out
 }
