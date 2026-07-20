@@ -5,6 +5,10 @@
 *.so
 *.dll
 *.dylib
+# ...but allow prebuilt release artifacts under releases/
+!releases/*.so
+!releases/*.dll
+!releases/*.dylib
 
 # Cargo lock is kept for binary crates (this is a binary crate)
 # (no ignore for Cargo.lock)
