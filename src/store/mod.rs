@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use tokio::sync::RwLock;
 use crate::errors::{Result, XhjobError};
 
 pub mod in_memory;

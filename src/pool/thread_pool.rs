@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use std::thread;
-use crossbeam_channel::{bounded, unbounded, Sender, Receiver};
+use crossbeam_channel::{bounded, unbounded, Sender};
 use once_cell::sync::OnceCell;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;

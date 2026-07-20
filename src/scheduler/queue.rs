@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::errors::Result;
-use crate::store::{Task, TaskState, TaskStore, now_ts};
+use crate::store::{TaskState, TaskStore, now_ts};
 use crate::executor::dispatch as dispatch_task;
 use crate::pool::coroutine_pool;
 use super::overlap::OverlapController;

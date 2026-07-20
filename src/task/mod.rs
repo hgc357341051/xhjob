@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use crate::errors::{Result, XhjobError};
 use crate::store::{Task, TaskType, HttpPayload, ShellPayload};
-use crate::ipc::{Request, request as ipc_request};
+use crate::ipc::request as ipc_request;
 use crate::store::now_ts;
 
 /// Builder for constructing tasks with a fluent chainable API.

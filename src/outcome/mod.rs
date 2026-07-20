@@ -2,8 +2,8 @@
 
 use serde::{Serialize, Deserialize};
 use crate::errors::{Result, XhjobError};
-use crate::store::{Task, TaskResult, TaskState, TaskStore};
-use crate::ipc::{Request, Response, request as ipc_request};
+use crate::store::{Task, TaskResult, TaskStore};
+use crate::ipc::request as ipc_request;
 
 /// State info returned by `xhjob_state($id)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
