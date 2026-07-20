@@ -79,4 +79,4 @@
 - [x] `git add <指定文件>` 暂存改动
 - [x] `git commit -m "..."` 提交到本地 main
 - [x] `git push origin main` 推送到远程主分支（用户在本地执行）
-- [ ] 推送后 `git log origin/main` 确认远程 HEAD 已更新（待用户本地推送后验证）
+- [x] 推送后 `git log origin/main` 确认远程 HEAD 已更新（`git status` 显示 `Your branch is up to date with 'origin/main'`，本地 `698f794` = 远程 `origin/main`）
