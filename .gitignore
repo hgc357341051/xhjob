@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+
+# Compiled PHP extension binaries
+*.so
+*.dll
+*.dylib
+
+# Cargo lock is kept for binary crates (this is a binary crate)
+# (no ignore for Cargo.lock)
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PHP run-tests.php artifacts (generated .out/.diff/.exp/.log/.sh/.php next to .phpt)
+tests/*.out
+tests/*.diff
+tests/*.exp
+tests/*.log
+tests/*.sh
+tests/*.php.tmp
