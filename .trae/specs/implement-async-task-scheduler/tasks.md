@@ -148,11 +148,11 @@
   - [x] SubTask 24.5: 修改 `src/lib.rs` `dispatch()` 路径，dispatch 前校验 timezone 字符串能否解析为合法 IANA 时区，无效时返回 `['error' => 'invalid timezone: ...']` 且任务不入队
   - [x] SubTask 24.6: 编写单元测试：对同一 cron 表达式分别配置 `Asia/Shanghai` 与 `America/New_York`，断言 next_fire 时间差符合预期（12 或 13 小时）
 
-- [x] Task 25: SQLite schema 自动迁移
-  - [x] SubTask 25.1: 修改 `src/store/sqlite.rs`，启动时执行 `PRAGMA table_info(tasks)` 查询现有列；若缺少 `proxy` / `encoding` / `timezone`，执行 `ALTER TABLE tasks ADD COLUMN <col> TEXT`
+- [x] Task 25: SQLite schema 自动迁移（**已撤销**：项目全新部署无 legacy 数据库，CREATE TABLE IF NOT EXISTS 已包含全部字段，迁移逻辑属过度工程化）
+  - [x] SubTask 25.1: ~~修改 `src/store/sqlite.rs`，启动时执行 `PRAGMA table_info(tasks)` 查询现有列；若缺少 `proxy` / `encoding` / `timezone`，执行 `ALTER TABLE tasks ADD COLUMN <col> TEXT`~~（已删除 migrate_schema 函数）
   - [x] SubTask 25.2: 同步更新 CREATE TABLE 语句，使新库直接包含全部字段
   - [x] SubTask 25.3: 修改 `insert_task` / `load_active_tasks` / `load_task` SQL 语句，包含新增的 proxy / encoding / timezone 列
-  - [x] SubTask 25.4: 编写测试 `tests/migration.phpt`：先用旧 schema 创建数据库（无新列），再启动 daemon，验证自动迁移后任务可正常 dispatch 与查询
+  - [x] SubTask 25.4: ~~编写测试 `tests/migration.phpt`~~（已删除，迁移功能不存在）
 
 - [x] Task 26: 更新文档与发布到主分支
   - [x] SubTask 26.1: 更新 `README.md`：新增「多服务实例」「HTTP 代理」「Shell 编码转换」「Cron 自定义时区」章节与示例代码
@@ -181,5 +181,5 @@
 - Task 20 依赖 Task 13（暴露 HTTP headers/body 链式 API）
 - Task 21 独立（多服务实例改造，影响所有路径计算，需先完成）
 - Task 22、Task 23、Task 24 可并行，均依赖 Task 21（TaskBuilder 字段扩展基础）
-- Task 25 依赖 Task 22 + Task 23 + Task 24（所有新字段确定后实现 schema 迁移）
+- Task 25 已撤销（全新部署无需 schema 迁移，CREATE TABLE 已包含全部字段）
 - Task 26 依赖 Task 21-25 全部完成

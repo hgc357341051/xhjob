@@ -25,9 +25,8 @@
 - 新增 HTTP 代理支持：HTTP 任务可配置 `http://` / `https://` / `socks5://` / `socks5h://` 代理（含 Basic Auth）
 - 新增 Shell 输出转码：shell 任务可指定源编码（如 `GBK`、`auto`），自动转为 UTF-8 解决 Windows cmd 中文乱码
 - 新增 Cron 自定义时区：cron 任务可指定 IANA 时区名（如 `Asia/Shanghai`），不指定则使用系统时区
-- 新增 SQLite schema 自动迁移：旧库启动时自动 ALTER TABLE 补齐 `proxy` / `encoding` / `timezone` 列
 - **BREAKING**：无任何外部依赖（不依赖 supervisor / crontab / Swoole / Redis / 消息队列）
-- **BREAKING**：默认服务实例的 PID/sock/db 路径由 `/tmp/xhjob.pid` 改为 `/tmp/xhjob.default.pid`（多服务实例化改造副作用；旧库可由 schema 迁移恢复任务）
+- **BREAKING**：默认服务实例的 PID/sock/db 路径由 `/tmp/xhjob.pid` 改为 `/tmp/xhjob.default.pid`（多服务实例化改造副作用）
 
 ## Impact
 - Affected specs：本仓库首次落地 spec，无历史 spec 受影响
@@ -340,20 +339,6 @@
 - **WHEN** 任务未调用 `withTimezone()`
 - **THEN** cron 调度器使用 `chrono::Local` 计算 next_fire
 - **AND** 行为与未引入时区功能前一致
-
-### Requirement: SQLite schema 自动迁移
-系统 SHALL 在 SQLite store 启动时检测旧 schema 并自动 ALTER TABLE 补齐新增列，保证已存在任务数据不丢失。
-
-#### Scenario: 旧库迁移
-- **WHEN** daemon 启动时检测到 SQLite 数据库存在但缺少 `proxy` / `encoding` / `timezone` 列
-- **THEN** 系统执行 `ALTER TABLE tasks ADD COLUMN proxy TEXT` / `ADD COLUMN encoding TEXT` / `ADD COLUMN timezone TEXT`
-- **AND** 现有任务记录保留，新列默认为 NULL
-- **AND** 后续新任务可正常使用新字段
-
-#### Scenario: 新库初始化
-- **WHEN** daemon 启动时 SQLite 数据库不存在或为空
-- **THEN** 直接创建包含全部字段的最新 schema（proxy / encoding / timezone 与其他字段一起 CREATE）
-- **AND** 无需迁移步骤
 
 ## MODIFIED Requirements
 

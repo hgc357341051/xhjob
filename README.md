@@ -14,7 +14,6 @@ XHJob 是一个基于 Rust（ext-php-rs 0.15）开发的高性能 PHP 异步任�
 - **HTTP / SOCKS5 代理**（Task 22）：`withProxy('socks5://user:pass@host:port')`
 - **Shell 输出编码转换**（Task 23）：`withEncoding('GBK')`，`auto` 模式自动检测
 - **Cron 自定义时区**（Task 24）：`withTimezone('Asia/Shanghai')`
-- **SQLite schema 自动迁移**（Task 25）：旧库启动时自动补齐新增列
 
 ## 安装
 
@@ -238,24 +237,6 @@ xhjob_stop();
 - 同一 cron 表达式在不同时区下 `next_fire` 时间不同，可用于跨地域任务调度
 
 完整示例参见 `examples/timezone.php`。
-
-## SQLite schema 自动迁移
-
-启用 `persist` feature 后，daemon 启动时会自动打开/创建 SQLite 数据库。对于旧版本创建的数据库（缺少 `proxy` / `encoding` / `timezone` 列），daemon 会通过以下流程自动迁移：
-
-1. 执行 `PRAGMA table_info(tasks)` 查询现有列
-2. 对缺失的列执行 `ALTER TABLE tasks ADD COLUMN <col> TEXT`（SQLite 不支持 `IF NOT EXISTS`）
-3. 全部迁移过程幂等，已迁移的库不会重复操作
-
-新增列与功能对应关系：
-
-| 列名 | 关联功能 | 引入版本 |
-|------|----------|----------|
-| `proxy` | HTTP 代理（Task 22） | v0.2 |
-| `encoding` | Shell 编码转换（Task 23） | v0.2 |
-| `timezone` | Cron 自定义时区（Task 24） | v0.2 |
-
-新创建的数据库直接包含全部列，无需迁移。
 
 ## API 参考
 

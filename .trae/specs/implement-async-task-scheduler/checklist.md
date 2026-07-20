@@ -171,14 +171,12 @@
 - [x] timezone 字段持久化到 SQLite tasks 表
 - [x] 单元测试覆盖多时区 next_fire 计算正确性
 
-## SQLite schema 自动迁移
-- [x] 启动时执行 `PRAGMA table_info(tasks)` 检测现有列
-- [x] 缺少 `proxy` 列时执行 `ALTER TABLE tasks ADD COLUMN proxy TEXT`
-- [x] 缺少 `encoding` 列时执行 `ALTER TABLE tasks ADD COLUMN encoding TEXT`
-- [x] 缺少 `timezone` 列时执行 `ALTER TABLE tasks ADD COLUMN timezone TEXT`
-- [x] 新库 CREATE TABLE 直接包含全部字段
-- [x] 迁移不丢失现有任务数据
-- [x] tests/migration.phpt 通过
+## SQLite schema 自动迁移（已撤销）
+- [x] ~~启动时执行 `PRAGMA table_info(tasks)` 检测现有列~~（已移除：项目全新部署，无 legacy 数据库）
+- [x] ~~缺少 `proxy` / `encoding` / `timezone` 列时执行 ALTER TABLE~~（已移除）
+- [x] 新库 CREATE TABLE 直接包含全部字段（保留：CREATE TABLE IF NOT EXISTS 已覆盖此需求）
+- [x] ~~迁移不丢失现有任务数据~~（已移除）
+- [x] ~~tests/migration.phpt 通过~~（已删除该测试）
 
 ## 文档与发布
 - [x] README.md 新增「多服务实例」「HTTP 代理」「Shell 编码转换」「Cron 自定义时区」章节
