@@ -4,12 +4,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use cron::Schedule;
-<<<<<<< Updated upstream
-use chrono::{TimeZone, Local};
-=======
 use chrono::TimeZone;
 use chrono_tz::Tz;
->>>>>>> Stashed changes
 use crate::errors::{Result, XhjobError};
 use crate::store::TaskStore;
 
@@ -22,8 +18,6 @@ pub struct CronEntry {
     pub next_fire: u64,
 }
 
-<<<<<<< Updated upstream
-=======
 /// Validate that `tz_str` parses as a valid IANA timezone (e.g.
 /// `Asia/Shanghai`, `America/New_York`). Returns `Ok(())` on success.
 pub fn validate_timezone(tz_str: &str) -> Result<()> {
@@ -32,14 +26,10 @@ pub fn validate_timezone(tz_str: &str) -> Result<()> {
         .map_err(|_| XhjobError::Config(format!("invalid timezone: {}", tz_str)))
 }
 
->>>>>>> Stashed changes
 /// Compute the next fire time for a cron expression.
 ///
 /// `cron` 0.12 requires 6 fields (sec min hour day month weekday). If the user
 /// supplied 5 fields we prepend a `0` seconds field.
-<<<<<<< Updated upstream
-pub fn next_fire(cron_expr: &str, seconds: bool, from_ts: u64) -> Result<u64> {
-=======
 ///
 /// `timezone` controls how `from_ts` (a Unix timestamp) is interpreted when
 /// matching the cron pattern:
@@ -53,7 +43,6 @@ pub fn next_fire(
     from_ts: u64,
     timezone: Option<&str>,
 ) -> Result<u64> {
->>>>>>> Stashed changes
     let _ = seconds;
     let normalized = if cron_expr.split_whitespace().count() >= 6 {
         cron_expr.to_string()
@@ -64,15 +53,6 @@ pub fn next_fire(
     let schedule = Schedule::from_str(&normalized)
         .map_err(|e| XhjobError::CronParse(format!("parse '{}': {}", cron_expr, e)))?;
 
-<<<<<<< Updated upstream
-    let from_dt = Local.timestamp_opt(from_ts as i64, 0).single()
-        .ok_or_else(|| XhjobError::CronParse(format!("invalid from_ts: {}", from_ts)))?;
-
-    let next = schedule.after(&from_dt).next()
-        .ok_or_else(|| XhjobError::CronParse(format!("no future fire time for '{}'", cron_expr)))?;
-
-    Ok(next.timestamp() as u64)
-=======
     let next_ts: i64 = match timezone {
         Some(tz_str) => {
             let tz: Tz = tz_str.parse()
@@ -93,7 +73,6 @@ pub fn next_fire(
     };
 
     Ok(next_ts as u64)
->>>>>>> Stashed changes
 }
 
 /// Default misfire grace window in seconds. Tasks that missed their fire time by
@@ -131,20 +110,12 @@ impl CronScheduler {
         let mut due = Vec::new();
         for task in active {
             if let Some(cron_expr) = &task.cron {
-<<<<<<< Updated upstream
-=======
                 let tz_ref = task.timezone.as_deref();
->>>>>>> Stashed changes
                 // Check if next_fire is due
                 let next = match task.next_fire {
                     Some(t) => t,
                     None => {
                         // Compute next fire if missing
-<<<<<<< Updated upstream
-                        match next_fire(cron_expr, false, now) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-=======
                         match next_fire(cron_expr, false, now, tz_ref) {
                             Ok(t) => t,
                             Err(e) => {
@@ -156,7 +127,6 @@ impl CronScheduler {
                                 );
                                 continue;
                             }
->>>>>>> Stashed changes
                         }
                     }
                 };
@@ -174,10 +144,6 @@ impl CronScheduler {
                     }
                     // Either way, roll next_fire forward to the next occurrence
                     // so we don't keep re-evaluating the stale fire time.
-<<<<<<< Updated upstream
-                    if let Ok(new_next) = next_fire(cron_expr, false, now + 1) {
-                        let _ = self.store.update_next_fire(&task.id, Some(new_next)).await;
-=======
                     if let Ok(new_next) = next_fire(cron_expr, false, now + 1, tz_ref) {
                         let _ = self.store.update_next_fire(&task.id, Some(new_next)).await;
                     } else {
@@ -186,7 +152,6 @@ impl CronScheduler {
                             cron = %cron_expr,
                             "failed to roll next_fire forward during scan"
                         );
->>>>>>> Stashed changes
                     }
                 }
             }
@@ -237,10 +202,7 @@ fn now_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< Updated upstream
-=======
     use chrono::Timelike;
->>>>>>> Stashed changes
     use crate::store::{InMemoryStore, Task, TaskType};
 
     #[test]
@@ -333,11 +295,6 @@ mod tests {
         // returns a later timestamp (not the same one). This exercises the
         // Local.timestamp_opt path.
         let now = now_ts();
-<<<<<<< Updated upstream
-        let next = next_fire("0 9 * * *", false, now).unwrap();
-        assert!(next > now, "next_fire should be in the future: now={} next={}", now, next);
-    }
-=======
         let next = next_fire("0 9 * * *", false, now, None).unwrap();
         assert!(next > now, "next_fire should be in the future: now={} next={}", now, next);
     }
@@ -429,5 +386,4 @@ mod tests {
         assert!(validate_timezone("NotAZone").is_err());
         assert!(validate_timezone("").is_err());
     }
->>>>>>> Stashed changes
 }

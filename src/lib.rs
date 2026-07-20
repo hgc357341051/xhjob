@@ -11,28 +11,16 @@ pub mod outcome;
 pub mod pool;
 pub mod retry;
 pub mod scheduler;
-<<<<<<< Updated upstream
-pub mod store;
-pub mod task;
-
-=======
 pub mod service;
 pub mod store;
 pub mod task;
 
 pub use service::ServiceName;
 
->>>>>>> Stashed changes
 // =========================================================================
 // PHP functions
 // =========================================================================
 
-<<<<<<< Updated upstream
-#[php_function]
-pub fn xhjob_start() -> bool {
-    // Check if daemon is already running
-    let status = daemon::status();
-=======
 /// Resolve and validate a PHP-supplied service name. `None` falls back to the
 /// default service. Returns the validated name as a `String`.
 fn resolve_service_name(name: Option<String>) -> Result<String, String> {
@@ -51,16 +39,11 @@ pub fn xhjob_start(name: Option<String>) -> bool {
     };
     // Check if daemon is already running
     let status = daemon::status(&service_name);
->>>>>>> Stashed changes
     if status.running {
         return true;
     }
     // Spawn daemon. daemon_main is the function the daemon will run.
-<<<<<<< Updated upstream
-    match daemon::start(daemon_main::daemon_main) {
-=======
     match daemon::start(daemon_main::daemon_main, &service_name) {
->>>>>>> Stashed changes
         Ok(true) => true,
         Ok(false) => {
             // Failed to start within timeout
@@ -74,10 +57,6 @@ pub fn xhjob_start(name: Option<String>) -> bool {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_stop() -> bool {
-    match daemon::stop() {
-=======
 pub fn xhjob_stop(name: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
@@ -87,7 +66,6 @@ pub fn xhjob_stop(name: Option<String>) -> bool {
         }
     };
     match daemon::stop(&service_name) {
->>>>>>> Stashed changes
         Ok(_) => true,
         Err(e) => {
             tracing::error!("xhjob_stop failed: {}", e);
@@ -97,10 +75,6 @@ pub fn xhjob_stop(name: Option<String>) -> bool {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_restart() -> bool {
-    match daemon::restart(daemon_main::daemon_main) {
-=======
 pub fn xhjob_restart(name: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
@@ -110,7 +84,6 @@ pub fn xhjob_restart(name: Option<String>) -> bool {
         }
     };
     match daemon::restart(daemon_main::daemon_main, &service_name) {
->>>>>>> Stashed changes
         Ok(_) => true,
         Err(e) => {
             tracing::error!("xhjob_restart failed: {}", e);
@@ -120,10 +93,6 @@ pub fn xhjob_restart(name: Option<String>) -> bool {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_status() -> Vec<(String, String)> {
-    let status = daemon::status();
-=======
 pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
@@ -135,7 +104,6 @@ pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
         }
     };
     let status = daemon::status(&service_name);
->>>>>>> Stashed changes
     let mut out: Vec<(String, String)> = Vec::new();
     out.push(("running".to_string(), status.running.to_string()));
     if let Some(pid) = status.pid {
@@ -145,15 +113,11 @@ pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_dispatch(task_json: String) -> String {
-=======
 pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => return e,
     };
->>>>>>> Stashed changes
     // Build a one-shot request to the daemon and return the task_id (or error string).
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
@@ -162,11 +126,7 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
     let result: std::result::Result<String, String> = rt.block_on(async move {
         let payload: serde_json::Value = serde_json::from_str(&task_json)
             .map_err(|e| format!("invalid json: {}", e))?;
-<<<<<<< Updated upstream
-        let resp = ipc::request("dispatch", payload).await
-=======
         let resp = ipc::request("dispatch", payload, &service_name).await
->>>>>>> Stashed changes
             .map_err(|e| format!("{}", e))?;
         if !resp.ok {
             return Err(resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -184,9 +144,6 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_state(id: String) -> Vec<(String, String)> {
-=======
 pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
@@ -197,17 +154,12 @@ pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
             return out;
         }
     };
->>>>>>> Stashed changes
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let info = rt.block_on(async move {
-<<<<<<< Updated upstream
-        match outcome::query_state(&id).await {
-=======
         match outcome::query_state(&id, &service_name).await {
->>>>>>> Stashed changes
             Ok(info) => Some(info),
             Err(_) => None,
         }
@@ -228,9 +180,6 @@ pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
 }
 
 #[php_function]
-<<<<<<< Updated upstream
-pub fn xhjob_result(id: String) -> Vec<(String, String)> {
-=======
 pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
@@ -240,17 +189,12 @@ pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
             return out;
         }
     };
->>>>>>> Stashed changes
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let result = rt.block_on(async move {
-<<<<<<< Updated upstream
-        match outcome::query_result(&id).await {
-=======
         match outcome::query_result(&id, &service_name).await {
->>>>>>> Stashed changes
             Ok(r) => Some(r),
             Err(_) => None,
         }
@@ -269,10 +213,32 @@ pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
 }
 
 /// Hidden entry point invoked when the PHP binary is re-executed by
-/// `spawn_via_double_fork` with `XHJOB_DAEMON_MODE=1`. Runs the daemon loop
-/// in the current process and never returns.
+/// `spawn_via_double_fork` (Unix) or `spawn_via_create_process` (Windows).
+/// Runs the daemon loop in the current process and never returns.
+///
+/// The optional `service_name` argument is the primary propagation path for
+/// the service identity: the spawner encodes it into the `-r` code string
+/// (e.g. `xhjob_run_daemon('cron-svc');`) so it survives PHP version-manager
+/// shim re-execs that may scrub env vars set via `Command::env()`. When
+/// provided, the name is validated and installed via `service::set_current()`
+/// before `daemon_main()` runs, so all derived paths (PID file, IPC socket,
+/// log file, store) are keyed correctly.
+///
+/// When `None`, the service name falls back to `service::current()`'s env-var
+/// path (`XHJOB_SERVICE_NAME`) and finally to `"default"`, preserving
+/// backward compatibility with callers that spawn the daemon through other
+/// paths.
 #[php_function]
-pub fn xhjob_run_daemon() -> bool {
+pub fn xhjob_run_daemon(service_name: Option<String>) -> bool {
+    if let Some(name) = service_name {
+        match service::validate(&name) {
+            Ok(validated) => service::set_current(validated),
+            Err(e) => {
+                tracing::error!("xhjob_run_daemon invalid service name: {}", e);
+                return false;
+            }
+        }
+    }
     // Std streams were detached by the spawn (Stdio::null). Reopen them to
     // the log file so tracing output is captured.
     #[cfg(unix)]
@@ -287,12 +253,8 @@ pub fn xhjob_run_daemon() -> bool {
 fn reopen_std_streams_for_daemon() {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-<<<<<<< Updated upstream
-    let log = daemon::log_file_path();
-=======
     let service_name = crate::service::current();
     let log = daemon::log_file_path(&service_name);
->>>>>>> Stashed changes
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -331,8 +293,6 @@ impl Xhjob {
         Xhjob { builder: task::TaskBuilder::new() }
     }
 
-<<<<<<< Updated upstream
-=======
     /// Bind this Xhjob instance to a named service. Subsequent `dispatch()`
     /// will route to the daemon for that service. Returns `&mut self` for
     /// chaining. Exposed as `service()` in PHP.
@@ -341,7 +301,6 @@ impl Xhjob {
         self
     }
 
->>>>>>> Stashed changes
     pub fn via_http(&mut self, method: String, url: String) -> &mut Self {
         self.builder = std::mem::take(&mut self.builder).via_http(method, url);
         self
@@ -367,8 +326,6 @@ impl Xhjob {
         self
     }
 
-<<<<<<< Updated upstream
-=======
     /// Set HTTP/SOCKS5 proxy URL for HTTP tasks. Exposed as `withProxy()` in PHP.
     /// Accepted schemes: `http://`, `https://`, `socks5://`, `socks5h://`.
     /// The URL may include `user:pass@` credentials.
@@ -398,7 +355,6 @@ impl Xhjob {
         self
     }
 
->>>>>>> Stashed changes
     pub fn via_shell(&mut self, cmd: String) -> &mut Self {
         self.builder = std::mem::take(&mut self.builder).via_shell(cmd);
         self

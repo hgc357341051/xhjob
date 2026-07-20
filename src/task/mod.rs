@@ -33,8 +33,6 @@ pub struct TaskBuilder {
     pub max_instances: u32,
     pub coalesce: bool,
     pub persist: bool,
-<<<<<<< Updated upstream
-=======
     /// Service name this builder dispatches to. Defaults to "default".
     #[serde(default = "default_service_name")]
     pub service_name: String,
@@ -54,7 +52,6 @@ pub struct TaskBuilder {
 
 fn default_service_name() -> String {
     "default".to_string()
->>>>>>> Stashed changes
 }
 
 impl Default for TaskBuilder {
@@ -71,13 +68,10 @@ impl Default for TaskBuilder {
             max_instances: 1,
             coalesce: true,
             persist: false,
-<<<<<<< Updated upstream
-=======
             service_name: default_service_name(),
             proxy: None,
             encoding: None,
             timezone: None,
->>>>>>> Stashed changes
         }
     }
 }
@@ -85,8 +79,6 @@ impl Default for TaskBuilder {
 impl TaskBuilder {
     pub fn new() -> Self { Self::default() }
 
-<<<<<<< Updated upstream
-=======
     /// Bind this builder to the named service. The dispatch path will resolve
     /// to that service's IPC socket.
     pub fn service(mut self, name: impl Into<String>) -> Self {
@@ -119,7 +111,6 @@ impl TaskBuilder {
         self
     }
 
->>>>>>> Stashed changes
     /// Set task type to HTTP with method + url.
     pub fn via_http(mut self, method: impl Into<String>, url: impl Into<String>) -> Self {
         let payload = HttpPayload {
@@ -227,18 +218,12 @@ impl TaskBuilder {
         task.max_instances = self.max_instances;
         task.coalesce = self.coalesce;
         task.persist = self.persist;
-<<<<<<< Updated upstream
-        // If cron, compute initial next_fire
-        if let Some(expr) = &task.cron {
-            match crate::scheduler::cron::next_fire(expr, false, now_ts()) {
-=======
         task.proxy = self.proxy;
         task.encoding = self.encoding;
         task.timezone = self.timezone;
         // If cron, compute initial next_fire
         if let Some(expr) = &task.cron {
             match crate::scheduler::cron::next_fire(expr, false, now_ts(), task.timezone.as_deref()) {
->>>>>>> Stashed changes
                 Ok(t) => task.next_fire = Some(t),
                 Err(e) => {
                     tracing::warn!(cron = %expr, error = %e, "failed to compute initial next_fire");
@@ -260,12 +245,6 @@ impl TaskBuilder {
     }
 
     /// Dispatch the task to the daemon via IPC. Returns task_id.
-<<<<<<< Updated upstream
-    pub async fn dispatch(self) -> Result<String> {
-        let json = serde_json::to_value(&self)
-            .map_err(|e| XhjobError::InvalidTask(format!("serialize: {}", e)))?;
-        let resp = ipc_request("dispatch", json).await?;
-=======
     ///
     /// Routes to the daemon for `self.service_name`.
     pub async fn dispatch(self) -> Result<String> {
@@ -277,7 +256,6 @@ impl TaskBuilder {
         let json = serde_json::to_value(&self)
             .map_err(|e| XhjobError::InvalidTask(format!("serialize: {}", e)))?;
         let resp = ipc_request("dispatch", json, &self.service_name).await?;
->>>>>>> Stashed changes
         if !resp.ok {
             return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown error".to_string())));
         }

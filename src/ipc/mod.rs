@@ -9,17 +9,6 @@ pub mod unix_socket;
 #[cfg(windows)]
 pub mod named_pipe;
 
-<<<<<<< Updated upstream
-/// Default IPC path (overridable by XHJOB_SOCK env var).
-pub fn ipc_path() -> String {
-    if let Ok(p) = std::env::var("XHJOB_SOCK") {
-        return p;
-    }
-    #[cfg(unix)]
-    { "/tmp/xhjob.sock".to_string() }
-    #[cfg(windows)]
-    { r"\\.\pipe\xhjob".to_string() }
-=======
 /// IPC path derived from `service_name`.
 ///
 /// Unix: `${XHJOB_SOCK_DIR:-/tmp}/xhjob.{name}.sock`
@@ -37,7 +26,6 @@ pub fn ipc_path(service_name: &str) -> String {
     {
         format!(r"\\.\pipe\xhjob-{}", service_name)
     }
->>>>>>> Stashed changes
 }
 
 /// Frame protocol: length-prefixed JSON.
@@ -114,34 +102,6 @@ pub trait IpcListener: Send + Sync {
 pub trait IpcStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 
 /// Spawn the appropriate listener for the current platform.
-<<<<<<< Updated upstream
-pub async fn bind_listener() -> Result<Box<dyn IpcListener>> {
-    #[cfg(unix)]
-    {
-        Ok(Box::new(unix_socket::UnixListenerWrapper::bind().await?))
-    }
-    #[cfg(windows)]
-    {
-        Ok(Box::new(named_pipe::NamedPipeListenerWrapper::bind()?))
-    }
-}
-
-/// Connect to the daemon (client side). Returns a stream.
-pub async fn connect() -> Result<Box<dyn IpcStream>> {
-    #[cfg(unix)]
-    {
-        unix_socket::UnixStreamWrapper::connect().await
-    }
-    #[cfg(windows)]
-    {
-        named_pipe::NamedPipeClientWrapper::connect()
-    }
-}
-
-/// Helper: send one request and receive one response (short connection).
-pub async fn request(op: &str, payload: serde_json::Value) -> Result<Response> {
-    let mut stream = connect().await?;
-=======
 ///
 /// The daemon-side listener binds to the path derived from `service::current()`,
 /// which is set via `XHJOB_SERVICE_NAME` by the spawning parent process.
@@ -177,7 +137,6 @@ pub async fn request(
     service_name: &str,
 ) -> Result<Response> {
     let mut stream = connect(service_name).await?;
->>>>>>> Stashed changes
     let req = Request {
         id: rand_id(),
         op: op.to_string(),

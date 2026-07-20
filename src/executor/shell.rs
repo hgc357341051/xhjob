@@ -22,10 +22,7 @@ impl Executor for ShellExecutor {
     fn execute(&self, task: &Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + '_>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
-<<<<<<< Updated upstream
-=======
         let encoding = task.encoding.clone();
->>>>>>> Stashed changes
         Box::pin(async move {
             let payload: ShellPayload = serde_json::from_value(payload_val)
                 .map_err(|e| XhjobError::Exec(format!("invalid shell payload: {}", e)))?;
@@ -52,21 +49,13 @@ impl Executor for ShellExecutor {
                         use tokio::io::AsyncReadExt;
                         let mut buf = Vec::new();
                         let _ = s.read_to_end(&mut buf).await;
-<<<<<<< Updated upstream
-                        String::from_utf8_lossy(&buf).to_string()
-=======
                         decode_output(&buf, encoding.as_ref())?
->>>>>>> Stashed changes
                     } else { String::new() };
                     let stderr_text = if let Some(mut s) = stderr_fut {
                         use tokio::io::AsyncReadExt;
                         let mut buf = Vec::new();
                         let _ = s.read_to_end(&mut buf).await;
-<<<<<<< Updated upstream
-                        String::from_utf8_lossy(&buf).to_string()
-=======
                         decode_output(&buf, encoding.as_ref())?
->>>>>>> Stashed changes
                     } else { String::new() };
                     let code = status.code().unwrap_or(-1);
                     (stdout_text, stderr_text, code)
@@ -92,8 +81,6 @@ impl Executor for ShellExecutor {
     }
 }
 
-<<<<<<< Updated upstream
-=======
 /// Decode captured shell output bytes into a UTF-8 `String`.
 ///
 /// If `encoding` is `None`, falls back to the historical lossy UTF-8 behavior.
@@ -166,7 +153,6 @@ fn detect_encoding() -> &'static str {
     }
 }
 
->>>>>>> Stashed changes
 /// Build the platform-specific command.
 fn build_command(cmd: &str) -> tokio::process::Command {
     #[cfg(unix)]
@@ -192,8 +178,6 @@ pub fn configured_timeout() -> u64 {
     }
     300
 }
-<<<<<<< Updated upstream
-=======
 
 #[cfg(test)]
 mod tests {
@@ -250,4 +234,3 @@ mod tests {
         assert!(msg.contains("unsupported encoding"), "unexpected error: {}", msg);
     }
 }
->>>>>>> Stashed changes

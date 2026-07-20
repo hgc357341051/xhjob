@@ -12,10 +12,7 @@ pub enum XhjobError {
     InvalidTask(String),
     CronParse(String),
     Exec(String),
-<<<<<<< Updated upstream
-=======
     Config(String),
->>>>>>> Stashed changes
 }
 
 impl fmt::Display for XhjobError {
@@ -30,10 +27,7 @@ impl fmt::Display for XhjobError {
             XhjobError::InvalidTask(s) => write!(f, "invalid task: {}", s),
             XhjobError::CronParse(s) => write!(f, "cron parse: {}", s),
             XhjobError::Exec(s) => write!(f, "exec: {}", s),
-<<<<<<< Updated upstream
-=======
             XhjobError::Config(s) => write!(f, "config: {}", s),
->>>>>>> Stashed changes
         }
     }
 }

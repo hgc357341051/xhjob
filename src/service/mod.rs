@@ -5,9 +5,23 @@
 //! name, allowing multiple independent daemons to coexist on the same host.
 //!
 //! The active service name is propagated from the PHP parent process to the
-//! spawned daemon via the `XHJOB_SERVICE_NAME` environment variable.
+//! spawned daemon via two mechanisms:
+//!   1. A global once-cell set by `xhjob_run_daemon(Some(name))` (primary
+//!      path; the name is encoded into the `-r` code string so it survives
+//!      PHP version-manager shim re-execs that may scrub env vars).
+//!   2. The `XHJOB_SERVICE_NAME` environment variable (backward-compatible
+//!      fallback for callers that spawn the daemon through other paths).
+
+use std::sync::OnceLock;
 
 use crate::errors::{Result, XhjobError};
+
+/// Process-global storage for the current service name.
+///
+/// Set once by `set_current()` (called from `xhjob_run_daemon(Some(name))`)
+/// at daemon startup. Once set, `current()` returns this value, taking
+/// precedence over the `XHJOB_SERVICE_NAME` env var.
+static CURRENT_SERVICE: OnceLock<String> = OnceLock::new();
 
 /// Newtype wrapping a validated service name string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,12 +75,31 @@ pub fn validate(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// Set the current service name globally for this process.
+///
+/// Intended to be called once at daemon startup from
+/// `xhjob_run_daemon(Some(name))` when the service name is delivered via the
+/// `-r` command-line code string (the primary propagation path that survives
+/// PHP version-manager shim re-execs). Subsequent calls are no-ops: the first
+/// caller wins, which matches the daemon-startup semantics (the service name
+/// is fixed for the lifetime of the daemon process).
+pub fn set_current(name: String) {
+    let _ = CURRENT_SERVICE.set(name);
+}
+
 /// Return the service name for the current process.
 ///
-/// Reads the `XHJOB_SERVICE_NAME` environment variable. When unset (for
-/// example, in a PHP parent process that has not explicitly set a service),
-/// returns `default_name()`.
+/// Resolution order:
+///   1. A name explicitly set via `set_current()` (e.g. by
+///      `xhjob_run_daemon(Some(name))` when the name was passed as a
+///      command-line argument).
+///   2. The `XHJOB_SERVICE_NAME` environment variable (set by the spawner
+///      when env-var propagation works).
+///   3. `default_name()` (`"default"`).
 pub fn current() -> String {
+    if let Some(name) = CURRENT_SERVICE.get() {
+        return name.clone();
+    }
     std::env::var("XHJOB_SERVICE_NAME")
         .ok()
         .filter(|s| !s.is_empty())

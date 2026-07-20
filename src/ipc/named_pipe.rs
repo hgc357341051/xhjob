@@ -11,13 +11,8 @@ pub struct NamedPipeListenerWrapper {
 }
 
 impl NamedPipeListenerWrapper {
-<<<<<<< Updated upstream
-    pub fn bind() -> Result<Self> {
-        let pipe_name = ipc_path();
-=======
     pub fn bind(service_name: &str) -> Result<Self> {
         let pipe_name = ipc_path(service_name);
->>>>>>> Stashed changes
         let first = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&pipe_name)
@@ -53,13 +48,8 @@ impl IpcListener for NamedPipeListenerWrapper {
 pub struct NamedPipeClientWrapper;
 
 impl NamedPipeClientWrapper {
-<<<<<<< Updated upstream
-    pub fn connect() -> Result<Box<dyn IpcStream>> {
-        let pipe_name = ipc_path();
-=======
     pub fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
         let pipe_name = ipc_path(service_name);
->>>>>>> Stashed changes
         let client = NamedPipeClient::connect(&pipe_name)
             .map_err(|e| XhjobError::Ipc(format!("client connect {}: {}", pipe_name, e)))?;
         Ok(Box::new(client))

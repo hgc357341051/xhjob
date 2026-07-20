@@ -10,13 +10,8 @@ pub struct UnixListenerWrapper {
 }
 
 impl UnixListenerWrapper {
-<<<<<<< Updated upstream
-    pub async fn bind() -> Result<Self> {
-        let path = ipc_path();
-=======
     pub async fn bind(service_name: &str) -> Result<Self> {
         let path = ipc_path(service_name);
->>>>>>> Stashed changes
         // remove stale socket file
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)
@@ -41,13 +36,8 @@ impl IpcListener for UnixListenerWrapper {
 pub struct UnixStreamWrapper;
 
 impl UnixStreamWrapper {
-<<<<<<< Updated upstream
-    pub async fn connect() -> Result<Box<dyn IpcStream>> {
-        let path = ipc_path();
-=======
     pub async fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
         let path = ipc_path(service_name);
->>>>>>> Stashed changes
         // try tokio UnixStream first
         match UnixStream::connect(&path).await {
             Ok(s) => Ok(Box::new(s)),

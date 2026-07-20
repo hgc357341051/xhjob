@@ -42,14 +42,10 @@ impl SqliteStore {
                 created_at    INTEGER NOT NULL,
                 started_at    INTEGER,
                 finished_at   INTEGER,
-<<<<<<< Updated upstream
-                last_error    TEXT
-=======
                 last_error    TEXT,
                 proxy         TEXT,
                 encoding      TEXT,
                 timezone      TEXT
->>>>>>> Stashed changes
             );
             CREATE TABLE IF NOT EXISTS results (
                 task_id      TEXT PRIMARY KEY,
@@ -64,19 +60,14 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_next_fire ON tasks(next_fire);
             "#,
         ).map_err(|e| XhjobError::Store(format!("create schema: {}", e)))?;
-<<<<<<< Updated upstream
-=======
         // Migrate legacy databases that predate the proxy/encoding/timezone
         // columns. CREATE TABLE IF NOT EXISTS is a no-op for existing DBs,
         // so we must ALTER TABLE explicitly to add the missing columns.
         migrate_schema(&conn)?;
->>>>>>> Stashed changes
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
 
-<<<<<<< Updated upstream
-=======
 /// Add any missing `proxy` / `encoding` / `timezone` columns to the `tasks`
 /// table. SQLite's `ALTER TABLE ADD COLUMN` does not support `IF NOT EXISTS`,
 /// so we introspect via `PRAGMA table_info` and only add what's missing.
@@ -105,7 +96,6 @@ fn migrate_schema(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
->>>>>>> Stashed changes
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let type_str: String = row.get("type")?;
     let task_type = match type_str.as_str() {
@@ -137,14 +127,11 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         max_instances: row.get("max_instances")?,
         coalesce: row.get::<_, i64>("coalesce")? != 0,
         persist: row.get::<_, i64>("persist")? != 0,
-<<<<<<< Updated upstream
-=======
         // These columns may be NULL for legacy rows that predate Task 25;
         // rusqlite transparently maps SQL NULL to Option::<String>::None.
         proxy: row.get("proxy")?,
         encoding: row.get("encoding")?,
         timezone: row.get("timezone")?,
->>>>>>> Stashed changes
         state,
         attempts: row.get("attempts")?,
         next_fire: row.get("next_fire")?,
@@ -166,24 +153,16 @@ impl TaskStore for SqliteStore {
                 "INSERT OR REPLACE INTO tasks
                  (id, type, payload, cron, retry_max, retry_delay, timeout, priority,
                   allow_overlap, max_instances, coalesce, persist, state, attempts,
-<<<<<<< Updated upstream
-                  next_fire, created_at, started_at, finished_at, last_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-=======
                   next_fire, created_at, started_at, finished_at, last_error,
                   proxy, encoding, timezone)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
->>>>>>> Stashed changes
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,
                     task.allow_overlap as i64, task.max_instances, task.coalesce as i64, task.persist as i64,
                     state_str, task.attempts, task.next_fire,
                     task.created_at, task.started_at, task.finished_at, task.last_error,
-<<<<<<< Updated upstream
-=======
                     task.proxy, task.encoding, task.timezone,
->>>>>>> Stashed changes
                 ],
             ).map_err(|e| XhjobError::Store(format!("insert: {}", e)))?;
             Ok(())
@@ -317,8 +296,6 @@ impl TaskStore for SqliteStore {
         })
     }
 }
-<<<<<<< Updated upstream
-=======
 
 #[cfg(test)]
 mod tests {
@@ -440,4 +417,3 @@ mod tests {
         assert!(cols.contains("timezone"));
     }
 }
->>>>>>> Stashed changes

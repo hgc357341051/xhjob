@@ -109,8 +109,6 @@ pub struct Task {
     pub max_instances: u32,
     pub coalesce: bool,
     pub persist: bool,
-<<<<<<< Updated upstream
-=======
     /// Optional proxy URL for HTTP tasks. None = direct connection.
     #[serde(default)]
     pub proxy: Option<String>,
@@ -122,7 +120,6 @@ pub struct Task {
     /// when evaluating the cron expression. None = system local timezone.
     #[serde(default)]
     pub timezone: Option<String>,
->>>>>>> Stashed changes
     pub state: TaskState,
     pub attempts: u32,
     pub next_fire: Option<u64>, // Unix timestamp
@@ -148,12 +145,9 @@ impl Task {
             max_instances: 1,
             coalesce: true,
             persist: false,
-<<<<<<< Updated upstream
-=======
             proxy: None,
             encoding: None,
             timezone: None,
->>>>>>> Stashed changes
             state: TaskState::Pending,
             attempts: 0,
             next_fire: None,
@@ -205,22 +199,6 @@ pub fn make_store(use_persist: bool, db_path: Option<&str>) -> Result<Arc<dyn Ta
     Ok(Arc::new(InMemoryStore::new()))
 }
 
-<<<<<<< Updated upstream
-fn default_db_path() -> String {
-    if let Ok(p) = std::env::var("XHJOB_DB") {
-        return p;
-    }
-    #[cfg(unix)]
-    { "/tmp/xhjob.db".to_string() }
-    #[cfg(windows)]
-    {
-        let mut p = std::env::temp_dir();
-        p.push("xhjob.db");
-        p.to_string_lossy().to_string()
-    }
-}
-
-=======
 /// Compute the default SQLite DB path for `service_name`.
 ///
 /// Unix: `${XHJOB_DB_DIR:-/tmp}/xhjob.{name}.db`
@@ -248,7 +226,6 @@ fn default_db_path() -> String {
     db_path_for(&crate::service::current())
 }
 
->>>>>>> Stashed changes
 pub fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

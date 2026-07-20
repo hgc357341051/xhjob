@@ -35,32 +35,19 @@ async fn run_daemon() -> Result<()> {
     #[cfg(windows)]
     { crate::daemon::windows::daemon_started()?; }
 
-<<<<<<< Updated upstream
-    tracing::info!("xhjob daemon starting (pid={})", std::process::id());
-=======
     let service_name = crate::service::current();
     tracing::info!(
         service = %service_name,
         pid = std::process::id(),
         "xhjob daemon starting"
     );
->>>>>>> Stashed changes
 
     // Choose store
     let use_persist = std::env::var("XHJOB_PERSIST").map(|v| v == "1" || v == "true").unwrap_or(false);
     let store: Arc<dyn TaskStore> = if use_persist {
         #[cfg(feature = "persist")]
         {
-<<<<<<< Updated upstream
-            let path = std::env::var("XHJOB_DB").unwrap_or_else(|_| {
-                #[cfg(unix)]
-                { "/tmp/xhjob.db".to_string() }
-                #[cfg(windows)]
-                { std::env::temp_dir().join("xhjob.db").to_string_lossy().to_string() }
-            });
-=======
             let path = crate::store::db_path_for(&service_name);
->>>>>>> Stashed changes
             Arc::new(crate::store::SqliteStore::open(&path)?)
         }
         #[cfg(not(feature = "persist"))]

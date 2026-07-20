@@ -15,8 +15,6 @@ impl Default for HttpExecutor {
     fn default() -> Self { Self::new() }
 }
 
-<<<<<<< Updated upstream
-=======
 /// Parsed components of a proxy URL.
 ///
 /// `socks5://user:pass@127.0.0.1:1080` -> scheme=socks5, user=Some(user), pass=Some(pass),
@@ -107,24 +105,15 @@ fn build_proxy(proxy_str: &str) -> Result<reqwest::Proxy> {
     Ok(proxy)
 }
 
->>>>>>> Stashed changes
 impl Executor for HttpExecutor {
     fn execute(&self, task: &Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + '_>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
-<<<<<<< Updated upstream
-=======
         let proxy = task.proxy.clone();
->>>>>>> Stashed changes
         Box::pin(async move {
             let payload: HttpPayload = serde_json::from_value(payload_val)
                 .map_err(|e| XhjobError::Exec(format!("invalid http payload: {}", e)))?;
 
-<<<<<<< Updated upstream
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()
-=======
             let mut client_builder = reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout));
 
@@ -134,7 +123,6 @@ impl Executor for HttpExecutor {
             }
 
             let client = client_builder.build()
->>>>>>> Stashed changes
                 .map_err(|e| XhjobError::Exec(format!("build client: {}", e)))?;
 
             let method = match payload.method.to_uppercase().as_str() {
@@ -171,8 +159,6 @@ impl Executor for HttpExecutor {
         })
     }
 }
-<<<<<<< Updated upstream
-=======
 
 #[cfg(test)]
 mod tests {
@@ -252,4 +238,3 @@ mod tests {
         assert!(msg.contains("unsupported proxy scheme"), "unexpected error: {}", msg);
     }
 }
->>>>>>> Stashed changes
