@@ -178,6 +178,15 @@
 - [x] ~~迁移不丢失现有任务数据~~（已移除）
 - [x] ~~tests/migration.phpt 通过~~（已删除该测试）
 
+## Windows DLL 交叉编译（已放弃）
+- [ ] `x86_64-pc-windows-gnu` target 安装：受阻于沙箱网络下载超时（rustup target add 长时间无进度）
+- [ ] MinGW-w64 交叉编译器：已安装 `gcc-mingw-w64-x86-64` 13.2.0（apt 源）
+- [ ] ext-php-rs 0.15 build.rs 对 Windows 交叉编译的支持：未实际验证（需要 Windows PHP 8.2 dev pack 头文件 + libclang 配置）
+- [ ] Windows PHP 8.2 dev pack（headers + php.lib）：沙箱无此资源
+- [ ] `cargo build --target x86_64-pc-windows-gnu --features persist` 实际编译：未达成
+- [ ] `releases/xhjob-php8.2-windows-x86_64.dll` 上传到 git：未达成
+- 当前状态：Linux .so 已编译并提交到 `releases/`；Windows DLL 因沙箱环境限制（网络 + 缺少 Windows PHP dev pack）无法在 Linux 主机交叉编译，建议在 Windows 主机原生编译后手动上传
+
 ## 自定义数据目录（data_dir）
 - [x] `src/service/mod.rs` 新增 `CURRENT_DATA_DIR: OnceLock<String>` + `set_current_data_dir()` / `current_data_dir()`（env var `XHJOB_DATA_DIR` 兜底）
 - [x] `src/daemon/mod.rs` 所有路径推导与生命周期函数新增 `data_dir: Option<&str>` 参数；新增 `resolve_dir_path()` 优先级链解析
