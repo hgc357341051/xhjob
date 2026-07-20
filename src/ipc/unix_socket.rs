@@ -10,8 +10,12 @@ pub struct UnixListenerWrapper {
 }
 
 impl UnixListenerWrapper {
-    pub async fn bind(service_name: &str) -> Result<Self> {
-        let path = ipc_path(service_name);
+    pub async fn bind(service_name: &str, data_dir: Option<&str>) -> Result<Self> {
+        let path = ipc_path(service_name, data_dir);
+        // ensure parent dir exists (e.g. user-specified data_dir may not exist yet)
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         // remove stale socket file
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)
@@ -36,8 +40,8 @@ impl IpcListener for UnixListenerWrapper {
 pub struct UnixStreamWrapper;
 
 impl UnixStreamWrapper {
-    pub async fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
-        let path = ipc_path(service_name);
+    pub async fn connect(service_name: &str, data_dir: Option<&str>) -> Result<Box<dyn IpcStream>> {
+        let path = ipc_path(service_name, data_dir);
         // try tokio UnixStream first
         match UnixStream::connect(&path).await {
             Ok(s) => Ok(Box::new(s)),

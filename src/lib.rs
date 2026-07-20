@@ -28,8 +28,13 @@ fn resolve_service_name(name: Option<String>) -> Result<String, String> {
     service::validate(&raw).map_err(|e| format!("{}", e))
 }
 
+/// Normalize a PHP-supplied data_dir: empty string becomes None.
+fn normalize_data_dir(dir: Option<String>) -> Option<String> {
+    dir.and_then(|d| if d.is_empty() { None } else { Some(d) })
+}
+
 #[php_function]
-pub fn xhjob_start(name: Option<String>) -> bool {
+pub fn xhjob_start(name: Option<String>, data_dir: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -37,13 +42,14 @@ pub fn xhjob_start(name: Option<String>) -> bool {
             return false;
         }
     };
+    let data_dir = normalize_data_dir(data_dir);
     // Check if daemon is already running
-    let status = daemon::status(&service_name);
+    let status = daemon::status(&service_name, data_dir.as_deref());
     if status.running {
         return true;
     }
     // Spawn daemon. daemon_main is the function the daemon will run.
-    match daemon::start(daemon_main::daemon_main, &service_name) {
+    match daemon::start(daemon_main::daemon_main, &service_name, data_dir.as_deref()) {
         Ok(true) => true,
         Ok(false) => {
             // Failed to start within timeout
@@ -57,7 +63,7 @@ pub fn xhjob_start(name: Option<String>) -> bool {
 }
 
 #[php_function]
-pub fn xhjob_stop(name: Option<String>) -> bool {
+pub fn xhjob_stop(name: Option<String>, data_dir: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -65,7 +71,8 @@ pub fn xhjob_stop(name: Option<String>) -> bool {
             return false;
         }
     };
-    match daemon::stop(&service_name) {
+    let data_dir = normalize_data_dir(data_dir);
+    match daemon::stop(&service_name, data_dir.as_deref()) {
         Ok(_) => true,
         Err(e) => {
             tracing::error!("xhjob_stop failed: {}", e);
@@ -75,7 +82,7 @@ pub fn xhjob_stop(name: Option<String>) -> bool {
 }
 
 #[php_function]
-pub fn xhjob_restart(name: Option<String>) -> bool {
+pub fn xhjob_restart(name: Option<String>, data_dir: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -83,7 +90,8 @@ pub fn xhjob_restart(name: Option<String>) -> bool {
             return false;
         }
     };
-    match daemon::restart(daemon_main::daemon_main, &service_name) {
+    let data_dir = normalize_data_dir(data_dir);
+    match daemon::restart(daemon_main::daemon_main, &service_name, data_dir.as_deref()) {
         Ok(_) => true,
         Err(e) => {
             tracing::error!("xhjob_restart failed: {}", e);
@@ -93,7 +101,7 @@ pub fn xhjob_restart(name: Option<String>) -> bool {
 }
 
 #[php_function]
-pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
+pub fn xhjob_status(name: Option<String>, data_dir: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -103,7 +111,8 @@ pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
             return out;
         }
     };
-    let status = daemon::status(&service_name);
+    let data_dir = normalize_data_dir(data_dir);
+    let status = daemon::status(&service_name, data_dir.as_deref());
     let mut out: Vec<(String, String)> = Vec::new();
     out.push(("running".to_string(), status.running.to_string()));
     if let Some(pid) = status.pid {
@@ -113,11 +122,12 @@ pub fn xhjob_status(name: Option<String>) -> Vec<(String, String)> {
 }
 
 #[php_function]
-pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
+pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<String>) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let data_dir = normalize_data_dir(data_dir);
     // Build a one-shot request to the daemon and return the task_id (or error string).
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
@@ -126,7 +136,7 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
     let result: std::result::Result<String, String> = rt.block_on(async move {
         let payload: serde_json::Value = serde_json::from_str(&task_json)
             .map_err(|e| format!("invalid json: {}", e))?;
-        let resp = ipc::request("dispatch", payload, &service_name).await
+        let resp = ipc::request("dispatch", payload, &service_name, data_dir.as_deref()).await
             .map_err(|e| format!("{}", e))?;
         if !resp.ok {
             return Err(resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -144,7 +154,7 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>) -> String {
 }
 
 #[php_function]
-pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
+pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -154,12 +164,13 @@ pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
             return out;
         }
     };
+    let data_dir = normalize_data_dir(data_dir);
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let info = rt.block_on(async move {
-        match outcome::query_state(&id, &service_name).await {
+        match outcome::query_state(&id, &service_name, data_dir.as_deref()).await {
             Ok(info) => Some(info),
             Err(_) => None,
         }
@@ -180,7 +191,7 @@ pub fn xhjob_state(id: String, name: Option<String>) -> Vec<(String, String)> {
 }
 
 #[php_function]
-pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
+pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -189,12 +200,13 @@ pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
             return out;
         }
     };
+    let data_dir = normalize_data_dir(data_dir);
     let rt = match pool::coroutine_pool::global_runtime() {
         Some(rt) => rt,
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let result = rt.block_on(async move {
-        match outcome::query_result(&id, &service_name).await {
+        match outcome::query_result(&id, &service_name, data_dir.as_deref()).await {
             Ok(r) => Some(r),
             Err(_) => None,
         }
@@ -218,18 +230,24 @@ pub fn xhjob_result(id: String, name: Option<String>) -> Vec<(String, String)> {
 ///
 /// The optional `service_name` argument is the primary propagation path for
 /// the service identity: the spawner encodes it into the `-r` code string
-/// (e.g. `xhjob_run_daemon('cron-svc');`) so it survives PHP version-manager
-/// shim re-execs that may scrub env vars set via `Command::env()`. When
-/// provided, the name is validated and installed via `service::set_current()`
-/// before `daemon_main()` runs, so all derived paths (PID file, IPC socket,
-/// log file, store) are keyed correctly.
+/// (e.g. `xhjob_run_daemon('cron-svc', '/var/lib/xhjob');`) so it survives
+/// PHP version-manager shim re-execs that may scrub env vars set via
+/// `Command::env()`. When provided, the name is validated and installed via
+/// `service::set_current()` before `daemon_main()` runs, so all derived paths
+/// (PID file, IPC socket, log file, store) are keyed correctly.
 ///
-/// When `None`, the service name falls back to `service::current()`'s env-var
-/// path (`XHJOB_SERVICE_NAME`) and finally to `"default"`, preserving
-/// backward compatibility with callers that spawn the daemon through other
-/// paths.
+/// The optional `data_dir` argument is the primary propagation path for the
+/// data directory: when provided, it is installed via
+/// `service::set_current_data_dir()` so all runtime files are placed under
+/// that directory. This enables users to relocate all service files to a
+/// custom directory for backup / migration / restore.
+///
+/// When either argument is `None`, the value falls back to `service::current()`
+/// / `service::current_data_dir()`'s env-var path (`XHJOB_SERVICE_NAME` /
+/// `XHJOB_DATA_DIR`) and finally to the platform default, preserving backward
+/// compatibility with callers that spawn the daemon through other paths.
 #[php_function]
-pub fn xhjob_run_daemon(service_name: Option<String>) -> bool {
+pub fn xhjob_run_daemon(service_name: Option<String>, data_dir: Option<String>) -> bool {
     if let Some(name) = service_name {
         match service::validate(&name) {
             Ok(validated) => service::set_current(validated),
@@ -238,6 +256,9 @@ pub fn xhjob_run_daemon(service_name: Option<String>) -> bool {
                 return false;
             }
         }
+    }
+    if let Some(dir) = normalize_data_dir(data_dir) {
+        service::set_current_data_dir(dir);
     }
     // Std streams were detached by the spawn (Stdio::null). Reopen them to
     // the log file so tracing output is captured.
@@ -254,7 +275,8 @@ fn reopen_std_streams_for_daemon() {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let service_name = crate::service::current();
-    let log = daemon::log_file_path(&service_name);
+    let data_dir = crate::service::current_data_dir();
+    let log = daemon::log_file_path(&service_name, data_dir.as_deref());
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -298,6 +320,16 @@ impl Xhjob {
     /// chaining. Exposed as `service()` in PHP.
     pub fn service(&mut self, name: String) -> &mut Self {
         self.builder = std::mem::take(&mut self.builder).service(name);
+        self
+    }
+
+    /// Set the data directory where the daemon's PID/sock/db/log files live.
+    /// When set, `dispatch()` resolves the IPC socket under this directory.
+    /// Used for backup / migration / restore scenarios where the user has
+    /// relocated all service files to a custom directory.
+    /// Exposed as `dataDir()` in PHP (snake→camel auto-conversion).
+    pub fn data_dir(&mut self, dir: String) -> &mut Self {
+        self.builder = std::mem::take(&mut self.builder).data_dir(dir);
         self
     }
 

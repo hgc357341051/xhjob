@@ -14,6 +14,7 @@ XHJob 是一个基于 Rust（ext-php-rs 0.15）开发的高性能 PHP 异步任�
 - **HTTP / SOCKS5 代理**（Task 22）：`withProxy('socks5://user:pass@host:port')`
 - **Shell 输出编码转换**（Task 23）：`withEncoding('GBK')`，`auto` 模式自动检测
 - **Cron 自定义时区**（Task 24）：`withTimezone('Asia/Shanghai')`
+- **自定义数据目录**（Task 26）：`xhjob_start('svc', '/var/lib/xhjob')` 统一指定 pid/sock/db/log 落盘位置，便于备份/迁移/恢复
 
 ## 安装
 
@@ -98,9 +99,82 @@ XHJob 支持在同一主机上启动多个独立的 daemon 实例，每个实例
 | SQLite DB | `${XHJOB_DB_DIR:-/tmp}/xhjob.{name}.db` | `%TEMP%\xhjob.{name}.db` |
 | 日志文件 | `${XHJOB_LOG_DIR:-/tmp}/xhjob.{name}.log` | `%TEMP%\xhjob.{name}.log` |
 
-可以通过环境变量 `XHJOB_PID_DIR` / `XHJOB_SOCK_DIR` / `XHJOB_DB_DIR` / `XHJOB_LOG_DIR` 自定义各资源目录。
+各资源目录可单独通过环境变量 `XHJOB_PID_DIR` / `XHJOB_SOCK_DIR` / `XHJOB_DB_DIR` / `XHJOB_LOG_DIR` 自定义，也可通过统一的 `XHJOB_DATA_DIR` 或函数参数 `data_dir` 一次性指定（详见下一节"自定义数据目录"）。
+
+目录解析优先级（高 → 低）：
+
+1. PHP 函数参数 `data_dir`（`xhjob_start($name, $data_dir)` 等）
+2. 细粒度环境变量（`XHJOB_PID_DIR` / `XHJOB_SOCK_DIR` / `XHJOB_DB_DIR` / `XHJOB_LOG_DIR`）
+3. 统一环境变量 `XHJOB_DATA_DIR`
+4. 平台默认（Unix：`/tmp`；Windows：`%TEMP%`）
+
+> Windows IPC 使用 Named Pipe（`\\.\pipe\xhjob-{name}`），不占用文件系统路径，因此 `data_dir` 对 Windows IPC 无影响；但 PID/DB/Log 仍受 `data_dir` 控制。
+
+## 自定义数据目录
+
+通过可选的 `data_dir` 参数可一次性指定一个服务所有运行时文件（PID / sock / SQLite DB / 日志）的存放目录。常见用途：
+
+- **数据迁移**：将整个目录复制到新机器即可恢复服务
+- **备份/恢复**：定时备份该目录即可保留全部任务历史
+- **隔离运行**：测试环境与生产环境使用不同目录互不干扰
+- **权限控制**：将目录放在受控路径下（如 `/var/lib/xhjob`）
 
 ### 函数 API
+
+所有顶层函数均新增可选的 `data_dir` 参数：
+
+```php
+xhjob_start(string $name = "default", string $data_dir = null): bool
+xhjob_stop(string $name = "default", string $data_dir = null): bool
+xhjob_restart(string $name = "default", string $data_dir = null): bool
+xhjob_status(string $name = "default", string $data_dir = null): array
+xhjob_dispatch(string $task_json, string $name = "default", string $data_dir = null): string
+xhjob_state(string $id, string $name = "default", string $data_dir = null): array
+xhjob_result(string $id, string $name = "default", string $data_dir = null): array
+```
+
+`$data_dir` 为 `null` 或空字符串时回退到环境变量和平台默认。指定的目录若不存在，daemon 启动 / IPC bind 时会自动 `mkdir -p` 创建。
+
+### 链式 API
+
+```php
+$id = Xhjob::task()
+    ->service('cron-svc')
+    ->dataDir('/var/lib/xhjob')
+    ->viaShell('echo hello')
+    ->dispatch();
+```
+
+`Xhjob::dataDir(string $dir): $this` 在 PHP 中暴露为 `dataDir()`（snake→camel 自动转换）。
+
+### 示例：备份/迁移
+
+```php
+<?php
+// 生产环境：所有文件落在 /var/lib/xhjob
+xhjob_start('cron-svc', '/var/lib/xhjob');
+
+// ... 投递任务 ...
+
+// 备份：直接打包 /var/lib/xhjob 即可（停服或在线备份都行）
+// 恢复：将备份解压到新机器的 /var/lib/xhjob，然后启动 daemon
+//       daemon 会自动读取已存在的 .db 文件，恢复活跃任务
+xhjob_stop('cron-svc', '/var/lib/xhjob');
+```
+
+```bash
+# 备份
+tar czf xhjob-backup-$(date +%Y%m%d).tar.gz /var/lib/xhjob
+
+# 迁移到新机器
+scp xhjob-backup-*.tar.gz new-host:/tmp/
+ssh new-host 'mkdir -p /var/lib/xhjob && tar xzf /tmp/xhjob-backup-*.tar.gz -C /'
+
+# 在新机器上启动 daemon，自动恢复
+ssh new-host 'php -d extension=xhjob.so -r "xhjob_start(\"cron-svc\", \"/var/lib/xhjob\");"'
+```
+
+### 函数 API（服务名参数）
 
 所有顶层函数均接受可选的服务名参数：
 
@@ -114,7 +188,7 @@ xhjob_state(string $id, string $name = "default"): array
 xhjob_result(string $id, string $name = "default"): array
 ```
 
-### 链式 API
+### 链式 API（服务名绑定）
 
 通过 `Xhjob::service($name)->task()->...` 将 builder 绑定到指定服务：
 
@@ -244,13 +318,13 @@ xhjob_stop();
 
 | 函数 | 说明 |
 |------|------|
-| `xhjob_start($name="default"): bool` | 启动（或确认已启动）指定服务的 daemon |
-| `xhjob_stop($name="default"): bool` | 停止指定服务的 daemon |
-| `xhjob_restart($name="default"): bool` | 重启指定服务的 daemon |
-| `xhjob_status($name="default"): array` | 查询 daemon 运行状态（`running`、`pid`） |
-| `xhjob_dispatch($task_json, $name="default"): string` | 通过 JSON 字符串 dispatch 任务，返回 task_id |
-| `xhjob_state($id, $name="default"): array` | 查询任务状态（`state`、`attempts`、`created_at`、`started_at`、`finished_at`、`last_error`） |
-| `xhjob_result($id, $name="default"): array` | 查询任务结果（`body`、`status_code`、`stdout`、`stderr`、`exit_code`） |
+| `xhjob_start($name="default", $data_dir=null): bool` | 启动（或确认已启动）指定服务的 daemon，可选 data_dir |
+| `xhjob_stop($name="default", $data_dir=null): bool` | 停止指定服务的 daemon |
+| `xhjob_restart($name="default", $data_dir=null): bool` | 重启指定服务的 daemon |
+| `xhjob_status($name="default", $data_dir=null): array` | 查询 daemon 运行状态（`running`、`pid`） |
+| `xhjob_dispatch($task_json, $name="default", $data_dir=null): string` | 通过 JSON 字符串 dispatch 任务，返回 task_id |
+| `xhjob_state($id, $name="default", $data_dir=null): array` | 查询任务状态（`state`、`attempts`、`created_at`、`started_at`、`finished_at`、`last_error`） |
+| `xhjob_result($id, $name="default", $data_dir=null): array` | 查询任务结果（`body`、`status_code`、`stdout`、`stderr`、`exit_code`） |
 
 ### `Xhjob` 类（链式 API）
 
@@ -258,6 +332,7 @@ xhjob_stop();
 |------|------|
 | `Xhjob::task(): Xhjob` | 创建一个新的 builder |
 | `service(string $name): $this` | 绑定到指定服务名 |
+| `dataDir(string $dir): $this` | 指定 PID/sock/db/log 的统一存放目录（备份/迁移用） |
 | `viaHttp(string $method, string $url): $this` | 设置为 HTTP 任务 |
 | `viaShell(string $cmd): $this` | 设置为 Shell 任务 |
 | `withHeaders(array $headers): $this` | 设置 HTTP headers |
@@ -279,11 +354,13 @@ xhjob_stop();
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `XHJOB_PID_DIR` (Unix) | `/tmp` | PID 文件目录 |
-| `XHJOB_SOCK_DIR` (Unix) | `/tmp` | IPC socket 目录 |
-| `XHJOB_DB_DIR` (Unix) | `/tmp` | SQLite 数据库目录 |
-| `XHJOB_LOG_DIR` (Unix) | `/tmp` | 日志文件目录 |
+| `XHJOB_DATA_DIR` | 平台默认 | 统一数据目录（PID/sock/db/log 同时落入此目录），优先级低于细粒度变量；也是 daemon 子进程内的当前数据目录（由父进程自动设置，函数参数可覆盖） |
+| `XHJOB_PID_DIR` (Unix) | `/tmp` | PID 文件目录（优先级高于 `XHJOB_DATA_DIR`） |
+| `XHJOB_SOCK_DIR` (Unix) | `/tmp` | IPC socket 目录（优先级高于 `XHJOB_DATA_DIR`） |
+| `XHJOB_DB_DIR` (Unix) | `/tmp` | SQLite 数据库目录（优先级高于 `XHJOB_DATA_DIR`） |
+| `XHJOB_LOG_DIR` (Unix) | `/tmp` | 日志文件目录（优先级高于 `XHJOB_DATA_DIR`） |
 | `XHJOB_SERVICE_NAME` | `default` | daemon 子进程内当前服务名（由父进程自动设置） |
+| `XHJOB_PERSIST` | `0` | 设为 `1` 或 `true` 时 daemon 启用 SQLite 持久化存储 |
 | `XHJOB_THREAD_POOL_SIZE` | `num_cpus` | 线程池大小 |
 | `XHJOB_COROUTINE_POOL_SIZE` | `1024` | 协程池大小 |
 | `XHJOB_SHELL_TIMEOUT` | `300` | Shell 任务默认超时（秒） |
@@ -301,6 +378,16 @@ cargo test --features persist
 
 # PHP .phpt 集成测试
 php -d extension=target/release/libxhjob.so tests/run-tests.php tests/
+
+# data_dir 功能专项测试（验证 pid/sock/db/log 全部落入用户指定目录）
+php -d extension=xhjob.so tests/data_dir_smoke.php
+
+# php-cli 业务场景串联测试
+bash tests/business/cli_bus/run_all.sh production-queue
+
+# php-fpm 模拟业务测试（proc_open / HTTP 两种模式）
+php -d extension=xhjob.so tests/business/fpm_sim/proc_test.php
+php -d extension=xhjob.so tests/business/fpm_sim/client_test.php
 ```
 
 ## 许可证

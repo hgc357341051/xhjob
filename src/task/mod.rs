@@ -36,6 +36,12 @@ pub struct TaskBuilder {
     /// Service name this builder dispatches to. Defaults to "default".
     #[serde(default = "default_service_name")]
     pub service_name: String,
+    /// Optional data directory where the daemon's PID/sock/db/log files live.
+    /// When set, the dispatch path resolves the IPC socket under this directory.
+    /// Used for backup / migration / restore scenarios where the user has
+    /// relocated all service files to a custom directory.
+    #[serde(default)]
+    pub data_dir: Option<String>,
     /// Optional proxy URL (e.g. `http://host:port`, `socks5://user:pass@host:port`).
     #[serde(default)]
     pub proxy: Option<String>,
@@ -69,6 +75,7 @@ impl Default for TaskBuilder {
             coalesce: true,
             persist: false,
             service_name: default_service_name(),
+            data_dir: None,
             proxy: None,
             encoding: None,
             timezone: None,
@@ -83,6 +90,15 @@ impl TaskBuilder {
     /// to that service's IPC socket.
     pub fn service(mut self, name: impl Into<String>) -> Self {
         self.service_name = name.into();
+        self
+    }
+
+    /// Set the data directory where the daemon's PID/sock/db/log files live.
+    /// When set, the dispatch path resolves the IPC socket under this directory.
+    /// Used for backup / migration / restore scenarios.
+    pub fn data_dir(mut self, dir: impl Into<String>) -> Self {
+        let dir = dir.into();
+        self.data_dir = if dir.is_empty() { None } else { Some(dir) };
         self
     }
 
@@ -246,7 +262,8 @@ impl TaskBuilder {
 
     /// Dispatch the task to the daemon via IPC. Returns task_id.
     ///
-    /// Routes to the daemon for `self.service_name`.
+    /// Routes to the daemon for `self.service_name` with `self.data_dir`
+    /// (if set) as the directory containing the IPC socket.
     pub async fn dispatch(self) -> Result<String> {
         // Validate timezone up front: fail fast on bad input rather than
         // enqueuing an IPC request that the daemon cannot honor correctly.
@@ -255,7 +272,7 @@ impl TaskBuilder {
         }
         let json = serde_json::to_value(&self)
             .map_err(|e| XhjobError::InvalidTask(format!("serialize: {}", e)))?;
-        let resp = ipc_request("dispatch", json, &self.service_name).await?;
+        let resp = ipc_request("dispatch", json, &self.service_name, self.data_dir.as_deref()).await?;
         if !resp.ok {
             return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown error".to_string())));
         }

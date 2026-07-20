@@ -9,14 +9,29 @@ pub mod unix_socket;
 #[cfg(windows)]
 pub mod named_pipe;
 
-/// IPC path derived from `service_name`.
+/// IPC path derived from `service_name` and optional `data_dir`.
 ///
-/// Unix: `${XHJOB_SOCK_DIR:-/tmp}/xhjob.{name}.sock`
-/// Windows: `\\.\pipe\xhjob-{name}`
-pub fn ipc_path(service_name: &str) -> String {
+/// Path resolution priority (highest first):
+///   1. `data_dir` argument (if `Some`)
+///   2. `XHJOB_SOCK_DIR` env var (Unix only, fine-grained override)
+///   3. `XHJOB_DATA_DIR` env var (unified data directory)
+///   4. Platform default (`/tmp` on Unix, named pipe on Windows)
+///
+/// Unix: `<dir>/xhjob.{name}.sock`
+/// Windows: `\\.\pipe\xhjob-{name}` (data_dir is ignored on Windows since
+/// named pipes live in their own kernel namespace, not the filesystem)
+pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String {
     #[cfg(unix)]
     {
-        let dir = std::env::var("XHJOB_SOCK_DIR").unwrap_or_else(|_| "/tmp".to_string());
+        let dir = if let Some(d) = data_dir {
+            if !d.is_empty() { d.to_string() } else { fallback_sock_dir() }
+        } else if let Ok(d) = std::env::var("XHJOB_SOCK_DIR") {
+            if !d.is_empty() { d } else { fallback_sock_dir() }
+        } else if let Ok(d) = std::env::var("XHJOB_DATA_DIR") {
+            if !d.is_empty() { d } else { fallback_sock_dir() }
+        } else {
+            fallback_sock_dir()
+        };
         std::path::PathBuf::from(dir)
             .join(format!("xhjob.{}.sock", service_name))
             .to_string_lossy()
@@ -24,8 +39,15 @@ pub fn ipc_path(service_name: &str) -> String {
     }
     #[cfg(windows)]
     {
+        let _ = data_dir;  // named pipes don't use filesystem paths
         format!(r"\\.\pipe\xhjob-{}", service_name)
     }
+}
+
+/// Fallback sock directory when no explicit dir is provided (Unix only).
+#[cfg(unix)]
+fn fallback_sock_dir() -> String {
+    "/tmp".to_string()
 }
 
 /// Frame protocol: length-prefixed JSON.
@@ -103,13 +125,18 @@ pub trait IpcStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin
 
 /// Spawn the appropriate listener for the current platform.
 ///
-/// The daemon-side listener binds to the path derived from `service::current()`,
-/// which is set via `XHJOB_SERVICE_NAME` by the spawning parent process.
+/// The daemon-side listener binds to the path derived from
+/// `service::current()` and `service::current_data_dir()`. The data_dir is
+/// set via `XHJOB_DATA_DIR` (or the `-r` code string) by the spawning parent
+/// process, allowing all runtime files to be relocated to a user-specified
+/// directory for backup / migration / restore.
 pub async fn bind_listener() -> Result<Box<dyn IpcListener>> {
     let service_name = crate::service::current();
+    let data_dir = crate::service::current_data_dir();
+    let data_dir_ref = data_dir.as_deref();
     #[cfg(unix)]
     {
-        Ok(Box::new(unix_socket::UnixListenerWrapper::bind(&service_name).await?))
+        Ok(Box::new(unix_socket::UnixListenerWrapper::bind(&service_name, data_dir_ref).await?))
     }
     #[cfg(windows)]
     {
@@ -117,26 +144,29 @@ pub async fn bind_listener() -> Result<Box<dyn IpcListener>> {
     }
 }
 
-/// Connect to the daemon (client side) for `service_name`. Returns a stream.
-pub async fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
+/// Connect to the daemon (client side) for `service_name` with optional
+/// `data_dir`. Returns a stream.
+pub async fn connect(service_name: &str, data_dir: Option<&str>) -> Result<Box<dyn IpcStream>> {
     #[cfg(unix)]
     {
-        unix_socket::UnixStreamWrapper::connect(service_name).await
+        unix_socket::UnixStreamWrapper::connect(service_name, data_dir).await
     }
     #[cfg(windows)]
     {
+        let _ = data_dir;  // named pipe path doesn't depend on filesystem dir
         named_pipe::NamedPipeClientWrapper::connect(service_name)
     }
 }
 
 /// Helper: send one request and receive one response (short connection)
-/// targeting the daemon for `service_name`.
+/// targeting the daemon for `service_name` with optional `data_dir`.
 pub async fn request(
     op: &str,
     payload: serde_json::Value,
     service_name: &str,
+    data_dir: Option<&str>,
 ) -> Result<Response> {
-    let mut stream = connect(service_name).await?;
+    let mut stream = connect(service_name, data_dir).await?;
     let req = Request {
         id: rand_id(),
         op: op.to_string(),

@@ -1,18 +1,23 @@
 //! Windows daemon implementation via CreateProcessW + DETACHED_PROCESS.
 //!
 //! On Windows, we cannot in-process detach like Unix fork. Instead we
-//! re-launch the current PHP binary with `-r 'xhjob_run_daemon("<name>");'`
+//! re-launch the current PHP binary with `-r 'xhjob_run_daemon("<name>", "<data_dir>");'`
 //! and the DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP flags. The relaunched
 //! process runs `daemon_main()` directly.
 
 use crate::errors::{Result, XhjobError};
 use super::{write_pid, remove_pid_file};
 
-pub fn spawn_via_create_process(_daemon_main: fn() -> (), service_name: &str) -> Result<()> {
+pub fn spawn_via_create_process(
+    _daemon_main: fn() -> (),
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<()> {
     // On Windows we cannot pass a function pointer across processes.
-    // Strategy: re-launch PHP with `-r 'xhjob_run_daemon("<name>");'`. The
-    // service name is encoded into the code string so it survives any env-var
-    // scrubbing by PHP version-manager shims (consistent with the Unix path).
+    // Strategy: re-launch PHP with `-r 'xhjob_run_daemon("<name>", "<data_dir>");'`.
+    // The service name and data_dir are encoded into the code string so they
+    // survive any env-var scrubbing by PHP version-manager shims (consistent
+    // with the Unix path).
     //
     // We use std::process::Command with creation_flags for detachment.
     use std::os::windows::process::CommandExt;
@@ -25,11 +30,21 @@ pub fn spawn_via_create_process(_daemon_main: fn() -> (), service_name: &str) ->
 
     // PHP single-quoted strings escape `'` as `\'` and `\` as `\\`. Service
     // names are validated to be `[a-zA-Z][a-zA-Z0-9_-]{0,31}` so neither
-    // character is legal, but we escape defensively anyway.
-    let escaped = service_name
+    // character is legal, but we escape defensively anyway. data_dir is also
+    // shell-escaped here for safety.
+    let escaped_name = service_name
         .replace('\\', "\\\\")
         .replace('\'', "\\'");
-    let code = format!("xhjob_run_daemon('{}');", escaped);
+    let code = if let Some(dir) = data_dir {
+        if !dir.is_empty() {
+            let escaped_dir = dir.replace('\\', "\\\\").replace('\'', "\\'");
+            format!("xhjob_run_daemon('{}', '{}');", escaped_name, escaped_dir)
+        } else {
+            format!("xhjob_run_daemon('{}');", escaped_name)
+        }
+    } else {
+        format!("xhjob_run_daemon('{}');", escaped_name)
+    };
 
     let mut cmd = Command::new(&exe);
     cmd.arg("-d").arg("extension=xhjob.so");
@@ -37,6 +52,11 @@ pub fn spawn_via_create_process(_daemon_main: fn() -> (), service_name: &str) ->
     // Env vars kept as a backward-compatible fallback.
     cmd.env("XHJOB_DAEMON_MODE", "1");
     cmd.env("XHJOB_SERVICE_NAME", service_name);
+    if let Some(dir) = data_dir {
+        if !dir.is_empty() {
+            cmd.env("XHJOB_DATA_DIR", dir);
+        }
+    }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -47,16 +67,19 @@ pub fn spawn_via_create_process(_daemon_main: fn() -> (), service_name: &str) ->
 }
 
 /// Called by daemon_main on startup: write PID file (Windows path).
-/// Reads the service name from `service::current()`.
+/// Reads the service name from `service::current()` and data_dir from
+/// `service::current_data_dir()`.
 pub fn daemon_started() -> Result<()> {
     let service_name = crate::service::current();
-    write_pid(std::process::id(), &service_name)
+    let data_dir = crate::service::current_data_dir();
+    write_pid(std::process::id(), &service_name, data_dir.as_deref())
 }
 
 /// Called by daemon_main on exit.
 pub fn daemon_stopping() {
     let service_name = crate::service::current();
-    remove_pid_file(&service_name);
+    let data_dir = crate::service::current_data_dir();
+    remove_pid_file(&service_name, data_dir.as_deref());
 }
 
 // daemon_main is invoked by the extension startup when XHJOB_DAEMON_MODE=1

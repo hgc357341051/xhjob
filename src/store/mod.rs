@@ -199,31 +199,45 @@ pub fn make_store(use_persist: bool, db_path: Option<&str>) -> Result<Arc<dyn Ta
     Ok(Arc::new(InMemoryStore::new()))
 }
 
-/// Compute the default SQLite DB path for `service_name`.
+/// Compute the SQLite DB path for `service_name` with optional `data_dir`.
 ///
-/// Unix: `${XHJOB_DB_DIR:-/tmp}/xhjob.{name}.db`
-/// Windows: `%TEMP%\xhjob.{name}.db`
-pub fn db_path_for(service_name: &str) -> String {
+/// Path resolution priority (highest first):
+///   1. `data_dir` argument (if `Some`)
+///   2. `XHJOB_DB_DIR` env var (fine-grained override)
+///   3. `XHJOB_DATA_DIR` env var (unified data directory)
+///   4. Platform default (`/tmp` on Unix, `%TEMP%` on Windows)
+///
+/// Unix: `<dir>/xhjob.{name}.db`
+/// Windows: `<dir>\xhjob.{name}.db`
+pub fn db_path_for(service_name: &str, data_dir: Option<&str>) -> String {
+    let dir = if let Some(d) = data_dir {
+        if !d.is_empty() { d.to_string() } else { fallback_db_dir() }
+    } else if let Ok(d) = std::env::var("XHJOB_DB_DIR") {
+        if !d.is_empty() { d } else { fallback_db_dir() }
+    } else if let Ok(d) = std::env::var("XHJOB_DATA_DIR") {
+        if !d.is_empty() { d } else { fallback_db_dir() }
+    } else {
+        fallback_db_dir()
+    };
+    std::path::PathBuf::from(dir)
+        .join(format!("xhjob.{}.db", service_name))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Fallback DB directory when no explicit dir is provided.
+fn fallback_db_dir() -> String {
     #[cfg(unix)]
-    {
-        let dir = std::env::var("XHJOB_DB_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        std::path::PathBuf::from(dir)
-            .join(format!("xhjob.{}.db", service_name))
-            .to_string_lossy()
-            .to_string()
-    }
+    { "/tmp".to_string() }
     #[cfg(windows)]
     {
-        std::env::temp_dir()
-            .join(format!("xhjob.{}.db", service_name))
-            .to_string_lossy()
-            .to_string()
+        std::env::temp_dir().to_string_lossy().to_string()
     }
 }
 
 #[allow(dead_code)]
 fn default_db_path() -> String {
-    db_path_for(&crate::service::current())
+    db_path_for(&crate::service::current(), crate::service::current_data_dir().as_deref())
 }
 
 pub fn now_ts() -> u64 {

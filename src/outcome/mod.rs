@@ -43,10 +43,15 @@ pub async fn handle_result(store: &std::sync::Arc<dyn TaskStore>, task_id: &str)
     Ok(result)
 }
 
-/// PHP-side client: send `state` request to daemon for `service_name`.
-pub async fn query_state(task_id: &str, service_name: &str) -> Result<StateInfo> {
+/// PHP-side client: send `state` request to daemon for `service_name` with
+/// optional `data_dir`.
+pub async fn query_state(
+    task_id: &str,
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<StateInfo> {
     let payload = serde_json::json!({ "task_id": task_id });
-    let resp = ipc_request("state", payload, service_name).await?;
+    let resp = ipc_request("state", payload, service_name, data_dir).await?;
     if !resp.ok {
         return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }
@@ -55,10 +60,15 @@ pub async fn query_state(task_id: &str, service_name: &str) -> Result<StateInfo>
     Ok(info)
 }
 
-/// PHP-side client: send `result` request to daemon for `service_name`.
-pub async fn query_result(task_id: &str, service_name: &str) -> Result<TaskResult> {
+/// PHP-side client: send `result` request to daemon for `service_name` with
+/// optional `data_dir`.
+pub async fn query_result(
+    task_id: &str,
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<TaskResult> {
     let payload = serde_json::json!({ "task_id": task_id });
-    let resp = ipc_request("result", payload, service_name).await?;
+    let resp = ipc_request("result", payload, service_name, data_dir).await?;
     if !resp.ok {
         return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }

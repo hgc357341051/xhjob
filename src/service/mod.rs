@@ -6,11 +6,13 @@
 //!
 //! The active service name is propagated from the PHP parent process to the
 //! spawned daemon via two mechanisms:
-//!   1. A global once-cell set by `xhjob_run_daemon(Some(name))` (primary
-//!      path; the name is encoded into the `-r` code string so it survives
-//!      PHP version-manager shim re-execs that may scrub env vars).
-//!   2. The `XHJOB_SERVICE_NAME` environment variable (backward-compatible
-//!      fallback for callers that spawn the daemon through other paths).
+//!   1. A global once-cell set by `xhjob_run_daemon(Some(name), data_dir)`
+//!      (primary path; the name and data_dir are encoded into the `-r` code
+//!      string so they survive PHP version-manager shim re-execs that may
+//!      scrub env vars).
+//!   2. The `XHJOB_SERVICE_NAME` / `XHJOB_DATA_DIR` environment variables
+//!      (backward-compatible fallback for callers that spawn the daemon
+//!      through other paths).
 
 use std::sync::OnceLock;
 
@@ -18,10 +20,20 @@ use crate::errors::{Result, XhjobError};
 
 /// Process-global storage for the current service name.
 ///
-/// Set once by `set_current()` (called from `xhjob_run_daemon(Some(name))`)
+/// Set once by `set_current()` (called from `xhjob_run_daemon(Some(name), _)`)
 /// at daemon startup. Once set, `current()` returns this value, taking
 /// precedence over the `XHJOB_SERVICE_NAME` env var.
 static CURRENT_SERVICE: OnceLock<String> = OnceLock::new();
+
+/// Process-global storage for the current data directory.
+///
+/// Set once by `set_current_data_dir()` (called from
+/// `xhjob_run_daemon(_, Some(dir))`) at daemon startup. When set, all
+/// runtime files (PID/sock/db/log) for this daemon are placed under this
+/// directory instead of the system default (`/tmp` on Unix, `%TEMP%` on
+/// Windows). This enables users to relocate all service files to a custom
+/// directory for backup / migration / restore.
+static CURRENT_DATA_DIR: OnceLock<String> = OnceLock::new();
 
 /// Newtype wrapping a validated service name string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,7 +90,7 @@ pub fn validate(name: &str) -> Result<String> {
 /// Set the current service name globally for this process.
 ///
 /// Intended to be called once at daemon startup from
-/// `xhjob_run_daemon(Some(name))` when the service name is delivered via the
+/// `xhjob_run_daemon(Some(name), _)` when the service name is delivered via the
 /// `-r` command-line code string (the primary propagation path that survives
 /// PHP version-manager shim re-execs). Subsequent calls are no-ops: the first
 /// caller wins, which matches the daemon-startup semantics (the service name
@@ -87,11 +99,22 @@ pub fn set_current(name: String) {
     let _ = CURRENT_SERVICE.set(name);
 }
 
+/// Set the current data directory globally for this process.
+///
+/// Intended to be called once at daemon startup from
+/// `xhjob_run_daemon(_, Some(dir))` when the data_dir is delivered via the
+/// `-r` command-line code string. Subsequent calls are no-ops: the first
+/// caller wins, which matches the daemon-startup semantics (the data_dir is
+/// fixed for the lifetime of the daemon process).
+pub fn set_current_data_dir(dir: String) {
+    let _ = CURRENT_DATA_DIR.set(dir);
+}
+
 /// Return the service name for the current process.
 ///
 /// Resolution order:
 ///   1. A name explicitly set via `set_current()` (e.g. by
-///      `xhjob_run_daemon(Some(name))` when the name was passed as a
+///      `xhjob_run_daemon(Some(name), _)` when the name was passed as a
 ///      command-line argument).
 ///   2. The `XHJOB_SERVICE_NAME` environment variable (set by the spawner
 ///      when env-var propagation works).
@@ -104,6 +127,27 @@ pub fn current() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_name().to_string())
+}
+
+/// Return the data directory for the current process, if explicitly set.
+///
+/// Resolution order:
+///   1. A directory explicitly set via `set_current_data_dir()` (e.g. by
+///      `xhjob_run_daemon(_, Some(dir))` when the dir was passed as a
+///      command-line argument).
+///   2. The `XHJOB_DATA_DIR` environment variable (set by the spawner
+///      when env-var propagation works).
+///   3. `None` (caller should fall back to the platform default temp dir).
+///
+/// Returns `None` when no data directory has been configured, so callers
+/// can distinguish "user did not specify" from "user specified empty string".
+pub fn current_data_dir() -> Option<String> {
+    if let Some(dir) = CURRENT_DATA_DIR.get() {
+        return Some(dir.clone());
+    }
+    std::env::var("XHJOB_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// The canonical default service name used when no explicit name is provided.

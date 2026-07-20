@@ -162,6 +162,19 @@
   - [x] SubTask 26.5: 执行 `git push origin <主分支>` 推送到远程主分支（注：当前沙箱环境无 GitHub 凭证，本地提交已完成；待凭证就绪后执行 `git push origin main` 即可）
   - [x] SubTask 26.6: 本地 `git checkout <主分支>` 确保已切换到主分支
 
+- [x] Task 27: 自定义数据目录（data_dir）支持
+  - [x] SubTask 27.1: 在 `src/service/mod.rs` 新增 `CURRENT_DATA_DIR: OnceLock<String>` 全局存储 + `set_current_data_dir()` / `current_data_dir()` 函数（与 service name 同模式，env var 兜底 `XHJOB_DATA_DIR`）
+  - [x] SubTask 27.2: 修改 `src/daemon/mod.rs`，所有路径推导函数（`pid_file_path` / `log_file_path` / `read_pid` / `write_pid` / `remove_pid_file` / `status` / `send_terminate` / `spawn_daemon` / `start` / `stop` / `restart` / `ipc_socket_ready`）新增 `data_dir: Option<&str>` 参数；新增 `resolve_dir_path()` 优先级链解析（PHP 参数 > 细粒度 env var > `XHJOB_DATA_DIR` > 平台默认）
+  - [x] SubTask 27.3: 修改 `src/ipc/mod.rs`，`ipc_path()` / `connect()` / `request()` / `bind_listener()` 接受 data_dir；`src/ipc/unix_socket.rs` 的 `bind()` / `connect()` 接受 data_dir，`bind()` 新增 `create_dir_all(parent)` 确保用户指定目录存在；Windows Named Pipe 忽略 data_dir（`let _ = data_dir;`）
+  - [x] SubTask 27.4: 修改 `src/daemon/unix.rs` 与 `src/daemon/windows.rs`，`spawn_via_double_fork` / `spawn_via_create_process` 接受 `data_dir`，编码到 `-r` 代码字符串（`xhjob_run_daemon('name', '/path');`）抵御 PHP version-manager shim 的 env var 清理，同时设置 `XHJOB_DATA_DIR` env var 作为兜底
+  - [x] SubTask 27.5: 修改 `src/daemon_main.rs`，读取 `current_data_dir()` 传给 `db_path_for`，调用 `create_dir_all(parent)` 确保用户指定目录存在
+  - [x] SubTask 27.6: 修改 `src/outcome/mod.rs`，`query_state()` / `query_result()` 接受 `data_dir: Option<&str>` 参数
+  - [x] SubTask 27.7: 修改 `src/store/mod.rs`，`db_path_for()` 接受 `data_dir`，使用同样的优先级链解析
+  - [x] SubTask 27.8: 修改 `src/lib.rs`，所有 `xhjob_*` 函数（`xhjob_start` / `xhjob_stop` / `xhjob_restart` / `xhjob_status` / `xhjob_dispatch` / `xhjob_state` / `xhjob_result` / `xhjob_run_daemon`）新增 `data_dir: Option<String>` 参数；新增 `normalize_data_dir()` 辅助函数；`Xhjob` 类新增 `dataDir(string $dir)` 链式方法（snake→camel 自动转换）；`reopen_std_streams_for_daemon()` 使用 `current_data_dir()` 解析 log 路径
+  - [x] SubTask 27.9: 修改 `src/task/mod.rs`，`TaskBuilder` 新增 `data_dir: Option<String>` 字段（`#[serde(default)]`）与 `data_dir()` builder 方法（空字符串归一化为 None），`dispatch()` 传递 data_dir 给 `ipc_request`
+  - [x] SubTask 27.10: 编写专项测试 `tests/data_dir_smoke.php`：设置 `XHJOB_PERSIST=1`，调用 `xhjob_start('smoke', '/tmp/xhjob-data-dir-test')` 后验证 pid/sock/db/log 全部在指定目录生成；通过 `Xhjob::task()->dataDir($dir)->viaShell('echo hello-data-dir')->persist(true)->dispatch()` 验证任务能成功执行；停止 daemon 后验证 `.db` 文件保留在指定目录
+  - [x] SubTask 27.11: 更新 `README.md`：新增「自定义数据目录」章节（用途、函数 API、链式 API、备份/迁移示例）、更新路径推导章节加入优先级链、更新 API 参考表加入 data_dir 参数、更新环境变量表加入 `XHJOB_DATA_DIR`
+
 # Task Dependencies
 - Task 2、Task 3 可并行，均依赖 Task 1
 - Task 4 独立，可与 Task 2/3 并行
@@ -183,3 +196,4 @@
 - Task 22、Task 23、Task 24 可并行，均依赖 Task 21（TaskBuilder 字段扩展基础）
 - Task 25 已撤销（全新部署无需 schema 迁移，CREATE TABLE 已包含全部字段）
 - Task 26 依赖 Task 21-25 全部完成
+- Task 27 依赖 Task 21（基于多服务实例的路径推导机制扩展 data_dir 参数）

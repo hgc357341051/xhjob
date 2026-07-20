@@ -178,14 +178,43 @@
 - [x] ~~迁移不丢失现有任务数据~~（已移除）
 - [x] ~~tests/migration.phpt 通过~~（已删除该测试）
 
+## 自定义数据目录（data_dir）
+- [x] `src/service/mod.rs` 新增 `CURRENT_DATA_DIR: OnceLock<String>` + `set_current_data_dir()` / `current_data_dir()`（env var `XHJOB_DATA_DIR` 兜底）
+- [x] `src/daemon/mod.rs` 所有路径推导与生命周期函数新增 `data_dir: Option<&str>` 参数；新增 `resolve_dir_path()` 优先级链解析
+- [x] 目录解析优先级：PHP 参数 > 细粒度 env var (`XHJOB_PID_DIR`/`XHJOB_SOCK_DIR`/`XHJOB_DB_DIR`/`XHJOB_LOG_DIR`) > `XHJOB_DATA_DIR` > 平台默认（Unix `/tmp` / Windows `%TEMP%`）
+- [x] `src/ipc/mod.rs` `ipc_path()` / `connect()` / `request()` / `bind_listener()` 接受 data_dir
+- [x] `src/ipc/unix_socket.rs` `bind()` / `connect()` 接受 data_dir，`bind()` 自动 `create_dir_all(parent)` 确保目录存在
+- [x] Windows Named Pipe 忽略 data_dir（`let _ = data_dir;`），但 PID/DB/Log 仍受 data_dir 控制
+- [x] `src/daemon/unix.rs` / `src/daemon/windows.rs` spawn 时编码 data_dir 到 `-r` 代码字符串（`xhjob_run_daemon('name', '/path');`）抵御 PHP version-manager shim 的 env var 清理，同时设置 `XHJOB_DATA_DIR` env var 兜底
+- [x] `src/daemon_main.rs` 读取 `current_data_dir()` 传给 `db_path_for`，调用 `create_dir_all(parent)`
+- [x] `src/outcome/mod.rs` `query_state()` / `query_result()` 接受 data_dir
+- [x] `src/store/mod.rs` `db_path_for()` 接受 data_dir，使用同样的优先级链解析
+- [x] `src/lib.rs` 所有 `xhjob_*` 函数新增 `data_dir: Option<String>` 参数；新增 `normalize_data_dir()` 辅助函数；`Xhjob` 类新增 `dataDir(string $dir)` 链式方法（snake→camel 自动转换）
+- [x] `src/task/mod.rs` `TaskBuilder` 新增 `data_dir: Option<String>` 字段与 `data_dir()` builder 方法（空字符串归一化为 None），`dispatch()` 传递 data_dir 给 `ipc_request`
+- [x] `xhjob_start('svc', '/var/lib/xhjob')` 后所有 pid/sock/db/log 文件落入指定目录
+- [x] `xhjob_stop('svc', '/var/lib/xhjob')` / `xhjob_status('svc', '/var/lib/xhjob')` / `xhjob_restart('svc', '/var/lib/xhjob')` 通过 data_dir 参数定位 daemon
+- [x] `Xhjob::task()->dataDir($dir)->dispatch()` 通过 data_dir 参数定位 IPC socket
+- [x] `xhjob_dispatch($json, 'svc', '/var/lib/xhjob')` / `xhjob_state($id, 'svc', '/var/lib/xhjob')` / `xhjob_result($id, 'svc', '/var/lib/xhjob')` 支持 data_dir 参数
+- [x] daemon 停止后 `.db` 文件保留在 data_dir（可用于备份/恢复）
+- [x] 用户指定目录不存在时自动 `mkdir -p` 创建（daemon 启动 + IPC bind 双保险）
+- [x] `data_dir` 为 `null` 或空字符串时回退到环境变量与平台默认（向后兼容）
+- [x] tests/data_dir_smoke.php 通过（设置 `XHJOB_PERSIST=1`，验证 pid/sock/db/log 全部在指定目录，任务成功执行，stop 后 db 保留）
+- [x] README.md 新增「自定义数据目录」章节（用途、函数 API、链式 API、备份/迁移示例）
+- [x] README.md 更新路径推导章节加入优先级链
+- [x] README.md 更新 API 参考表与环境变量表
+
 ## 文档与发布
-- [x] README.md 新增「多服务实例」「HTTP 代理」「Shell 编码转换」「Cron 自定义时区」章节
+- [x] README.md 新增「多服务实例」「HTTP 代理」「Shell 编码转换」「Cron 自定义时区」「自定义数据目录」章节
 - [x] examples/multi_service.php 示例可运行
 - [x] examples/proxy.php 示例可运行
 - [x] examples/encoding.php 示例可运行
 - [x] examples/timezone.php 示例可运行
 - [x] 全部 .phpt 测试通过（multi_service.phpt 在 phpenv shim 环境下 FAIL，标准 PHP SAPI 下 PASS；其余 5 PASS / 5 SKIP）
 - [x] cargo test 单元测试通过（默认 43 通过；--features persist 45 通过）
+- [x] cli_bus 4 步业务场景测试通过（start/operate/restart/stop）
+- [x] fpm_sim proc_test 10 步通过（多 worker 跨进程 daemon 共享）
+- [x] fpm_sim client_test 10 步通过（HTTP fpm 模拟）
+- [x] data_dir_smoke 专项测试通过（pid/sock/db/log 全部落入用户指定目录）
 - [x] 所有改动已 git add 并 commit 到本地主分支（commit 3639166 on main）
 - [ ] 代码已 push 到远程主分支（**待凭证就绪后执行 `git push origin main`**；当前沙箱无 GitHub 凭证）
 - [x] 本地已 checkout 到主分支（`git branch` 显示 `* main`）
