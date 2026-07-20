@@ -93,6 +93,39 @@ fn migrate_schema(conn: &rusqlite::Connection) -> Result<()> {
             tracing::info!("schema migrated: added column {}", col);
         }
     }
+
+    // Backfill NULL values in NOT-NULL-with-default columns. Legacy databases
+    // (created before the NOT NULL constraints were enforced, or via manual
+    // INSERTs that omitted columns) may contain NULLs that would break
+    // `task_from_row` when read back as non-Option integer types. Each UPDATE
+    // is a no-op on rows that already have a value, so this is safe to run
+    // on every open.
+    let backfills: &[(&str, &str)] = &[
+        ("retry_max", "0"),
+        ("retry_delay", "1"),
+        ("timeout", "30"),
+        ("priority", "0"),
+        ("allow_overlap", "0"),
+        ("max_instances", "1"),
+        ("coalesce", "1"),
+        ("persist", "0"),
+        ("attempts", "0"),
+    ];
+    for (col, default_val) in backfills {
+        // Skip columns that don't exist (e.g. a legacy schema missing a
+        // column entirely — they would have been added above with NULL
+        // default, but defensive check anyway).
+        if !cols.contains(*col) {
+            continue;
+        }
+        let sql = format!("UPDATE tasks SET {} = {} WHERE {} IS NULL", col, default_val, col);
+        let affected = conn.execute(&sql, [])
+            .map_err(|e| XhjobError::Store(format!("backfill {}: {}", col, e)))?;
+        if affected > 0 {
+            tracing::info!(col, affected, "backfilled NULL values to default");
+        }
+    }
+
     Ok(())
 }
 
