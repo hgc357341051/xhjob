@@ -198,6 +198,14 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
         out.push(("ignore_result".to_string(), info.ignore_result.to_string()));
         out.push(("acks_late".to_string(), info.acks_late.to_string()));
         out.push(("soft_timeout".to_string(), info.soft_timeout.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        // 追加 StateInfo 中已有但之前未透出的字段
+        out.push(("misfire_grace_time".to_string(), info.misfire_grace_time.to_string()));
+        out.push(("tags".to_string(), serde_json::to_string(&info.tags).unwrap_or_else(|_| "[]".to_string())));
+        out.push(("rate_limit_count".to_string(), info.rate_limit_count.to_string()));
+        out.push(("rate_limit_window".to_string(), info.rate_limit_window.to_string()));
+        out.push(("acks_on_failure".to_string(), info.acks_on_failure.to_string()));
+        out.push(("timezone".to_string(), info.timezone.clone().unwrap_or_default()));
+        out.push(("coalesce".to_string(), info.coalesce.to_string()));
     } else {
         out.push(("state".to_string(), "UNKNOWN".to_string()));
         out.push(("error".to_string(), "task not found or daemon not running".to_string()));
@@ -357,12 +365,18 @@ pub fn xhjob_cancel(id: String, name: Option<String>, data_dir: Option<String>) 
 
 /// List all tasks in a service, optionally filtered by state.
 /// Reference: APScheduler get_jobs.
-/// PHP: `xhjob_list(string $name = "default", string $state_filter = null, string $data_dir = null): string`
+/// PHP: `xhjob_list(string $name = "default", string $state_filter = null, string $tag = null, string $data_dir = null): string`
 /// Returns a JSON string of the form `{"tasks": [...]}`. PHP callers should
 /// `json_decode($result, true)` to obtain the associative array. On error the
-/// returned string starts with `error:`.
+/// returned string starts with `error:`. The `$tag` parameter (when non-null)
+/// is forwarded to the daemon as `tag_filter` for server-side tag filtering.
 #[php_function]
-pub fn xhjob_list(name: Option<String>, state_filter: Option<String>, data_dir: Option<String>) -> String {
+pub fn xhjob_list(
+    name: Option<String>,
+    state_filter: Option<String>,
+    tag: Option<String>,
+    data_dir: Option<String>,
+) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => return format!("error: {}", e),
@@ -373,7 +387,11 @@ pub fn xhjob_list(name: Option<String>, state_filter: Option<String>, data_dir: 
         None => pool::coroutine_pool::init_global_runtime(),
     };
     rt.block_on(async move {
-        let payload = serde_json::json!({ "state_filter": state_filter });
+        // 新增 tag_filter 字段，透传到 daemon 端 handle_list_op
+        let payload = serde_json::json!({
+            "state_filter": state_filter,
+            "tag_filter": tag,
+        });
         match ipc::request("list", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {

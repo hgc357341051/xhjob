@@ -46,8 +46,9 @@ $state = xhjob_state($id, "ignoreresult-svc");
 check("state eventually SUCCESS (machine still ran)",
     ($state['state'] ?? '') === 'SUCCESS',
     "state=" . ($state['state'] ?? ''));
+// 注意：xhjob_state 返回的 ignore_result 是字符串 'true'，不是 bool true
 check("ignore_result=true visible in state",
-    ($state['ignore_result'] ?? null) === true,
+    ($state['ignore_result'] ?? null) === 'true',
     "ignore_result=" . var_export($state['ignore_result'] ?? null, true));
 
 // Result should be null (no row saved).
@@ -70,8 +71,9 @@ $state2 = xhjob_state($id2, "ignoreresult-svc");
 check("state eventually SUCCESS",
     ($state2['state'] ?? '') === 'SUCCESS',
     "state=" . ($state2['state'] ?? ''));
+// 注意：xhjob_state 返回的 ignore_result 是字符串 'false'，不是 bool false
 check("ignore_result=false (default) visible in state",
-    ($state2['ignore_result'] ?? null) === false,
+    ($state2['ignore_result'] ?? null) === 'false',
     "ignore_result=" . var_export($state2['ignore_result'] ?? null, true));
 
 // Result should be present.
@@ -79,8 +81,9 @@ $result2 = xhjob_result($id2, "ignoreresult-svc");
 check("xhjob_result has stdout",
     isset($result2['stdout']) && str_contains($result2['stdout'], 'saved-result'),
     "result=" . json_encode($result2));
+// 注意：xhjob_result 返回的 exit_code 是字符串 '0'，不是 int 0
 check("xhjob_result exit_code=0",
-    ($result2['exit_code'] ?? -1) === 0,
+    ($result2['exit_code'] ?? -1) === '0',
     "exit_code=" . var_export($result2['exit_code'] ?? null, true));
 
 // Cleanup

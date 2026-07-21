@@ -61,6 +61,41 @@ impl TaskQueue {
             return Ok(());
         }
 
+        let now = now_ts();
+        // expires 检查（C6）：如果 Pending 任务已超过 expires 窗口
+        // （created_at + expires < now），直接转 Expired 终态。这是防御性
+        // 检查（scan_once 也会做），避免任务在 scan_once 间隔内被错误派发。
+        // 仅对 Pending 任务生效，不影响 Running 任务。
+        // Reference: APScheduler expires.
+        if task.expires > 0 && task.state == TaskState::Pending {
+            let expiry_ts = task.created_at.saturating_add(task.expires);
+            if now > expiry_ts {
+                let _ = self.store.update_state(
+                    &task.id,
+                    TaskState::Expired,
+                    None,
+                    Some(now),
+                ).await;
+                // 记录 Expired 事件（A17）—— 终态过期。
+                let _ = self.store.record_event(
+                    &task.id,
+                    crate::store::EventType::Expired,
+                    None,
+                    now as i64,
+                ).await;
+                return Ok(());
+            }
+        }
+        // start_date 检查：未到开始时间的任务跳过派发，保持 Pending。
+        // 这样 scan_once 的 expires 检查可以正常工作，避免任务被提前触发
+        // 后立即转 Success 终态，导致 expires 永远无法生效。
+        // Reference: APScheduler start_date.
+        if let Some(start_ts) = task.start_date {
+            if (now as i64) < start_ts {
+                return Ok(());
+            }
+        }
+
         // Overlap check
         if !self.overlap.should_fire(&self.store, &task).await? {
             return Ok(()); // skipped
@@ -193,18 +228,22 @@ impl TaskQueue {
                 }
             };
             if success {
-                if task_clone.cron.is_some() {
-                    // Cron task: increment execution_count FIRST, then
-                    // check max_executions. Only transition to Success
-                    // terminal when the limit is reached; otherwise revert
-                    // to Pending so scan_once (which filters terminal tasks
-                    // via load_active_tasks) can re-trigger this task on the
-                    // next cron tick.
+                if task_clone.cron.is_some() || task_clone.interval.is_some() {
+                    // 周期任务（cron / interval）: 先递增 execution_count，
+                    // 然后检查 max_executions。只有达到上限才进入 Success
+                    // 终态；否则保持 Pending 状态，让 scan_once 在下一个
+                    // 周期重新触发。
                     //
-                    // The previous order (Success -> increment) was buggy:
-                    // the immediate Success terminal state caused
-                    // load_active_tasks to drop the task, so execution_count
-                    // could never advance past 1.
+                    // 注意：run_at 是一次性任务（DateTrigger），不在此分支
+                    // 内。它在 scan_once 中直接转 Success 终态，process_one
+                    // 仍然走非周期任务分支（也是 Success 终态），行为保持
+                    // 一致。
+                    //
+                    // 历史背景：之前的顺序（先 Success 终态 -> 再递增 count）
+                    // 是有 bug 的：Success 终态导致 load_active_tasks 把
+                    // 任务过滤掉，execution_count 永远无法递增到 2 以上。
+                    // interval 任务之前被错误归入"非 cron 任务"分支，触发
+                    // 一次后立即 Success 终态，周期触发被提前终止。
                     if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
                         if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
                             let _ = store.update_state(
@@ -228,7 +267,7 @@ impl TaskQueue {
                                 Some(finished),
                             ).await;
                             // Record a `Succeeded` event (A17) — non-terminal
-                            // success (cron task will re-trigger).
+                            // success (周期任务将由 scan_once 重新触发)。
                             let _ = store.record_event(
                                 &task_clone.id,
                                 crate::store::EventType::Succeeded,
@@ -238,9 +277,9 @@ impl TaskQueue {
                         }
                     }
                 } else {
-                    // Non-cron task: original behavior — immediate Success
-                    // terminal state, then increment execution_count for
-                    // bookkeeping.
+                    // 非周期任务（包括 run_at 一次性任务）: 立即进入 Success
+                    // 终态，然后递增 execution_count 作为记账。原始逻辑保持
+                    // 不变。
                     let _ = store.update_state(
                         &task_clone.id,
                         TaskState::Success,

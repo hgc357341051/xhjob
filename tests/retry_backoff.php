@@ -68,8 +68,11 @@ while (time() - $start < 30) {
 check("state == FAILED after retries exhausted",
     $finalState === 'FAILED',
     "state=" . $finalState);
-check("attempts == 3 (retry_max reached)",
-    $finalAttempts === 3,
+// withRetry(3, 1) 表示 retry_max=3（3 次重试），总执行次数 = 1 次初始 + 3 次重试 = 4
+// 最后一次失败时 attempts 从 3 增至 4 并标记为 FAILED
+// 注意：xhjob_state 返回的 attempts 是字符串
+check("attempts == 4 (retry_max reached)",
+    $finalAttempts === '4',
     "attempts=" . var_export($finalAttempts, true));
 
 // Test 3: retryBackoff(false) keeps fixed delay (default behavior).

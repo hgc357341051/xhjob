@@ -129,6 +129,10 @@ impl SqliteStore {
         ensure_column(&conn, "rate_limit_count", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "rate_limit_window", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "acks_on_failure", "INTEGER NOT NULL DEFAULT 1")?;
+        // 以下两列在 CREATE TABLE 中已存在，但早期版本的旧库可能缺失，
+        // 这里补齐迁移以保证 schema 完整性。
+        ensure_column(&conn, "timezone", "TEXT")?;
+        ensure_column(&conn, "coalesce", "INTEGER NOT NULL DEFAULT 1")?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
@@ -243,7 +247,7 @@ impl TaskStore for SqliteStore {
                   interval, run_at, jitter, expires, retry_backoff, ignore_result,
                   acks_late, soft_timeout, misfire_grace_time, replace_existing,
                   tags, rate_limit_count, rate_limit_window, acks_on_failure)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,

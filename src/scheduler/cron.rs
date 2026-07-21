@@ -125,6 +125,9 @@ impl CronScheduler {
             // Task-level expires (C6): if a task is still Pending (not Running)
             // and expires > 0 and (created_at + expires) < now, transition to
             // Expired terminal state. Running tasks are NOT affected.
+            // 该检查位于 start_date / interval / cron 触发逻辑之前，确保
+            // 即使 next_fire > now（看似不应触发），只要 expires 窗口已过，
+            // 任务也会被置为 Expired 终态，不会被误触发。
             // Reference: APScheduler expires.
             if task.expires > 0 && task.state == TaskState::Pending {
                 let expiry_ts = task.created_at.saturating_add(task.expires);
@@ -134,6 +137,13 @@ impl CronScheduler {
                         TaskState::Expired,
                         None,
                         Some(now_ts()),
+                    ).await;
+                    // 记录 Expired 事件（A17）—— 终态过期。
+                    let _ = self.store.record_event(
+                        &task.id,
+                        crate::store::EventType::Expired,
+                        None,
+                        now as i64,
                     ).await;
                     continue;
                 }
@@ -181,10 +191,17 @@ impl CronScheduler {
             }
             // IntervalTrigger (every): fires every `interval` seconds.
             // After firing, next_fire is advanced to now + interval (+ jitter).
+            // 如果 next_fire 为 None（任务刚创建尚未触发过，例如被 daemon
+            // 立即 enqueue 由 process_one 派发过一次但未推进 next_fire），
+            // 使用 created_at + interval 作为首次触发时间。这样首次触发
+            // 发生在创建后一个 interval，与 APScheduler IntervalTrigger 的
+            // 语义一致，避免任务因 next_fire=None 永远无法被 scan_once
+            // 重新触发。
             // Reference: APScheduler IntervalTrigger.
             if let Some(secs) = task.interval {
                 if task.cron.is_none() {
-                    let next = task.next_fire.unwrap_or_else(|| now + secs);
+                    let next = task.next_fire
+                        .unwrap_or_else(|| task.created_at.saturating_add(secs));
                     if next <= now {
                         due.push(task.id.clone());
                         let mut new_next = now + secs;

@@ -64,8 +64,9 @@ $state = xhjob_state($id, "requeue-svc");
 check("state == PENDING after requeue",
     ($state['state'] ?? '') === 'PENDING',
     "state=" . ($state['state'] ?? ''));
+// 注意：xhjob_state 返回的 attempts 是字符串 '0'，不是 int 0
 check("attempts == 0 after requeue",
-    ($state['attempts'] ?? -1) === 0,
+    ($state['attempts'] ?? -1) === '0',
     "attempts=" . var_export($state['attempts'] ?? null, true));
 
 // Test 3: requeue should be idempotent-false on a non-terminal task.

@@ -7,14 +7,13 @@
  * that tag-based filtering correctly selects matching tasks.
  *
  * Note: The PHP-facing xhjob_list() function signature is
- *   xhjob_list(name, state_filter, data_dir)
- * and does not expose a server-side tag_filter parameter (the daemon's
- * handle_list_op does support tag_filter, but it is not wired through the PHP
- * binding). This test verifies tags via:
+ *   xhjob_list(name, state_filter, tag, data_dir)
+ * 共 4 参数，第三参数 tag 为服务端 tag 过滤。调用时若不需 tag 过滤，
+ * 必须显式传 null（否则会把后续的 $dataDir 误当成 tag）。
+ * 本测试通过两条路径验证 tags：
  *   - xhjob_get (full Task JSON includes tags field)
  *   - xhjob_list (TaskSummary includes tags field) + client-side filtering
- * It also attempts the 4-argument xhjob_list form in a try/catch to detect
- * whether the PHP binding exposes the tag parameter.
+ * 并直接使用 4 参数形式验证服务端 tag 过滤。
  *
  * Reference: APScheduler tags.
  */
@@ -86,8 +85,10 @@ ok(is_array($g3) && ($g3['tags'] ?? null) === ['billing', 'urgent'],
     "task3 tags=[billing,urgent] (got=" . json_encode($g3['tags'] ?? null) . ")");
 
 // xhjob_list (no tag filter) returns all 3 tasks
+// 注意：xhjob_list 当前签名为 (name, state_filter, tag, data_dir) 共 4 参数。
+// 必须显式传 null 作为 tag，否则 $dataDir 会被当成 tag 过滤导致返回空列表。
 echo "Test 2: xhjob_list returns all 3 tasks (no filter)\n";
-$listJson = xhjob_list("default", null, $dataDir);
+$listJson = xhjob_list("default", null, null, $dataDir);
 $allTasks = json_decode($listJson, true);
 if (!is_array($allTasks)) $allTasks = [];
 $allIds = array_column($allTasks, 'id');
@@ -130,13 +131,12 @@ foreach ($allTasks as $t) {
 }
 ok(count($nonexistentIds) === 0, "no tasks match 'nonexistent' tag (got=" . count($nonexistentIds) . ")");
 
-// Attempt server-side tag filter via 4-argument xhjob_list (may not be exposed)
+// 服务端 tag 过滤：直接使用 4 参数形式 xhjob_list(name, state_filter, tag, data_dir)
 echo "Test 6: server-side tag filter via xhjob_list (4-arg form)\n";
 $serverTagSupported = false;
 $serverTagBillingIds = [];
 try {
-    // The PHP binding signature is xhjob_list(name, state_filter, data_dir).
-    // If a 4th tag argument is accepted, it would be server-side filtering.
+    // 4 参数签名：name=default, state_filter=null, tag="billing", data_dir=$dataDir
     $tagListJson = xhjob_list("default", null, "billing", $dataDir);
     $tagTasks = json_decode($tagListJson, true);
     if (is_array($tagTasks)) {
@@ -144,14 +144,14 @@ try {
         $serverTagBillingIds = array_column($tagTasks, 'id');
     }
 } catch (\ArgumentCountError $e) {
-    // PHP binding does not expose a 4th tag argument.
+    // 兜底：若 PHP 绑定未暴露 4 参数形式则跳过服务端验证
 }
 if ($serverTagSupported) {
     ok(in_array($id1, $serverTagBillingIds), "server-side filter: task1 matched");
     ok(in_array($id3, $serverTagBillingIds), "server-side filter: task3 matched");
     ok(!in_array($id2, $serverTagBillingIds), "server-side filter: task2 NOT matched");
 } else {
-    skip("server-side tag_filter not exposed by PHP xhjob_list (3-arg signature); verified via client-side filtering instead");
+    skip("server-side tag_filter not exposed by PHP xhjob_list; verified via client-side filtering instead");
 }
 
 // Cleanup

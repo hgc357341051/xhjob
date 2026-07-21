@@ -61,8 +61,9 @@ $result = xhjob_result($id, "softtimeout-svc");
 check("stdout contains CAUGHT (trap fired)",
     isset($result['stdout']) && str_contains($result['stdout'], 'CAUGHT'),
     "stdout=" . var_export($result['stdout'] ?? null, true));
+// 注意：xhjob_result 返回的 exit_code 是字符串 '0'，不是 int 0
 check("exit_code=0 (clean exit via trap)",
-    ($result['exit_code'] ?? -1) === 0,
+    ($result['exit_code'] ?? -1) === '0',
     "exit_code=" . var_export($result['exit_code'] ?? null, true));
 
 // Test 2: softTimeout(2)+timeout(4) + ignore SIGTERM → state=FAILED.
@@ -120,8 +121,10 @@ check("Task JSON has soft_timeout=2",
 
 $json3 = xhjob_get($id3, "softtimeout-svc");
 $task3 = is_string($json3) ? json_decode($json3, true) : null;
+// 注意：当 soft_timeout 为 None 时，Task JSON 中可能省略该字段（serde skip_serializing_if）
+// 或值为 null。两种情况都应视为 "disabled"。使用 ?? null 兜底，让缺失字段也判为 null。
 check("Task JSON has soft_timeout=null for Test 3",
-    is_array($task3) && ($task3['soft_timeout'] ?? 'missing') === null,
+    is_array($task3) && ($task3['soft_timeout'] ?? null) === null,
     "soft_timeout=" . var_export($task3['soft_timeout'] ?? 'missing', true));
 
 // Cleanup

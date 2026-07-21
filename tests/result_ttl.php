@@ -52,21 +52,23 @@ check("result has stdout immediately after SUCCESS",
     !empty($result['stdout']),
     "stdout=" . var_export($result['stdout'] ?? null, true));
 
-// Wait for TTL to expire + daemon cleanup cycle (60s throttle, but in-memory cleanup may happen on next scan_once)
-// Wait 5 seconds to ensure TTL=2s is exceeded and cleanup runs
-echo "  waiting 5s for TTL expiry + cleanup...\n";
-sleep(5);
-
-// Manually trigger another task to force scan_once (which runs cleanup_expired_results)
-$triggerId = Xhjob::task()
-    ->service('result-ttl-svc')
-    ->viaShell('echo trigger')
-    ->dispatch();
-usleep(500_000);
+// 等待 TTL 过期 + cleanup 周期。
+// 注意：daemon 端 cleanup_expired_results 被 60s 节流（LAST_CLEANUP_TS），
+// 首次 scan_once 时会执行一次 cleanup（此时任务尚未完成，无 result 可清），
+// 下一次 cleanup 最早要在 60s 后才会再次执行。
+// 因此这里轮询最多 70s，等待 result 被清理。
+echo "  waiting for TTL expiry + cleanup (throttled to 60s, polling up to 70s)...\n";
+$cleaned = false;
+$result = xhjob_result($id, "result-ttl-svc");
+$waitStart = time();
+while (time() - $waitStart < 70) {
+    $result = xhjob_result($id, "result-ttl-svc");
+    $cleaned = empty($result['stdout']) && empty($result['body']) && empty($result['exit_code']);
+    if ($cleaned) break;
+    sleep(1);
+}
 
 // Now check result - should be cleaned up
-$result = xhjob_result($id, "result-ttl-svc");
-$cleaned = empty($result['stdout']) && empty($result['body']) && empty($result['exit_code']);
 check("result cleared after TTL",
     $cleaned,
     "stdout=" . var_export($result['stdout'] ?? null, true) . " exit=" . var_export($result['exit_code'] ?? null, true));
@@ -79,7 +81,6 @@ check("task state still queryable after result cleanup",
 
 // Cleanup
 xhjob_remove($id, "result-ttl-svc");
-xhjob_remove($triggerId, "result-ttl-svc");
 xhjob_stop("result-ttl-svc");
 
 echo "\n=== Summary ===\n";

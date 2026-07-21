@@ -52,8 +52,10 @@ $state = xhjob_state($id, "ackslate-svc");
 check("state eventually SUCCESS",
     ($state['state'] ?? '') === 'SUCCESS',
     "state=" . ($state['state'] ?? ''));
+// 注意：xhjob_state 返回的 acks_late 是字符串 'true'，不是 bool true
+// （xhjob_get 返回的 Task JSON 中 acks_late 才是 bool true）
 check("acks_late=true visible in state",
-    ($state['acks_late'] ?? null) === true,
+    ($state['acks_late'] ?? null) === 'true',
     "acks_late=" . var_export($state['acks_late'] ?? null, true));
 
 // Test 2: default (acksLate not called) — acks_late=false in state.
@@ -70,8 +72,9 @@ $state2 = xhjob_state($id2, "ackslate-svc");
 check("state eventually SUCCESS",
     ($state2['state'] ?? '') === 'SUCCESS',
     "state=" . ($state2['state'] ?? ''));
+// 注意：xhjob_state 返回的 acks_late 是字符串 'false'，不是 bool false
 check("acks_late=false (default) visible in state",
-    ($state2['acks_late'] ?? null) === false,
+    ($state2['acks_late'] ?? null) === 'false',
     "acks_late=" . var_export($state2['acks_late'] ?? null, true));
 
 // Test 3: xhjob_get() returns full Task JSON with acks_late field.
