@@ -283,8 +283,20 @@ async fn handle_dispatch(
     // replace_existing (A14): when true and the user supplied an explicit
     // `id`, drop any pre-existing task with the same id before inserting.
     // Mirrors APScheduler's `replace_existing=True` semantics.
+    //
+    // When false (default): detect id conflict and return an error rather
+    // than silently overwriting the existing task. The underlying stores
+    // (SqliteStore `INSERT OR REPLACE`, InMemoryStore `HashMap::insert`)
+    // would silently overwrite, so the conflict check must happen here at
+    // the daemon layer. Reference: APScheduler replace_existing=False raises
+    // ConflictingIdError.
     if task.replace_existing {
         let _ = store.delete_task(&task.id).await;
+    } else if let Ok(Some(_existing)) = store.load_task(&task.id).await {
+        return Ok(Response::error(0, format!(
+            "task id '{}' already exists; use replace_existing=true to overwrite",
+            task.id
+        )));
     }
     store.insert_task(task).await?;
     queue.enqueue(&task_id, priority).await?;

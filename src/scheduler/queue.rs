@@ -150,8 +150,16 @@ impl TaskQueue {
             // policy with the synthetic result (network error -> retryable).
             if let Some(err_str) = dispatch_err {
                 let synthetic = crate::store::TaskResult::default();
+                // acks_on_failure (C13): when false, dispatch errors are
+                // retried indefinitely (ignoring retry_max). Same override
+                // as the failure path below.
+                let effective_retry_max = if task_clone.acks_on_failure {
+                    task_clone.retry_max
+                } else {
+                    u32::MAX
+                };
                 let policy = crate::retry::RetryPolicy::new(
-                    task_clone.retry_max, task_clone.retry_delay,
+                    effective_retry_max, task_clone.retry_delay,
                 );
                 if !policy.should_retry(&task_clone, &synthetic) {
                     let _ = store.update_state(
@@ -166,7 +174,7 @@ impl TaskQueue {
                         Some(format!("not retryable: {}", err_str)),
                     ).await;
                 } else {
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_str).await;
+                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_str, effective_retry_max).await;
                 }
                 overlap.on_finish(&task_clone.id).await;
                 return;
@@ -306,7 +314,7 @@ impl TaskQueue {
                 } else {
                     // Retryable: schedule retry (which itself may
                     // permanently fail if attempts are exhausted).
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone()).await;
+                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone(), effective_retry_max).await;
                     // Record a `Failed` event (A17) for the individual
                     // attempt; the retry will be processed separately.
                     let _ = store.record_event(

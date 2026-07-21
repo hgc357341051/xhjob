@@ -50,8 +50,13 @@ impl RetryPolicy {
     /// Whether the task should be retried.
     /// Returns true if attempts < max_attempts AND the result indicates a
     /// retryable failure (HTTP 5xx, shell non-zero exit, or network error).
+    ///
+    /// Note: comparison uses `self.max_attempts` (which may be `u32::MAX` for
+    /// `acks_on_failure=false` tasks) rather than `task.retry_max`, so the
+    /// caller can override the per-task retry ceiling via `RetryPolicy::new`.
+    /// Reference: Celery acks_on_failure (false → retry indefinitely).
     pub fn should_retry(&self, task: &Task, result: &TaskResult) -> bool {
-        if task.attempts >= task.retry_max {
+        if task.attempts >= self.max_attempts {
             return false;
         }
         match task.task_type {
@@ -127,12 +132,18 @@ pub fn next_retry_ts(task: &Task) -> u64 {
 /// reset state to PENDING, and update next_fire to the retry time.
 ///
 /// Returns true if retry was scheduled, false if max attempts reached.
+///
+/// `effective_max_attempts` lets the caller override `task.retry_max`
+/// (e.g. for `acks_on_failure=false` where the policy is "retry
+/// indefinitely"). When `u32::MAX` is passed the function never reaches
+/// the permanent FAILED branch. Reference: Celery acks_on_failure.
 pub async fn schedule_retry(
     store: &Arc<dyn TaskStore>,
     task: &Task,
     error: String,
+    effective_max_attempts: u32,
 ) -> Result<bool> {
-    if task.attempts >= task.retry_max {
+    if task.attempts >= effective_max_attempts {
         // Mark as FAILED permanently
         store.update_state(
             &task.id,
@@ -169,7 +180,10 @@ mod tests {
         let mut task = Task::new(TaskType::Http, serde_json::json!({}));
         task.retry_max = 3;
         task.attempts = 0;
-        let p = RetryPolicy::default();
+        // Use RetryPolicy::new (max_attempts=3) instead of Default (max_attempts=0).
+        // The new should_retry reads self.max_attempts, not task.retry_max, so
+        // the policy must be constructed with the actual retry ceiling.
+        let p = RetryPolicy::new(3, 1);
 
         // HTTP 200 -> success, not retryable
         let mut ok = TaskResult::default();
@@ -196,7 +210,7 @@ mod tests {
         let mut task = Task::new(TaskType::Http, serde_json::json!({}));
         task.retry_max = 3;
         task.attempts = 0;
-        let p = RetryPolicy::default();
+        let p = RetryPolicy::new(3, 1);
         let mut result = TaskResult::default();
         result.status_code = Some(404);
         assert!(!p.should_retry(&task, &result),
@@ -208,11 +222,31 @@ mod tests {
         let mut task = Task::new(TaskType::Http, serde_json::json!({}));
         task.retry_max = 3;
         task.attempts = 0;
-        let p = RetryPolicy::default();
+        let p = RetryPolicy::new(3, 1);
         // Network error: no status_code at all -> retryable.
         let result = TaskResult::default();
         assert!(p.should_retry(&task, &result),
             "network error (status_code=None) should be retryable");
+    }
+
+    /// acks_on_failure (C13) override: when RetryPolicy is constructed with
+    /// `u32::MAX` (the queue-level override for `acks_on_failure=false`),
+    /// should_retry must keep returning true even after many attempts.
+    /// Reference: Celery acks_on_failure.
+    #[test]
+    fn test_should_retry_acks_on_failure_false_never_exhausts() {
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd":"false"}));
+        task.retry_max = 1;
+        task.attempts = 5; // already past retry_max
+        let p = RetryPolicy::new(u32::MAX, 1);
+        let mut result = TaskResult::default();
+        result.exit_code = Some(1);
+        assert!(p.should_retry(&task, &result),
+            "acks_on_failure=false should keep retrying past retry_max");
+        // Even at attempts=1000, should still retry.
+        task.attempts = 1000;
+        assert!(p.should_retry(&task, &result),
+            "acks_on_failure=false should keep retrying indefinitely");
     }
 
     #[test]
