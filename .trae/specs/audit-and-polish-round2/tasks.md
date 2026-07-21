@@ -248,7 +248,7 @@
   - [x] SubTask 30.8: 单元测试 `test_exponential_backoff_delay_sequence` 验证 attempts=1→1s, 2→2s, 3→4s, 4→8s, 5→16s, 上限 60s
   - [x] SubTask 30.9: `tests/retry_backoff.php` 验证 retryBackoff(true) + withRetry(3,1) + HTTP 500 URL 重试间隔递增
 
-- [ ] Task 31: README + examples 文档更新（A7-A9 + C6-C8 新对齐项）
+- [x] Task 31: README + examples 文档更新（A7-A9 + C6-C8 新对齐项）
   - [ ] SubTask 31.1: Xhjob 类方法表新增 `every` / `runAt` / `jitter` / `expires` / `retryBackoff` 5 行
   - [ ] SubTask 31.2: 顶层函数表新增 `xhjob_requeue` 行
   - [ ] SubTask 31.3: `xhjob_state` 返回说明新增 `interval` / `run_at` / `jitter` / `expires` / `retry_backoff` 5 字段
@@ -264,7 +264,7 @@
   - [ ] SubTask 31.13: 新增 `examples/cron_runAt.php` 演示 runAt()
   - [ ] SubTask 31.14: 新增 `examples/cron_jitter.php` 演示 jitter()
 
-- [ ] Task 32: 新增 6 个对齐测试文件（A7-A9 + C6-C8）
+- [x] Task 32: 新增 6 个对齐测试文件（A7-A9 + C6-C8）
   - [ ] SubTask 32.1: `tests/interval_trigger.php` 验证 every(2) 周期触发至少 2 次（PASS）
   - [ ] SubTask 32.2: `tests/run_at_trigger.php` 验证 runAt(time()+3) 一次性触发后 state=SUCCESS（PASS）
   - [ ] SubTask 32.3: `tests/jitter_test.php` 验证 jitter(5) 多任务触发时刻分散（PASS）
@@ -401,7 +401,7 @@
   - [x] SubTask 41.12: 单元测试 `test_soft_timeout_ge_timeout_ignored`：softTimeout(15)+timeout(10) → warn + soft_timeout 字段为 None
   - [x] SubTask 41.13: `tests/soft_timeout_test.php` 端到端验证 SIGTERM 优雅退出
 
-- [ ] Task 42: README + examples 文档更新（A10-A12 + C9-C11 第三轮对齐项）
+- [x] Task 42: README + examples 文档更新（A10-A12 + C9-C11 第三轮对齐项）
   - [ ] SubTask 42.1: Xhjob 类方法表新增 `ignoreResult(bool $on)` / `acksLate(bool $on)` / `softTimeout(int $secs)` 3 行；`maxInstances(int $n)` 行补充"独立于 allowOverlap 生效"说明
   - [ ] SubTask 42.2: 顶层函数表新增 `xhjob_reschedule` / `xhjob_get` 2 行
   - [ ] SubTask 42.3: `xhjob_state` 返回说明新增 `ignore_result` / `acks_late` / `soft_timeout` 3 字段
@@ -415,7 +415,7 @@
   - [ ] SubTask 42.11: 新增 `examples/cron_maxInstances.php` 演示 maxInstances(2) 并发执行
   - [ ] SubTask 42.12: 新增 `examples/cron_reschedule.php` 演示 xhjob_reschedule 在线修改 cron
 
-- [ ] Task 43: 新增 6 个第三轮对齐测试文件（A10-A12 + C9-C11）
+- [x] Task 43: 新增 6 个第三轮对齐测试文件（A10-A12 + C9-C11）
   - [ ] SubTask 43.1: `tests/max_instances_test.php` 验证 maxInstances(2) 允许 2 个并发 + 第 3 个被跳过（PASS）
   - [ ] SubTask 43.2: `tests/reschedule_test.php` 验证 reschedule 修改 cron + 保留 execution_count（PASS）
   - [ ] SubTask 43.3: `tests/get_job_test.php` 验证 xhjob_get 返回完整 Task JSON 字段（PASS）
@@ -537,7 +537,7 @@
   - [ ] SubTask 46.5: `git push origin main` 推送到远程主分支
   - [ ] SubTask 46.6: `git log origin/main --oneline -5` 确认远程 HEAD 已更新
 
-- [ ] Task 47: 新功能 A13 — misfire_grace_time 每作业级（per-job 覆盖全局默认 60s）
+- [x] Task 47: 新功能 A13 — misfire_grace_time 每作业级（per-job 覆盖全局默认 60s）
   - [ ] SubTask 47.1: `Task` struct 新增 `misfire_grace_time: u64` 字段（默认 0=使用全局默认 60s），带 `#[serde(default)]`
   - [ ] SubTask 47.2: `TaskBuilder` 新增 `misfire_grace_time: u64` 字段 + builder 方法 `misfire_grace_time(secs: u64)` + `build()` 复制
   - [ ] SubTask 47.3: `Xhjob` 类新增 `misfire_grace_time(&mut self, secs: i64)`，PHP 暴露为 `misfireGraceTime(int $secs): $this`
@@ -552,7 +552,7 @@
   - [ ] SubTask 47.12: 单元测试 `test_misfire_grace_time_ignored_for_non_cron`：interval/runAt 任务 warn 并忽略
   - [ ] SubTask 47.13: `tests/misfire_grace_time_test.php` 端到端验证 misfireGraceTime(5) 与全局默认对比 + coalesce 配合
 
-- [ ] Task 48: 新功能 A14 — replace_existing 幂等 dispatch（withId + replaceExisting）
+- [x] Task 48: 新功能 A14 — replace_existing 幂等 dispatch（withId + replaceExisting）
   - [ ] SubTask 48.1: `Task` struct 新增 `id: Option<String>` 字段（自定义 id，None 时系统生成 UUID），带 `#[serde(default)]`
   - [ ] SubTask 48.2: `Task` struct 新增 `replace_existing: bool` 字段（默认 false），带 `#[serde(default)]`
   - [ ] SubTask 48.3: `TaskBuilder` 新增 `id: Option<String>` + `replace_existing: bool` 字段 + builder 方法 `id(s: impl Into<String>)` / `replace_existing(on: bool)` + `build()` 复制
@@ -569,7 +569,7 @@
   - [ ] SubTask 48.12: 单元测试 `test_replace_existing_overrides_terminal_task`：withId('x')->maxExecutions(3) 执行 3 次终态后 replaceExisting(true) 覆盖 → 新 task 状态 Pending
   - [ ] SubTask 48.13: `tests/replace_existing_test.php` 端到端验证部署脚本幂等场景
 
-- [ ] Task 49: 新功能 A15 — tags 作业分组（tags 标记 + xhjob_list 按 tag 过滤）
+- [x] Task 49: 新功能 A15 — tags 作业分组（tags 标记 + xhjob_list 按 tag 过滤）
   - [ ] SubTask 49.1: `Task` struct 新增 `tags: Vec<String>` 字段（默认空 Vec），带 `#[serde(default)]`
   - [ ] SubTask 49.2: `TaskBuilder` 新增 `tags: Vec<String>` 字段 + builder 方法 `tags(tags: &[&str])`（接受切片）+ `build()` 复制
   - [ ] SubTask 49.3: `Xhjob` 类新增 `tags(&mut self, tags: Vec<String>)`，PHP 暴露为 `tags(array $tags): $this`（PHP 端接收数组转 Vec<String>）
@@ -588,7 +588,7 @@
   - [ ] SubTask 49.16: 单元测试 `test_tags_persisted_after_restart`：tags 持久化到 SQLite，restart 后 xhjob_get 仍返回 tags
   - [ ] SubTask 49.17: `tests/tags_test.php` 端到端验证 tags 标记 + xhjob_list 按 tag 过滤
 
-- [ ] Task 50: 新功能 C12 — rate_limit 每任务限流（滑动窗口限制单位时间触发数）
+- [x] Task 50: 新功能 C12 — rate_limit 每任务限流（滑动窗口限制单位时间触发数）
   - [ ] SubTask 50.1: `Task` struct 新增 `rate_limit_count: u32`（默认 0=不限流）+ `rate_limit_window: u64`（默认 0）字段，带 `#[serde(default)]`
   - [ ] SubTask 50.2: `TaskBuilder` 新增 `rate_limit_count: u32` + `rate_limit_window: u64` 字段 + builder 方法 `rate_limit(max_count: u32, window_secs: u64)` + `build()` 复制
   - [ ] SubTask 50.3: `Xhjob` 类新增 `rate_limit(&mut self, max_count: i64, window_secs: i64)`，PHP 暴露为 `rateLimit(int $maxCount, int $windowSecs): $this`
@@ -605,7 +605,7 @@
   - [ ] SubTask 50.14: 单元测试 `test_rate_limit_rebuild_after_restart`：daemon 重启后从 store started_at 重建窗口计数
   - [ ] SubTask 50.15: `tests/rate_limit_test.php` 端到端验证 rateLimit(3, 10) 在 10s 窗口内最多 3 次触发
 
-- [ ] Task 51: 新功能 C13 — acks_on_failure 失败不放弃（与 acksLate 互补）
+- [x] Task 51: 新功能 C13 — acks_on_failure 失败不放弃（与 acksLate 互补）
   - [ ] SubTask 51.1: `Task` struct 新增 `acks_on_failure: bool` 字段（默认 true 保持当前行为），带 `#[serde(default)]`
   - [ ] SubTask 51.2: `TaskBuilder` 新增 `acks_on_failure: bool` 字段 + builder 方法 `acks_on_failure(on: bool)` + `build()` 复制
   - [ ] SubTask 51.3: `Xhjob` 类新增 `acks_on_failure(&mut self, on: bool)`，PHP 暴露为 `acksOnFailure(bool $on): $this`
@@ -625,7 +625,7 @@
   - [ ] SubTask 51.15: 单元测试 `test_acks_on_false_plus_acks_late_complementary`：acksOnFailure(false)+acksLate(true) → daemon 崩溃重启后 acksLate 重排 + acksOnFailure 让失败持续重试
   - [ ] SubTask 51.16: `tests/acks_on_failure_test.php` 端到端验证失败任务持续重试
 
-- [ ] Task 52: 新功能 C14 — worker_max_tasks_per_child daemon 自我回收（环境变量配置 + 优雅退出）
+- [x] Task 52: 新功能 C14 — worker_max_tasks_per_child daemon 自我回收（环境变量配置 + 优雅退出）
   - [ ] SubTask 52.1: `daemon_main.rs::Config` 新增 `max_tasks_per_child: u64` 字段（从环境变量 `XHJOB_MAX_TASKS_PER_CHILD` 读取，默认 0=不回收）
   - [ ] SubTask 52.2: `daemon_main.rs::run` 中维护 `tasks_executed_since_start: AtomicU64`（全局原子计数器，避免锁竞争）
   - [ ] SubTask 52.3: `process_one` 完成后（无论成功失败）`tasks_executed_since_start.fetch_add(1, Ordering::Relaxed)` 递增
@@ -640,7 +640,7 @@
   - [ ] SubTask 52.12: 单元测试 `test_max_tasks_per_child_counter_resets_on_restart`：daemon 重启后计数器从 0 开始
   - [ ] SubTask 52.13: `tests/max_tasks_per_child_test.php` 端到端验证 `XHJOB_MAX_TASKS_PER_CHILD=5 xhjob_daemon` 执行 5 个任务后退出
 
-- [ ] Task 53: README + examples 文档更新（A13-A15 + C12-C14 第四轮对齐项）
+- [x] Task 53: README + examples 文档更新（A13-A15 + C12-C14 第四轮对齐项）
   - [ ] SubTask 53.1: Xhjob 类方法表新增 `misfireGraceTime(int $secs): $this` / `withId(string $id): $this` / `replaceExisting(bool $on): $this` / `tags(array $tags): $this` / `rateLimit(int $maxCount, int $windowSecs): $this` / `acksOnFailure(bool $on): $this` 6 行
   - [ ] SubTask 53.2: 顶层函数 `xhjob_list` 行更新签名为 `xhjob_list($name='default', $state_filter=null, $tag=null, $data_dir=null): string`（含可选 $tag）
   - [ ] SubTask 53.3: `xhjob_state` 返回说明新增 `misfire_grace_time` / `tags` / `rate_limit_count` / `rate_limit_window` / `acks_on_failure` 字段
@@ -656,7 +656,7 @@
   - [ ] SubTask 53.13: 新增 `examples/cron_tags.php`：演示 tags 标记 + xhjob_list 按 tag 过滤（A15）
   - [ ] SubTask 53.14: 新增 `examples/cron_rateLimit.php`：演示 rateLimit 限流外部 API 调用（C12）
 
-- [ ] Task 54: 新增 6 个第四轮对齐测试文件（A13-A15 + C12-C14）
+- [x] Task 54: 新增 6 个第四轮对齐测试文件（A13-A15 + C12-C14）
   - [ ] SubTask 54.1: `tests/misfire_grace_time_test.php` 验证 misfireGraceTime(5) 短窗口跳过 6s 延迟 + 默认 0 用全局 60s（PASS）
   - [ ] SubTask 54.2: `tests/replace_existing_test.php` 验证 withId + replaceExisting(true) 同 id 重跑覆盖 + replaceExisting(false) 报错（PASS）
   - [ ] SubTask 54.3: `tests/tags_test.php` 验证 tags 标记 + xhjob_list 按 tag 过滤 + 默认空数组不返回（PASS）
@@ -743,7 +743,7 @@
   - [ ] SubTask 57.5: `git push origin main` 推送到远程主分支
   - [ ] SubTask 57.6: `git log origin/main --oneline -5` 确认远程 HEAD 已更新
 
-- [ ] Task 58: 新功能 A16 — timezone per-job（每作业独立时区，对齐 APScheduler `CronTrigger(timezone=...)`）
+- [x] Task 58: 新功能 A16 — timezone per-job（每作业独立时区，对齐 APScheduler `CronTrigger(timezone=...)`）
   - [ ] SubTask 58.1: `Cargo.toml` 新增 `chrono-tz = "0.9"` 依赖
   - [ ] SubTask 58.2: `Task` struct 新增 `timezone: Option<String>` 字段（默认 None = 使用 daemon 全局时区，向后兼容），加 `#[serde(default)]`
   - [ ] SubTask 58.3: `Task::new` 初始化为 None
@@ -761,7 +761,7 @@
   - [ ] SubTask 58.15: 单元测试 `test_timezone_ignored_for_interval_tasks`：interval + timezone → warn + 忽略
   - [ ] SubTask 58.16: `tests/timezone_test.php` 端到端验证 timezone('America/New_York') cron 任务按纽约时区评估
 
-- [ ] Task 59: 新功能 A17 — Event listener API（任务执行事件流查询，对齐 APScheduler `add_listener` + `EVENT_JOB_*`）
+- [x] Task 59: 新功能 A17 — Event listener API（任务执行事件流查询，对齐 APScheduler `add_listener` + `EVENT_JOB_*`）
   - [ ] SubTask 59.1: 新增 `src/scheduler/events.rs` 模块，定义 `pub struct TaskEvent { task_id: String, event_type: EventType, payload: Option<String>, ts: i64 }`
   - [ ] SubTask 59.2: 定义 `pub enum EventType { Started, Succeeded, Failed, Missed, Cancelled, Paused, Resumed, Expired, MaxInstancesReached, RateLimited }` + `as_str()` / `from_str()` 实现
   - [ ] SubTask 59.3: `TaskStore` trait 新增 `fn record_event(&self, task_id: &str, event_type: EventType, payload: Option<&str>, ts: i64) -> Result<()>`
@@ -784,7 +784,7 @@
   - [ ] SubTask 59.20: 单元测试 `test_event_types_cover_all_paths`：模拟 started / succeeded / failed / missed / cancelled / paused / resumed / expired / max_instances_reached / rate_limited → list_events 返回 10 条覆盖全部类型
   - [ ] SubTask 59.21: `tests/events_test.php` 端到端验证 xhjob_events 查询任务执行事件流 + TTL 清理
 
-- [ ] Task 60: 新功能 A18 — coalesce 显式 per-job 行为（misfire 合并/丢弃规则真正生效）
+- [x] Task 60: 新功能 A18 — coalesce 显式 per-job 行为（misfire 合并/丢弃规则真正生效）
   - [ ] SubTask 60.1: 确认 `Task` struct 已有 `coalesce: bool` 字段（默认 true 保持当前行为），如未存在则补充
   - [ ] SubTask 60.2: `TaskBuilder` 新增 `coalesce(on: bool)` builder 方法（如未存在）
   - [ ] SubTask 60.3: `Xhjob` 类新增 `coalesce(&mut self, on: bool) -> &mut Self`，PHP 暴露为 `coalesce(bool $on): $this`（如未存在）
@@ -805,7 +805,7 @@
   - [ ] SubTask 60.16: 单元测试 `test_coalesce_with_misfire_grace_time_full_misfire`：coalesce(false)+misfireGraceTime(5)+6 秒停顿 → 完全 misfire 丢弃
   - [ ] SubTask 60.17: `tests/coalesce_test.php` 端到端验证 coalesce(true) 合并 missed / coalesce(false) 丢弃 missed 行为
 
-- [ ] Task 61: 新功能 C15 — Task chain 顺序流水线（对齐 Celery `chain`）
+- [x] Task 61: 新功能 C15 — Task chain 顺序流水线（对齐 Celery `chain`）
   - [ ] SubTask 61.1: 新增 `src/scheduler/chain.rs` 模块，定义 `pub struct ChainExecutor`，负责推进 chain 的 current_step
   - [ ] SubTask 61.2: `TaskStore` trait 新增 `fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Result<()>`
   - [ ] SubTask 61.3: `TaskStore` trait 新增 `fn get_chain(&self, chain_id: &str) -> Result<Option<ChainRecord>>`
@@ -831,7 +831,7 @@
   - [ ] SubTask 61.21: 单元测试 `test_chain_empty_tasks_returns_error`：xhjob_chain([]) → 返回 `error: chain tasks cannot be empty`
   - [ ] SubTask 61.22: `tests/chain_test.php` 端到端验证 xhjob_chain 顺序流水线 + 前任务输出作为后任务输入 + 失败中断
 
-- [ ] Task 62: 新功能 C16 — Task group 并行批处理（对齐 Celery `group`）
+- [x] Task 62: 新功能 C16 — Task group 并行批处理（对齐 Celery `group`）
   - [ ] SubTask 62.1: 新增 `src/scheduler/group.rs` 模块，定义 `pub struct GroupWatcher`，监听 group 内任务终态并更新 group state
   - [ ] SubTask 62.2: `TaskStore` trait 新增 `fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Result<()>`
   - [ ] SubTask 62.3: `TaskStore` trait 新增 `fn get_group(&self, group_id: &str) -> Result<Option<GroupRecord>>`
@@ -858,7 +858,7 @@
   - [ ] SubTask 62.21: 单元测试 `test_group_empty_tasks_returns_error`：xhjob_group([]) → 返回 `error: group tasks cannot be empty`
   - [ ] SubTask 62.22: `tests/group_test.php` 端到端验证 xhjob_group 并行批处理 + group_state 完成率
 
-- [ ] Task 63: 新功能 C17 — worker_max_memory_per_child 基于内存的 daemon 自我回收
+- [x] Task 63: 新功能 C17 — worker_max_memory_per_child 基于内存的 daemon 自我回收
   - [ ] SubTask 63.1: `daemon_main.rs::Config` 新增 `max_memory_per_child: u64` 字段（从环境变量 `XHJOB_MAX_MEMORY_PER_CHILD` 读取，默认 0=不回收，单位 MB）
   - [ ] SubTask 63.2: 新增 `src/utils/memory.rs` 模块（或扩展 `daemon_main.rs`），实现跨平台 `pub fn read_process_memory_mb() -> u64`：
     - Linux：读取 `/proc/self/status` 中 `VmRSS:` 行，解析 KB 单位值，转换为 MB
@@ -881,7 +881,7 @@
   - [ ] SubTask 63.16: 单元测试 `test_max_memory_per_child_waits_inflight`：max=100 + VmRSS=200MB + 2 个 Running 任务 → daemon 等待任务完成后才退出
   - [ ] SubTask 63.17: `tests/max_memory_per_child_test.php` 端到端验证 XHJOB_MAX_MEMORY_PER_CHILD=100 daemon 内存超阈值后优雅退出
 
-- [ ] Task 64: README + examples 文档更新（A16-A18 + C15-C17 第五轮对齐项）
+- [x] Task 64: README + examples 文档更新（A16-A18 + C15-C17 第五轮对齐项）
   - [ ] SubTask 64.1: Xhjob 类方法表新增 `timezone(string $tz): $this` / `coalesce(bool $on): $this` 2 行
   - [ ] SubTask 64.2: 顶层函数表新增 `xhjob_events($since_ts, $name='default', $task_id=null, $data_dir=null): string` / `xhjob_chain(array $task_configs, $name='default', $data_dir=null): string` / `xhjob_chain_state($chain_id, $name='default', $data_dir=null): string` / `xhjob_group(array $task_configs, $name='default', $data_dir=null): string` / `xhjob_group_state($group_id, $name='default', $data_dir=null): string` 5 行
   - [ ] SubTask 64.3: `xhjob_state` 返回说明新增 `timezone` / `coalesce` 字段
@@ -899,7 +899,7 @@
   - [ ] SubTask 64.15: 新增 `examples/chain_etl.php`：演示 xhjob_chain 3 步 ETL 流水线 extract → transform → load（C15）
   - [ ] SubTask 64.16: 新增 `examples/group_batch.php`：演示 xhjob_group 3 任务并行批处理 + group_state 查询完成率（C16）
 
-- [ ] Task 65: 新增 6 个第五轮对齐测试文件（A16-A18 + C15-C17）
+- [x] Task 65: 新增 6 个第五轮对齐测试文件（A16-A18 + C15-C17）
   - [ ] SubTask 65.1: `tests/timezone_test.php` 验证 timezone('America/New_York') cron 任务按纽约时区评估 + 解析失败回退全局 + 非 cron 任务忽略（PASS）
   - [ ] SubTask 65.2: `tests/events_test.php` 验证 xhjob_events 查询任务执行事件流 + 按 task_id 过滤 + 按 since_ts 过滤 + TTL 清理（PASS）
   - [ ] SubTask 65.3: `tests/coalesce_test.php` 验证 coalesce(true) 合并 missed 触发为最后一次执行 + coalesce(false) 丢弃 missed 不执行补偿 + 默认 true 向后兼容（PASS）
@@ -907,7 +907,7 @@
   - [ ] SubTask 65.5: `tests/group_test.php` 验证 xhjob_group 3 任务并行批处理 + group_state 完成率 + partial_failed 状态 + 持久化（PASS）
   - [ ] SubTask 65.6: `tests/max_memory_per_child_test.php` 验证 XHJOB_MAX_MEMORY_PER_CHILD=100 daemon 内存超阈值后优雅退出 + 默认 0 不退出 + 与 max_tasks_per_child 互补（PASS）
 
-- [ ] Task 66: 重新编译 + 重跑全量测试（含 24 个新对齐测试：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5，**取代 Task 55**）
+- [x] Task 66: 重新编译 + 重跑全量测试（含 24 个新对齐测试：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5，**取代 Task 55**）
   - [ ] SubTask 66.1: `cargo build --release --features persist` 退出码 0 且无 warning
   - [ ] SubTask 66.2: `cargo build --release`（默认 feature）退出码 0 且无 warning
   - [ ] SubTask 66.3: `cargo test --release --lib --features persist` 全部通过（含 maxExecutions bug 修复 + 24 个新功能单元测试）
@@ -951,7 +951,7 @@
   - [ ] SubTask 66.41: 20 个 `examples/*.php`（含新增 cron_timezone / events_query / chain_etl / group_batch）全部可运行（无 fatal error）
   - [ ] SubTask 66.42: `php tests/functional_verify.php` 15 步全部 PASS（验证既有功能未回归）
 
-- [ ] Task 67: 功能模块独立验证（含 24 个新对齐功能：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5，**取代 Task 56**）
+- [x] Task 67: 功能模块独立验证（含 24 个新对齐功能：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5，**取代 Task 56**）
   - [ ] SubTask 67.1: shell 任务：dispatch echo 命令，验证 stdout 与 exit_code（PASS）
   - [ ] SubTask 67.2: retry 任务：dispatch HTTP 404 + withRetry(3)，验证不重试 attempts=1
   - [ ] SubTask 67.3: retry 任务：dispatch shell 失败 + withRetry(3)，验证重试至多 3 次
@@ -990,7 +990,7 @@
   - [ ] SubTask 67.36: group (C16)：xhjob_group 3 任务并行批处理 + group_state 完成率验证
   - [ ] SubTask 67.37: max_memory_per_child (C17)：XHJOB_MAX_MEMORY_PER_CHILD=100 daemon 内存超阈值后优雅退出验证
 
-- [ ] Task 68: 提交并推送远程主分支（**取代 Task 57**，含 24 个新对齐功能改动：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5）
+- [x] Task 68: 提交并推送远程主分支（**取代 Task 57**，含 24 个新对齐功能改动：6 项 round 2 + 6 项 round 3 + 6 项 round 4 + 6 项 round 5）
   - [ ] SubTask 68.1: `git status` 核对修改文件清单
   - [ ] SubTask 68.2: `git diff` 审查改动内容（确认无意外改动、无删除用户文件）
   - [ ] SubTask 68.3: `git add <指定文件>` 暂存改动（不 `git add -A`，避免误加 spec 文档外文件）
