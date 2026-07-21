@@ -77,6 +77,9 @@ impl Response {
     }
 }
 
+/// IPC 事件结构（保留为未来扩展接口）。
+/// 未来用于 daemon → client 的事件流推送（如任务完成通知、cron tick 事件等），当前未启用。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub kind: String,

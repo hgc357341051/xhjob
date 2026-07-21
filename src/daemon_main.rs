@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use crate::errors::{Result, XhjobError};
 use crate::ipc::{self, Request, Response, bind_listener, read_frame, write_frame};
 use crate::pool::coroutine_pool;
-use crate::store::{self, TaskStore, TaskState, now_ts};
+use crate::store::{self, TaskStore, TaskState};
 use crate::scheduler::{CronScheduler, TaskQueue, OverlapController};
 use crate::task::TaskBuilder;
 use crate::outcome;
@@ -69,21 +69,30 @@ async fn run_daemon() -> Result<()> {
     if use_persist {
         let active = store.load_active_tasks().await?;
         tracing::info!("recovered {} active tasks from store", active.len());
-        // Reset RUNNING tasks to PENDING so they will be retried/fired again.
-        // - Cron tasks: just reset to PENDING; cron scheduler will fire them at next_fire.
-        // - Non-cron tasks: reset to PENDING and set next_fire=now() so scan_retries
-        //   picks them up immediately on its next 1-second tick.
-        // (Previously these were marked INTERRUPTED, which neither scan_retries nor
-        //  scan_once would pick up, leaving them stuck forever.)
-        for task in active {
-            if task.state == TaskState::Running {
-                if task.cron.is_some() {
-                    let _ = store.update_state(&task.id, TaskState::Pending, None, None).await;
-                } else {
-                    let _ = store.update_state(&task.id, TaskState::Pending, None, None).await;
-                    let _ = store.update_next_fire(&task.id, Some(now_ts())).await;
-                }
-            }
+        // acksLate (C10) crash recovery: reset Running tasks with
+        // `acks_late=true` to Pending and re-trigger them immediately on the
+        // next scan. Must run BEFORE the cron scheduler + task queue are
+        // spawned so the reset tasks are visible to the scheduler.
+        //
+        // Celery semantics: tasks marked `acks_late=true` are re-queued on
+        // worker crash; tasks with `acks_late=false` (default) are
+        // "acked early" and left in the Running state on restart (must be
+        // manually requeued via `xhjob_requeue`). This is a behavior change
+        // from the previous loop which unconditionally reset ALL Running
+        // tasks — but it matches the Celery `acks_late` contract that this
+        // feature introduces.
+        // Reference: Celery acks_late.
+        let reset = store.reset_running_to_pending().await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "reset_running_to_pending failed on startup");
+                e
+            })
+            .unwrap_or(0);
+        if reset > 0 {
+            tracing::info!(
+                reset_count = reset,
+                "acksLate crash recovery: reset Running tasks with acks_late=true to Pending"
+            );
         }
     }
 
@@ -210,6 +219,14 @@ async fn handle_connection(
         "dispatch" => handle_dispatch(&store, &queue, req.payload).await,
         "state" => handle_state_op(&store, req.payload).await,
         "result" => handle_result_op(&store, req.payload).await,
+        "remove" => handle_remove_op(&store, req.payload).await,
+        "pause" => handle_pause_op(&store, req.payload, true).await,
+        "resume" => handle_pause_op(&store, req.payload, false).await,
+        "cancel" => handle_cancel_op(&store, req.payload).await,
+        "list" => handle_list_op(&store, req.payload).await,
+        "requeue" => handle_requeue_op(&store, req.payload).await,
+        "reschedule" => handle_reschedule_op(&store, req.payload).await,
+        "get" => handle_get_op(&store, req.payload).await,
         "ping" => Ok(Response::success(req.id, serde_json::json!({"pong": true}))),
         other => Ok(Response::error(req.id, format!("unknown op: {}", other))),
     };
@@ -265,6 +282,137 @@ async fn handle_result_op(
     let data = serde_json::to_value(&result)
         .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
     Ok(Response::success(0, data))
+}
+
+/// Handler for `remove` op: remove a task definition from the store.
+/// Reference: APScheduler remove_job.
+async fn handle_remove_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    store.remove_task(task_id).await?;
+    Ok(Response::success(0, serde_json::json!({"removed": true})))
+}
+
+/// Handler for `pause` / `resume` op: set paused flag.
+/// `paused=true` for pause, `paused=false` for resume.
+/// Reference: APScheduler pause_job / resume_job.
+async fn handle_pause_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+    paused: bool,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    store.set_paused(task_id, paused).await?;
+    Ok(Response::success(0, serde_json::json!({"paused": paused})))
+}
+
+/// Handler for `cancel` op: cancel a task.
+/// Pending → Cancelled terminal; Running → cancel_requested=true (no retry, no cron re-trigger).
+/// Reference: Celery revoke.
+async fn handle_cancel_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    store.cancel_task(task_id).await?;
+    Ok(Response::success(0, serde_json::json!({"cancelled": true})))
+}
+
+/// Handler for `list` op: list all tasks, optionally filtered by state.
+/// Reference: APScheduler get_jobs.
+async fn handle_list_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let state_filter: Option<String> = payload.get("state_filter")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let state_filter = match state_filter.as_deref() {
+        Some("PENDING") => Some(TaskState::Pending),
+        Some("RUNNING") => Some(TaskState::Running),
+        Some("INTERRUPTED") => Some(TaskState::Interrupted),
+        Some("SUCCESS") => Some(TaskState::Success),
+        Some("FAILED") => Some(TaskState::Failed),
+        Some("CANCELLED") => Some(TaskState::Cancelled),
+        Some("EXPIRED") => Some(TaskState::Expired),
+        Some(other) => return Err(XhjobError::InvalidTask(format!("invalid state_filter: {}", other))),
+        None => None,
+    };
+    let summaries = store.list_tasks(state_filter).await?;
+    let arr: Vec<serde_json::Value> = summaries.iter()
+        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .collect();
+    Ok(Response::success(0, serde_json::json!({"tasks": arr})))
+}
+
+/// Handler for `requeue` op: re-queue a terminal task (Cancelled / Failed /
+/// Expired) back to Pending so it can be triggered again. Returns
+/// `{"requeued": bool}`.
+/// Reference: Celery requeue.
+async fn handle_requeue_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    let requeued = store.requeue_task(task_id).await?;
+    Ok(Response::success(0, serde_json::json!({"requeued": requeued})))
+}
+
+/// Handler for `reschedule` op: online modify a cron task's cron expression.
+/// Returns `{"rescheduled": bool}`. On invalid cron, returns an error
+/// response with message starting with "cron parse: invalid cron".
+/// Reference: APScheduler reschedule_job.
+async fn handle_reschedule_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    let new_cron = payload.get("cron")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing cron".to_string()))?;
+    let rescheduled = store.reschedule_task(task_id, new_cron).await?;
+    Ok(Response::success(0, serde_json::json!({"rescheduled": rescheduled})))
+}
+
+/// Handler for `get` op: fetch a single task definition by id. Returns the
+/// full Task JSON (all persisted fields including config, state, and
+/// execution metadata). Distinguishes from `state` (which returns the
+/// trimmed `StateInfo`) by including all configuration fields such as
+/// `retry_max` / `timeout` / `priority` / `allow_overlap` / `max_instances` /
+/// `coalesce` / `cron` / `interval` / `run_at` / etc.
+///
+/// Response shape:
+/// - Found: `{"ok": true, "data": <task_json>}`
+/// - Not found: `{"ok": false, "error": "not found"}`
+///
+/// Reference: APScheduler get_job.
+async fn handle_get_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    match store.load_task(task_id).await? {
+        Some(task) => {
+            let data = serde_json::to_value(&task)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+            Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
+        }
+        None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
+    }
 }
 
 #[cfg(unix)]

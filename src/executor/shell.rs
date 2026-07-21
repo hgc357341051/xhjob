@@ -23,6 +23,7 @@ impl Executor for ShellExecutor {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
         let encoding = task.encoding.clone();
+        let soft_timeout = task.soft_timeout;
         Box::pin(async move {
             let payload: ShellPayload = serde_json::from_value(payload_val)
                 .map_err(|e| XhjobError::Exec(format!("invalid shell payload: {}", e)))?;
@@ -40,9 +41,49 @@ impl Executor for ShellExecutor {
             let stdout_fut = child.stdout.take();
             let stderr_fut = child.stderr.take();
 
-            // Collect stdout/stderr concurrently with timeout
-            let wait = tokio::time::timeout(Duration::from_secs(timeout), child.wait());
-            let (stdout_text, stderr_text, exit_code) = match wait.await {
+            // softTimeout (C11): when set and strictly less than `timeout`,
+            // send SIGTERM at `soft_timeout` seconds. If the child does not
+            // exit within (timeout - soft_timeout) seconds after SIGTERM,
+            // send SIGKILL. When None or >= timeout, fall back to the
+            // existing hard-kill-at-timeout behavior.
+            // Reference: Celery soft_time_limit.
+            let soft = soft_timeout.filter(|&s| s > 0 && s < timeout);
+
+            let status_result = if let Some(soft_secs) = soft {
+                let grace = timeout - soft_secs;
+                // Phase 1: wait soft_secs for graceful completion (no signal yet).
+                match tokio::time::timeout(Duration::from_secs(soft_secs), child.wait()).await {
+                    Ok(s) => Ok(s), // completed before soft_timeout
+                    Err(_) => {
+                        // soft_timeout elapsed — send SIGTERM to the child.
+                        #[cfg(unix)]
+                        if let Some(pid) = child.id() {
+                            use nix::sys::signal::{kill, Signal};
+                            use nix::unistd::Pid;
+                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                        }
+                        // Phase 2: wait grace period for graceful exit after SIGTERM.
+                        match tokio::time::timeout(Duration::from_secs(grace), child.wait()).await {
+                            Ok(s) => Ok(s), // graceful exit after SIGTERM
+                            Err(_) => {
+                                // SIGKILL after grace period — reap the child
+                                // so it doesn't become a zombie.
+                                let _ = child.start_kill();
+                                let _ = child.wait().await;
+                                return Err(XhjobError::Exec(format!(
+                                    "timeout after {}s (soft={}s, grace={}s, SIGKILL)",
+                                    timeout, soft_secs, grace
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No soft_timeout: existing logic, just wait timeout then SIGKILL.
+                tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await
+            };
+
+            let (stdout_text, stderr_text, exit_code) = match status_result {
                 Ok(Ok(status)) => {
                     // Read stdout/stderr from the captured pipes
                     let stdout_text = if let Some(mut s) = stdout_fut {
@@ -232,5 +273,55 @@ mod tests {
         assert!(result.is_err(), "expected Err for unsupported encoding");
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("unsupported encoding"), "unexpected error: {}", msg);
+    }
+
+    /// softTimeout (C11) SubTask 41.9 — SIGTERM graceful exit:
+    /// `softTimeout(2) + timeout(5)`. The shell script traps SIGTERM and
+    /// exits cleanly via the trap (echo CAUGHT; exit 0). The executor sends
+    /// SIGTERM at 2s; the trap fires, prints "CAUGHT", and the child exits
+    /// with code 0 → execute returns Ok with exit_code=0 and stdout
+    /// containing "CAUGHT".
+    /// Reference: Celery soft_time_limit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_soft_timeout_sigterm_graceful_exit() {
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+        // Bash script: trap SIGTERM, print CAUGHT, exit 0; otherwise loop
+        // sleeping so the child is still alive when SIGTERM arrives at 2s.
+        let script = "trap 'echo CAUGHT; exit 0' TERM; echo STARTED; for i in $(seq 1 30); do sleep 0.5; done";
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": script}));
+        task.timeout = 5;
+        task.soft_timeout = Some(2);
+
+        let result = ShellExecutor.execute(&task).await
+            .expect("execute should succeed (graceful SIGTERM exit)");
+        assert_eq!(result.exit_code, Some(0), "exit_code should be 0 (graceful exit via trap)");
+        let stdout = result.stdout.as_deref().unwrap_or("");
+        assert!(stdout.contains("CAUGHT"), "stdout should contain CAUGHT: {}", stdout);
+    }
+
+    /// softTimeout (C11) SubTask 41.10 — SIGKILL after grace period:
+    /// `softTimeout(2) + timeout(4)`. The shell script explicitly ignores
+    /// SIGTERM (`trap '' TERM`). The executor sends SIGTERM at 2s (no
+    /// effect), then SIGKILL at 4s (grace period = 2s) → execute returns
+    /// Err mentioning SIGKILL.
+    /// Reference: Celery soft_time_limit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_soft_timeout_sigkill_after_grace_period() {
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+        // Bash script: explicitly ignore SIGTERM; keep sleeping so SIGKILL
+        // is required to terminate the child.
+        let script = "trap '' TERM; echo STARTED; for i in $(seq 1 30); do sleep 0.5; done";
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": script}));
+        task.timeout = 4;
+        task.soft_timeout = Some(2);
+
+        let result = ShellExecutor.execute(&task).await;
+        assert!(result.is_err(), "expected Err (SIGKILL after grace period)");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("SIGKILL"), "error message should mention SIGKILL: {}", msg);
     }
 }

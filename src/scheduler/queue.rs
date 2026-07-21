@@ -82,58 +82,179 @@ impl TaskQueue {
         coroutine_pool::global().spawn(async move {
             let result = dispatch_task(&task_clone).await;
             let finished = now_ts();
+            // Save the result if dispatch succeeded, so the result is visible
+            // regardless of whether cancel was requested during execution.
+            // For dispatch errors, build a synthetic TaskResult so the retry
+            // policy treats it as a network error (retryable).
+            let stored: crate::store::TaskResult;
+            let dispatch_err: Option<String>;
             match result {
                 Ok(r) => {
-                    let _ = store.save_result(&task_clone.id, r).await;
-                    // Determine success/failure
-                    let success = match task_clone.task_type {
-                        crate::store::TaskType::Http => {
-                            // 2xx = success
-                            store.load_result(&task_clone.id).await
-                                .ok().flatten()
-                                .and_then(|r| r.status_code)
-                                .map(|c| (200..300).contains(&c))
-                                .unwrap_or(true)
-                        }
-                        crate::store::TaskType::Shell => {
-                            store.load_result(&task_clone.id).await
-                                .ok().flatten()
-                                .and_then(|r| r.exit_code)
-                                .map(|c| c == 0)
-                                .unwrap_or(true)
-                        }
-                    };
-                    if success {
-                        let _ = store.update_state(
-                            &task_clone.id,
-                            TaskState::Success,
-                            None,
-                            Some(finished),
-                        ).await;
+                    if task_clone.ignore_result {
+                        // Fire-and-forget (C9): skip save_result entirely.
+                        // Use the dispatch TaskResult directly for
+                        // success/failure determination so the state machine
+                        // still transitions correctly.
+                        stored = r;
                     } else {
-                        // Failure: schedule a retry (or mark FAILED if exhausted)
-                        let err_msg = match task_clone.task_type {
-                            crate::store::TaskType::Http => {
-                                let code = store.load_result(&task_clone.id).await
-                                    .ok().flatten()
-                                    .and_then(|r| r.status_code)
-                                    .unwrap_or(0);
-                                format!("http status {}", code)
-                            }
-                            crate::store::TaskType::Shell => {
-                                let code = store.load_result(&task_clone.id).await
-                                    .ok().flatten()
-                                    .and_then(|r| r.exit_code)
-                                    .unwrap_or(-1);
-                                format!("shell exit {}", code)
-                            }
-                        };
-                        let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg).await;
+                        let _ = store.save_result(&task_clone.id, r).await;
+                        // Reload the persisted TaskResult so retry policy sees the
+                        // same data the success/failure check used.
+                        stored = store.load_result(&task_clone.id).await
+                            .ok().flatten()
+                            .unwrap_or_default();
                     }
+                    dispatch_err = None;
                 }
                 Err(e) => {
                     tracing::warn!(task_id = %task_clone.id, error = %e, "task execution failed");
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, format!("{}", e)).await;
+                    stored = crate::store::TaskResult::default();
+                    dispatch_err = Some(format!("{}", e));
+                }
+            }
+
+            // If cancel was requested during execution, transition to Cancelled
+            // terminal state. No retry, no cron re-trigger.
+            // Reference: Celery revoke.
+            let cancel_requested = store.load_task(&task_clone.id).await
+                .ok().flatten()
+                .map(|t| t.cancel_requested)
+                .unwrap_or(false);
+            if cancel_requested {
+                let _ = store.update_state(
+                    &task_clone.id,
+                    TaskState::Cancelled,
+                    None,
+                    Some(now_ts()),
+                ).await;
+                overlap.on_finish(&task_clone.id).await;
+                return;
+            }
+
+            // Dispatch error path: no TaskResult was produced. Consult retry
+            // policy with the synthetic result (network error -> retryable).
+            if let Some(err_str) = dispatch_err {
+                let synthetic = crate::store::TaskResult::default();
+                let policy = crate::retry::RetryPolicy::new(
+                    task_clone.retry_max, task_clone.retry_delay,
+                );
+                if !policy.should_retry(&task_clone, &synthetic) {
+                    let _ = store.update_state(
+                        &task_clone.id,
+                        TaskState::Failed,
+                        None,
+                        Some(now_ts()),
+                    ).await;
+                    let _ = store.set_attempts_and_error(
+                        &task_clone.id,
+                        task_clone.attempts + 1,
+                        Some(format!("not retryable: {}", err_str)),
+                    ).await;
+                } else {
+                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_str).await;
+                }
+                overlap.on_finish(&task_clone.id).await;
+                return;
+            }
+
+            // Determine success/failure
+            let success = match task_clone.task_type {
+                crate::store::TaskType::Http => {
+                    // 2xx = success
+                    stored.status_code
+                        .map(|c| (200..300).contains(&c))
+                        .unwrap_or(true)
+                }
+                crate::store::TaskType::Shell => {
+                    stored.exit_code.map(|c| c == 0).unwrap_or(true)
+                }
+            };
+            if success {
+                if task_clone.cron.is_some() {
+                    // Cron task: increment execution_count FIRST, then
+                    // check max_executions. Only transition to Success
+                    // terminal when the limit is reached; otherwise revert
+                    // to Pending so scan_once (which filters terminal tasks
+                    // via load_active_tasks) can re-trigger this task on the
+                    // next cron tick.
+                    //
+                    // The previous order (Success -> increment) was buggy:
+                    // the immediate Success terminal state caused
+                    // load_active_tasks to drop the task, so execution_count
+                    // could never advance past 1.
+                    if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
+                        if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
+                            let _ = store.update_state(
+                                &task_clone.id,
+                                TaskState::Success,
+                                None,
+                                Some(finished),
+                            ).await;
+                        } else {
+                            let _ = store.update_state(
+                                &task_clone.id,
+                                TaskState::Pending,
+                                None,
+                                Some(finished),
+                            ).await;
+                        }
+                    }
+                } else {
+                    // Non-cron task: original behavior — immediate Success
+                    // terminal state, then increment execution_count for
+                    // bookkeeping.
+                    let _ = store.update_state(
+                        &task_clone.id,
+                        TaskState::Success,
+                        None,
+                        Some(finished),
+                    ).await;
+                    if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
+                        if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
+                            let _ = store.update_state(
+                                &task_clone.id,
+                                TaskState::Success,
+                                None,
+                                Some(crate::store::now_ts()),
+                            ).await;
+                        }
+                    }
+                }
+            } else {
+                // Failure: build a human-readable error summary and
+                // consult the retry policy. If the result is not
+                // retryable (e.g. HTTP 4xx), mark FAILED immediately
+                // rather than going through schedule_retry.
+                let err_msg = match task_clone.task_type {
+                    crate::store::TaskType::Http => {
+                        let code = stored.status_code.unwrap_or(0);
+                        format!("http status {}", code)
+                    }
+                    crate::store::TaskType::Shell => {
+                        let code = stored.exit_code.unwrap_or(-1);
+                        format!("shell exit {}", code)
+                    }
+                };
+                let policy = crate::retry::RetryPolicy::new(
+                    task_clone.retry_max, task_clone.retry_delay,
+                );
+                if !policy.should_retry(&task_clone, &stored) {
+                    // Not retryable: fail permanently right now.
+                    let _ = store.update_state(
+                        &task_clone.id,
+                        TaskState::Failed,
+                        None,
+                        Some(now_ts()),
+                    ).await;
+                    let _ = store.set_attempts_and_error(
+                        &task_clone.id,
+                        task_clone.attempts + 1,
+                        Some(format!("not retryable: {}", err_msg)),
+                    ).await;
+                } else {
+                    // Retryable: schedule retry (which itself may
+                    // permanently fail if attempts are exhausted).
+                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg).await;
                 }
             }
             overlap.on_finish(&task_clone.id).await;
@@ -190,5 +311,261 @@ impl TaskQueue {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{InMemoryStore, Task, TaskType};
+
+    /// Verify that the in-memory pending queue is ordered by priority DESC
+    /// (higher priority first), regardless of insertion order.
+    /// Reference: Celery priority.
+    #[tokio::test]
+    async fn test_priority_ordering_high_priority_drained_first() {
+        let store = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(store, overlap);
+
+        // Enqueue low-priority task first
+        queue.enqueue("low-prio-task", 1).await.unwrap();
+        // Enqueue high-priority task second
+        queue.enqueue("high-prio-task", 10).await.unwrap();
+
+        // Drain should return the high-priority task first despite being enqueued later.
+        let first = queue.drain_next().await.unwrap();
+        assert_eq!(first, "high-prio-task");
+
+        // Then the low-priority task.
+        let second = queue.drain_next().await.unwrap();
+        assert_eq!(second, "low-prio-task");
+    }
+
+    /// When priorities are equal, the stable sort preserves insertion order
+    /// (FIFO). This matches the "priority DESC, created_at ASC" semantics
+    /// since tasks are typically enqueued in created_at order.
+    #[tokio::test]
+    async fn test_priority_ordering_equal_priority_preserves_insertion_order() {
+        let store = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(store, overlap);
+
+        queue.enqueue("first-task", 5).await.unwrap();
+        queue.enqueue("second-task", 5).await.unwrap();
+
+        let first = queue.drain_next().await.unwrap();
+        assert_eq!(first, "first-task");
+
+        let second = queue.drain_next().await.unwrap();
+        assert_eq!(second, "second-task");
+    }
+
+    /// `drain_next` on an empty queue returns `None`.
+    #[tokio::test]
+    async fn test_drain_next_empty_returns_none() {
+        let store = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(store, overlap);
+
+        assert!(queue.drain_next().await.is_none());
+    }
+
+    /// End-to-end priority ordering: insert two pending tasks into the store
+    /// (low-priority first, high-priority second), then run scan_retries +
+    /// drain_next and verify the high-priority task is dispatched first.
+    #[tokio::test]
+    async fn test_scan_retries_respects_priority_ordering() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let now = now_ts();
+
+        // Low-priority task inserted first.
+        let mut t1 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "low"}));
+        t1.id = "t-low".to_string();
+        t1.state = TaskState::Pending;
+        t1.priority = 1;
+        t1.next_fire = Some(now);
+        t1.created_at = now;
+        store.insert_task(t1).await.unwrap();
+
+        // High-priority task inserted second.
+        let mut t2 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "high"}));
+        t2.id = "t-high".to_string();
+        t2.state = TaskState::Pending;
+        t2.priority = 10;
+        t2.next_fire = Some(now);
+        t2.created_at = now + 1;
+        store.insert_task(t2).await.unwrap();
+
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+
+        // scan_retries enqueues both pending tasks (sorted by priority DESC).
+        queue.scan_retries().await.unwrap();
+
+        // First drained should be the high-priority task.
+        let first = queue.drain_next().await.unwrap();
+        assert_eq!(first, "t-high");
+
+        let second = queue.drain_next().await.unwrap();
+        assert_eq!(second, "t-low");
+    }
+
+    /// Cron tasks should NOT transition to Success terminal state on each
+    /// successful execution. Instead, execution_count is incremented first,
+    /// and only when max_executions is reached does the task become Success.
+    ///
+    /// This guards against a regression of the maxExecutions timing bug where
+    /// `update_state(Success)` was called before `increment_execution_count`,
+    /// causing `scan_once` (which filters terminal tasks via
+    /// `load_active_tasks`) to drop the task before it could be re-triggered,
+    /// so `execution_count` could never advance past 1.
+    ///
+    /// Reference: APScheduler max_instances / coalesce.
+    #[tokio::test]
+    async fn test_cron_task_success_not_terminal_until_max() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+
+        // Cron task with max_executions=3 and a shell command that succeeds
+        // (exit 0). After one successful execution the task should remain
+        // Pending (non-terminal) so the next cron tick can re-trigger it.
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "true"}));
+        task.id = "t-cron-max-exec".to_string();
+        task.cron = Some("*/1 * * * *".to_string());
+        task.max_executions = 3;
+        task.state = TaskState::Pending;
+        task.next_fire = Some(now_ts());
+        store.insert_task(task).await.unwrap();
+
+        // Enqueue and process once. process_one spawns the dispatch on the
+        // global coroutine pool and returns immediately.
+        queue.enqueue("t-cron-max-exec", 0).await.unwrap();
+        queue.process_one().await.unwrap();
+
+        // Poll until the dispatch completes (state transitions away from
+        // Running). Cap at ~5s to avoid hanging the test on a regression.
+        let mut tries = 0;
+        loop {
+            let t = store.load_task("t-cron-max-exec").await.unwrap().unwrap();
+            if t.state != TaskState::Running { break; }
+            tries += 1;
+            if tries > 500 {
+                panic!("task still Running after ~5s of polling; state={:?}",
+                    store.load_task("t-cron-max-exec").await.unwrap().unwrap().state);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let final_task = store.load_task("t-cron-max-exec").await.unwrap().unwrap();
+        // Cron task with max_executions=3 should NOT be terminal after 1 execution.
+        assert_eq!(
+            final_task.state,
+            TaskState::Pending,
+            "cron task should remain Pending after success when max_executions not reached"
+        );
+        assert!(
+            !final_task.state.is_terminal(),
+            "cron task should not be in terminal state before max_executions is reached"
+        );
+        assert_eq!(
+            final_task.execution_count, 1,
+            "execution_count should be 1 after one successful execution"
+        );
+    }
+
+    /// ignoreResult (C9): when ignore_result=true, the queue skips
+    /// `save_result` so `load_result` returns None even after the task
+    /// completes successfully. The state machine still runs.
+    /// Reference: Celery ignore_result.
+    #[tokio::test]
+    async fn test_ignore_result_skips_save_result() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+
+        // Shell task with ignore_result=true. "echo hi" succeeds and would
+        // normally produce a result row with stdout="hi\n".
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
+        task.id = "t-ignore-result".to_string();
+        task.ignore_result = true;
+        task.state = TaskState::Pending;
+        task.next_fire = Some(now_ts());
+        store.insert_task(task).await.unwrap();
+
+        queue.enqueue("t-ignore-result", 0).await.unwrap();
+        queue.process_one().await.unwrap();
+
+        // Poll until the dispatch completes (state transitions away from
+        // Running). Cap at ~5s to avoid hanging the test on a regression.
+        let mut tries = 0;
+        loop {
+            let t = store.load_task("t-ignore-result").await.unwrap().unwrap();
+            if t.state != TaskState::Running { break; }
+            tries += 1;
+            if tries > 500 {
+                panic!("task still Running after ~5s of polling");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let final_task = store.load_task("t-ignore-result").await.unwrap().unwrap();
+        // State machine still ran: task reached Success terminal.
+        assert_eq!(final_task.state, TaskState::Success,
+            "task should reach Success terminal even with ignore_result=true");
+        // But no result row was persisted.
+        let result = store.load_result("t-ignore-result").await.unwrap();
+        assert!(result.is_none(),
+            "load_result should return None when ignore_result=true (no row saved)");
+    }
+
+    /// ignoreResult (C9): when ignore_result is false (default), the queue
+    /// calls `save_result` as usual so `load_result` returns Some after
+    /// completion. Verifies backward compatibility.
+    /// Reference: Celery ignore_result.
+    #[tokio::test]
+    async fn test_ignore_result_default_false_still_saves() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let overlap = Arc::new(OverlapController::new());
+        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+
+        // Default ignore_result=false. "echo hi" produces stdout="hi\n".
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
+        task.id = "t-save-result".to_string();
+        task.ignore_result = false;
+        task.state = TaskState::Pending;
+        task.next_fire = Some(now_ts());
+        store.insert_task(task).await.unwrap();
+
+        queue.enqueue("t-save-result", 0).await.unwrap();
+        queue.process_one().await.unwrap();
+
+        // Poll until completion.
+        let mut tries = 0;
+        loop {
+            let t = store.load_task("t-save-result").await.unwrap().unwrap();
+            if t.state != TaskState::Running { break; }
+            tries += 1;
+            if tries > 500 {
+                panic!("task still Running after ~5s of polling");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let final_task = store.load_task("t-save-result").await.unwrap().unwrap();
+        assert_eq!(final_task.state, TaskState::Success,
+            "task should reach Success terminal");
+
+        // Result row WAS persisted.
+        let result = store.load_result("t-save-result").await.unwrap();
+        assert!(result.is_some(),
+            "load_result should return Some when ignore_result=false (default)");
+        let r = result.unwrap();
+        assert_eq!(r.exit_code, Some(0),
+            "exit_code should be 0 for 'echo hi'");
+        assert!(r.stdout.as_deref().unwrap_or("").contains("hi"),
+            "stdout should contain 'hi', got: {:?}",
+            r.stdout);
     }
 }

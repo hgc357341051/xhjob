@@ -1,4 +1,7 @@
-//! Real OS-thread pool for CPU-intensive task execution.
+//! 线程池模块（保留为未来 CPU 密集型任务执行器扩展）。
+//!
+//! 当前协程池（coroutine pool）已覆盖 IO 密集任务；未来若需 CPU 密集任务
+//! （如图像处理、压缩），可启用此模块。
 //!
 //! Built on top of `std::thread` + `crossbeam-channel`. The default pool size
 //! equals the number of CPU cores; it can be overridden via `XHJOB_THREAD_POOL_SIZE`.
@@ -10,18 +13,21 @@ use once_cell::sync::OnceCell;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[allow(dead_code)]
 struct PoolInner {
     sender: Sender<Job>,
     shutdown: Sender<()>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 pub struct ThreadPool {
     inner: Arc<PoolInner>,
 }
 
 static GLOBAL: OnceCell<ThreadPool> = OnceCell::new();
 
+#[allow(dead_code)]
 impl ThreadPool {
     /// Create a new fixed-size thread pool.
     pub fn new(size: usize) -> Self {
@@ -95,6 +101,7 @@ impl Drop for ThreadPool {
 }
 
 /// Get the configured pool size (from env or CPU count).
+#[allow(dead_code)]
 pub fn configured_size() -> usize {
     if let Ok(s) = std::env::var("XHJOB_THREAD_POOL_SIZE") {
         if let Ok(n) = s.parse::<usize>() {
@@ -105,6 +112,7 @@ pub fn configured_size() -> usize {
 }
 
 /// Get the global thread pool (lazily initialized).
+#[allow(dead_code)]
 pub fn global() -> &'static ThreadPool {
     GLOBAL.get_or_init(|| ThreadPool::new(configured_size()))
 }

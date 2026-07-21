@@ -183,6 +183,20 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
         if let Some(s) = info.started_at { out.push(("started_at".to_string(), s.to_string())); }
         if let Some(f) = info.finished_at { out.push(("finished_at".to_string(), f.to_string())); }
         if let Some(e) = info.last_error { out.push(("last_error".to_string(), e)); }
+        out.push(("execution_count".to_string(), info.execution_count.to_string()));
+        out.push(("max_executions".to_string(), info.max_executions.to_string()));
+        out.push(("paused".to_string(), info.paused.to_string()));
+        out.push(("start_date".to_string(), info.start_date.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push(("end_date".to_string(), info.end_date.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push(("meta".to_string(), info.meta.clone().unwrap_or_else(|| "null".to_string())));
+        out.push(("interval".to_string(), info.interval.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push(("run_at".to_string(), info.run_at.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push(("jitter".to_string(), info.jitter.to_string()));
+        out.push(("expires".to_string(), info.expires.to_string()));
+        out.push(("retry_backoff".to_string(), info.retry_backoff.to_string()));
+        out.push(("ignore_result".to_string(), info.ignore_result.to_string()));
+        out.push(("acks_late".to_string(), info.acks_late.to_string()));
+        out.push(("soft_timeout".to_string(), info.soft_timeout.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
     } else {
         out.push(("state".to_string(), "UNKNOWN".to_string()));
         out.push(("error".to_string(), "task not found or daemon not running".to_string()));
@@ -222,6 +236,285 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
         out.push(("error".to_string(), "no result record for this task (it may have failed before producing output; check xhjob_state() last_error)".to_string()));
     }
     out
+}
+
+/// Remove a task definition from the store. Does not affect running instances.
+/// Reference: APScheduler remove_job.
+/// PHP: `xhjob_remove(string $id, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_remove(id: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_remove invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("remove", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => resp.ok,
+            Err(e) => {
+                tracing::error!("xhjob_remove ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Pause a cron task. The task definition is preserved but cron tick will not fire it.
+/// Reference: APScheduler pause_job.
+/// PHP: `xhjob_pause(string $id, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_pause(id: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_pause invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("pause", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => resp.ok,
+            Err(e) => {
+                tracing::error!("xhjob_pause ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Resume a paused cron task.
+/// Reference: APScheduler resume_job.
+/// PHP: `xhjob_resume(string $id, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_resume(id: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_resume invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("resume", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => resp.ok,
+            Err(e) => {
+                tracing::error!("xhjob_resume ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Cancel a task. Pending → Cancelled terminal; Running → no retry, no cron re-trigger.
+/// Reference: Celery revoke.
+/// PHP: `xhjob_cancel(string $id, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_cancel(id: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_cancel invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("cancel", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => resp.ok,
+            Err(e) => {
+                tracing::error!("xhjob_cancel ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// List all tasks in a service, optionally filtered by state.
+/// Reference: APScheduler get_jobs.
+/// PHP: `xhjob_list(string $name = "default", string $state_filter = null, string $data_dir = null): string`
+/// Returns a JSON string of the form `{"tasks": [...]}`. PHP callers should
+/// `json_decode($result, true)` to obtain the associative array. On error the
+/// returned string starts with `error:`.
+#[php_function]
+pub fn xhjob_list(name: Option<String>, state_filter: Option<String>, data_dir: Option<String>) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "state_filter": state_filter });
+        match ipc::request("list", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("tasks")
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "[]".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Re-queue a terminal task (Cancelled / Failed / Expired) back to Pending so
+/// it can be triggered again. Resets attempts to 0 and sets next_fire to now.
+/// Returns `true` if requeued, `false` if the task was not in a requeueable
+/// terminal state (or does not exist).
+/// Reference: Celery requeue.
+/// PHP: `xhjob_requeue(string $id, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_requeue(id: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_requeue invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("requeue", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return false;
+                }
+                resp.data.get("requeued")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            }
+            Err(e) => {
+                tracing::error!("xhjob_requeue ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Reschedule a cron task's cron expression online (A11). Preserves task
+/// state, execution_count, attempts, and meta — only `cron` and `next_fire`
+/// change. Returns `true` on success. Returns `false` if the task does not
+/// exist, is not a cron task (e.g. interval / runAt), is in a terminal state,
+/// or the new cron expression is invalid.
+/// Reference: APScheduler reschedule_job.
+/// PHP: `xhjob_reschedule(string $id, string $cron, string $name = "default", string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_reschedule invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id, "cron": cron });
+        match ipc::request("reschedule", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return false;
+                }
+                resp.data.get("rescheduled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            }
+            Err(e) => {
+                tracing::error!("xhjob_reschedule ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Fetch a single task definition by id, returning the full Task JSON (A12).
+/// Differs from `xhjob_state` (which returns the trimmed `StateInfo` view):
+/// `xhjob_get` returns every persisted field including configuration fields
+/// such as `retry_max` / `timeout` / `priority` / `allow_overlap` /
+/// `max_instances` / `coalesce` / `cron` / `interval` / `run_at` / etc.
+///
+/// Returns the JSON string of the task on success, or `null` if the task
+/// does not exist (or the daemon is unreachable). The returned string can be
+/// decoded with `json_decode($json, true)` to obtain the full associative
+/// array.
+///
+/// Reference: APScheduler get_job.
+/// PHP: `xhjob_get(string $id, string $name = "default", string $data_dir = null): ?string`
+#[php_function]
+pub fn xhjob_get(id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_get invalid service name: {}", e);
+            return None;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id });
+        match ipc::request("get", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return None;
+                }
+                let ok = resp.data.get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    return None;
+                }
+                resp.data.get("data")
+                    .map(|d| d.to_string())
+            }
+            Err(e) => {
+                tracing::error!("xhjob_get ipc: {}", e);
+                None
+            }
+        }
+    })
 }
 
 /// Hidden entry point invoked when the PHP binary is re-executed by
@@ -432,6 +725,136 @@ impl Xhjob {
         self
     }
 
+    /// Set maximum executions for cron task (0 = unlimited).
+    /// PHP: `maxExecutions(int $n): $this`
+    pub fn max_executions(&mut self, n: i64) -> &mut Self {
+        self.builder.max_executions = if n < 0 { 0 } else { n as u32 };
+        self
+    }
+
+    /// Set start date (Unix ts). Cron triggers before this time are skipped.
+    /// PHP: `startAt(int $ts): $this` (snake→camel auto-conversion)
+    pub fn start_at(&mut self, ts: i64) -> &mut Self {
+        self.builder.start_date = Some(ts);
+        self
+    }
+
+    /// Set end date (Unix ts). After this time, task state becomes Success terminal.
+    /// PHP: `endAt(int $ts): $this` (snake→camel auto-conversion)
+    pub fn end_at(&mut self, ts: i64) -> &mut Self {
+        self.builder.end_date = Some(ts);
+        self
+    }
+
+    /// Set result TTL in seconds (0 = keep forever).
+    /// PHP: `resultTtl(int $secs): $this` (snake→camel auto-conversion)
+    pub fn result_ttl(&mut self, secs: i64) -> &mut Self {
+        self.builder.result_ttl = if secs < 0 { 0 } else { secs as u64 };
+        self
+    }
+
+    /// Attach user metadata (JSON string) to the task.
+    /// PHP: `withMeta(string $json): $this` (snake→camel auto-conversion)
+    pub fn with_meta(&mut self, json: String) -> &mut Self {
+        self.builder.meta = Some(json);
+        self
+    }
+
+    /// Set IntervalTrigger period in seconds (A7). The task fires every
+    /// `secs` seconds. Mutually exclusive with `cron` and `runAt`; if both
+    /// are set, `cron` / `runAt` take priority.
+    /// PHP: `every(int $secs): $this`
+    /// Reference: APScheduler IntervalTrigger.
+    pub fn every(&mut self, secs: i64) -> &mut Self {
+        self.builder.interval = Some(if secs < 0 { 0 } else { secs as u64 });
+        self
+    }
+
+    /// Set DateTrigger absolute Unix timestamp (A8). The task fires once at
+    /// the given timestamp, then immediately transitions to Success terminal
+    /// state. Highest scheduling priority (overrides cron + interval).
+    /// PHP: `runAt(int $ts): $this` (snake→camel auto-conversion)
+    /// Reference: APScheduler DateTrigger.
+    pub fn run_at(&mut self, ts: i64) -> &mut Self {
+        self.builder.run_at = Some(ts);
+        self
+    }
+
+    /// Set jitter (A9): random offset in seconds added to next_fire for cron
+    /// / interval tasks to avoid thundering-herd effects. Default 0 = no
+    /// jitter. Ignored for runAt tasks (precise one-shot timestamp).
+    /// PHP: `jitter(int $secs): $this`
+    /// Reference: APScheduler jitter.
+    pub fn jitter(&mut self, secs: i64) -> &mut Self {
+        self.builder.jitter = if secs < 0 { 0 } else { secs as u64 };
+        self
+    }
+
+    /// Set task-level expires (C6): if a task remains Pending for longer than
+    /// `secs` seconds (measured from `created_at`), it transitions to
+    /// `Expired` terminal state. Default 0 = no expiry. Only affects Pending
+    /// tasks; Running tasks are not interrupted.
+    /// PHP: `expires(int $secs): $this`
+    /// Reference: APScheduler expires.
+    pub fn expires(&mut self, secs: i64) -> &mut Self {
+        self.builder.expires = if secs < 0 { 0 } else { secs as u64 };
+        self
+    }
+
+    /// Enable/disable retry exponential backoff (C8). When enabled, retry
+    /// delays grow exponentially as
+    /// `min(retry_delay * 2^(attempts-1), retry_delay * 60)`. When disabled
+    /// (default), retry delays are fixed at `retry_delay` seconds.
+    /// PHP: `retryBackoff(bool $on): $this` (snake→camel auto-conversion)
+    /// Reference: Celery retry_backoff.
+    pub fn retry_backoff(&mut self, on: bool) -> &mut Self {
+        self.builder.retry_backoff = on;
+        self
+    }
+
+    /// Enable fire-and-forget mode (C9): when true, the daemon skips
+    /// `save_result` for this task so `xhjob_result()` will return null. The
+    /// task state machine still runs (Pending → Running → Success/Failed).
+    /// Useful for high-throughput tasks whose result is not needed by the
+    /// caller. If both `ignoreResult(true)` and `resultTtl(>0)` are set, a
+    /// warning is logged and `ignoreResult` takes priority.
+    /// PHP: `ignoreResult(bool $on): $this` (snake→camel auto-conversion)
+    /// Reference: Celery ignore_result.
+    pub fn ignore_result(&mut self, on: bool) -> &mut Self {
+        self.builder.ignore_result = on;
+        self
+    }
+
+    /// Enable late acknowledgment (C10): when true, the task is "acked late"
+    /// — on daemon restart, Running tasks with `acksLate=true` are
+    /// automatically reset to Pending so they will be re-triggered (crash
+    /// recovery semantics). When false (default), Running tasks on daemon
+    /// restart stay Running (or, in persist mode, are unconditionally reset
+    /// to Pending — `acksLate=true` is reserved for the future
+    /// "task is idempotent and safe to re-run" opt-in flag).
+    /// PHP: `acksLate(bool $on): $this` (snake→camel auto-conversion)
+    /// Reference: Celery acks_late.
+    pub fn acks_late(&mut self, on: bool) -> &mut Self {
+        self.builder.acks_late = on;
+        self
+    }
+
+    /// Set soft timeout (C11): graceful exit timeout in seconds. When set
+    /// and strictly less than `timeout`, the shell executor sends SIGTERM
+    /// at `soft_timeout` seconds; if the child does not exit within
+    /// (timeout - soft_timeout) seconds, SIGKILL is sent. A value of 0
+    /// clears the soft timeout (None). HTTP tasks ignore this field.
+    /// PHP: `softTimeout(int $secs): $this` (snake→camel auto-conversion)
+    /// Reference: Celery soft_time_limit.
+    pub fn soft_timeout(&mut self, secs: i64) -> &mut Self {
+        self.builder.soft_timeout = if secs <= 0 {
+            None
+        } else {
+            Some(secs as u64)
+        };
+        self
+    }
+
     pub fn dispatch(&mut self) -> String {
         let rt = match pool::coroutine_pool::global_runtime() {
             Some(rt) => rt,
@@ -463,5 +886,13 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(xhjob_dispatch))
         .function(wrap_function!(xhjob_state))
         .function(wrap_function!(xhjob_result))
+        .function(wrap_function!(xhjob_remove))
+        .function(wrap_function!(xhjob_pause))
+        .function(wrap_function!(xhjob_resume))
+        .function(wrap_function!(xhjob_cancel))
+        .function(wrap_function!(xhjob_list))
+        .function(wrap_function!(xhjob_requeue))
+        .function(wrap_function!(xhjob_reschedule))
+        .function(wrap_function!(xhjob_get))
         .function(wrap_function!(xhjob_run_daemon))
 }

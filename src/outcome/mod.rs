@@ -14,6 +14,39 @@ pub struct StateInfo {
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub last_error: Option<String>,
+    pub execution_count: u32,
+    pub max_executions: u32,
+    pub paused: bool,
+    pub start_date: Option<i64>,
+    pub end_date: Option<i64>,
+    pub meta: Option<String>,
+    /// IntervalTrigger period in seconds (A7). None if not set.
+    pub interval: Option<u64>,
+    /// DateTrigger absolute Unix timestamp (A8). None if not set.
+    pub run_at: Option<i64>,
+    /// Jitter (A9): random offset in seconds added to next_fire. 0 = no jitter.
+    pub jitter: u64,
+    /// Task-level expires (C6): if a task remains Pending for longer than
+    /// `expires` seconds (measured from `created_at`), it transitions to
+    /// `Expired` terminal state. 0 = no expiry.
+    pub expires: u64,
+    /// Retry exponential backoff (C8): when true, retry delays grow
+    /// exponentially as `min(retry_delay * 2^(attempts-1), retry_delay * 60)`.
+    pub retry_backoff: bool,
+    /// ignoreResult (C9): when true, no result row is persisted for this
+    /// task — `xhjob_result()` will return null. Default false.
+    /// Reference: Celery ignore_result.
+    pub ignore_result: bool,
+    /// acksLate (C10): when true, Running tasks are auto-reset to Pending on
+    /// daemon restart (crash recovery). Default false.
+    /// Reference: Celery acks_late.
+    pub acks_late: bool,
+    /// softTimeout (C11): graceful exit timeout in seconds. None = no soft
+    /// timeout (existing hard-kill behavior at `timeout`). When set, the
+    /// shell executor sends SIGTERM at `soft_timeout` seconds; SIGKILL is
+    /// sent after (timeout - soft_timeout) seconds of grace.
+    /// Reference: Celery soft_time_limit.
+    pub soft_timeout: Option<u64>,
 }
 
 impl StateInfo {
@@ -25,6 +58,20 @@ impl StateInfo {
             started_at: task.started_at,
             finished_at: task.finished_at,
             last_error: task.last_error.clone(),
+            execution_count: task.execution_count,
+            max_executions: task.max_executions,
+            paused: task.paused,
+            start_date: task.start_date,
+            end_date: task.end_date,
+            meta: task.meta.clone(),
+            interval: task.interval,
+            run_at: task.run_at,
+            jitter: task.jitter,
+            expires: task.expires,
+            retry_backoff: task.retry_backoff,
+            ignore_result: task.ignore_result,
+            acks_late: task.acks_late,
+            soft_timeout: task.soft_timeout,
         }
     }
 }

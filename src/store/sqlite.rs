@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, OptionalExtension};
 use crate::errors::{Result, XhjobError};
-use super::{Task, TaskType, TaskState, TaskResult, TaskStore};
+use super::{Task, TaskType, TaskState, TaskResult, TaskStore, TaskSummary};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -45,7 +45,23 @@ impl SqliteStore {
                 last_error    TEXT,
                 proxy         TEXT,
                 encoding      TEXT,
-                timezone      TEXT
+                timezone      TEXT,
+                max_executions INTEGER NOT NULL DEFAULT 0,
+                execution_count INTEGER NOT NULL DEFAULT 0,
+                paused INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                start_date INTEGER,
+                end_date INTEGER,
+                result_ttl INTEGER NOT NULL DEFAULT 0,
+                meta TEXT,
+                interval INTEGER,
+                run_at INTEGER,
+                jitter INTEGER NOT NULL DEFAULT 0,
+                expires INTEGER NOT NULL DEFAULT 0,
+                retry_backoff INTEGER NOT NULL DEFAULT 0,
+                ignore_result INTEGER NOT NULL DEFAULT 0,
+                acks_late INTEGER NOT NULL DEFAULT 0,
+                soft_timeout INTEGER
             );
             CREATE TABLE IF NOT EXISTS results (
                 task_id      TEXT PRIMARY KEY,
@@ -60,8 +76,43 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_next_fire ON tasks(next_fire);
             "#,
         ).map_err(|e| XhjobError::Store(format!("create schema: {}", e)))?;
+        // Legacy DB migration: add new columns if missing.
+        ensure_column(&conn, "max_executions", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "execution_count", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "paused", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "cancel_requested", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "start_date", "INTEGER")?;
+        ensure_column(&conn, "end_date", "INTEGER")?;
+        ensure_column(&conn, "result_ttl", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "meta", "TEXT")?;
+        ensure_column(&conn, "interval", "INTEGER")?;
+        ensure_column(&conn, "run_at", "INTEGER")?;
+        ensure_column(&conn, "jitter", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "expires", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "retry_backoff", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "ignore_result", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "acks_late", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "soft_timeout", "INTEGER")?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
+}
+
+/// Add a column to the `tasks` table if it does not already exist. Used to
+/// migrate older databases that predate a schema change.
+fn ensure_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(tasks)")
+        .map_err(|e| XhjobError::Store(format!("pragma table_info: {}", e)))?;
+    let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| XhjobError::Store(format!("pragma query_map: {}", e)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !cols.iter().any(|c| c == name) {
+        conn.execute(
+            &format!("ALTER TABLE tasks ADD COLUMN {} {}", name, sql_type),
+            [],
+        ).map_err(|e| XhjobError::Store(format!("alter table add {}: {}", name, e)))?;
+    }
+    Ok(())
 }
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -80,6 +131,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         "SUCCESS" => TaskState::Success,
         "FAILED" => TaskState::Failed,
         "INTERRUPTED" => TaskState::Interrupted,
+        "CANCELLED" => TaskState::Cancelled,
+        "EXPIRED" => TaskState::Expired,
         _ => TaskState::Pending,
     };
     Ok(Task {
@@ -107,6 +160,22 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
         last_error: row.get("last_error")?,
+        max_executions: row.get::<_, i64>("max_executions").unwrap_or(0) as u32,
+        execution_count: row.get::<_, i64>("execution_count").unwrap_or(0) as u32,
+        paused: row.get::<_, i64>("paused").unwrap_or(0) != 0,
+        cancel_requested: row.get::<_, i64>("cancel_requested").unwrap_or(0) != 0,
+        start_date: row.get::<_, Option<i64>>("start_date").ok().flatten(),
+        end_date: row.get::<_, Option<i64>>("end_date").ok().flatten(),
+        result_ttl: row.get::<_, i64>("result_ttl").unwrap_or(0) as u64,
+        meta: row.get::<_, Option<String>>("meta").ok().flatten(),
+        interval: row.get::<_, Option<i64>>("interval").ok().flatten().map(|v| v as u64),
+        run_at: row.get::<_, Option<i64>>("run_at").ok().flatten(),
+        jitter: row.get::<_, i64>("jitter").unwrap_or(0) as u64,
+        expires: row.get::<_, i64>("expires").unwrap_or(0) as u64,
+        retry_backoff: row.get::<_, i64>("retry_backoff").unwrap_or(0) != 0,
+        ignore_result: row.get::<_, i64>("ignore_result").unwrap_or(0) != 0,
+        acks_late: row.get::<_, i64>("acks_late").unwrap_or(0) != 0,
+        soft_timeout: row.get::<_, Option<i64>>("soft_timeout").ok().flatten().map(|v| v as u64),
     })
 }
 
@@ -122,8 +191,10 @@ impl TaskStore for SqliteStore {
                  (id, type, payload, cron, retry_max, retry_delay, timeout, priority,
                   allow_overlap, max_instances, coalesce, persist, state, attempts,
                   next_fire, created_at, started_at, finished_at, last_error,
-                  proxy, encoding, timezone)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                  proxy, encoding, timezone, max_executions, execution_count,
+                  paused, cancel_requested, start_date, end_date, result_ttl, meta,
+                  interval, run_at, jitter, expires, retry_backoff, ignore_result, acks_late, soft_timeout)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,
@@ -131,6 +202,14 @@ impl TaskStore for SqliteStore {
                     state_str, task.attempts, task.next_fire,
                     task.created_at, task.started_at, task.finished_at, task.last_error,
                     task.proxy, task.encoding, task.timezone,
+                    task.max_executions as i64, task.execution_count as i64,
+                    task.paused as i64, task.cancel_requested as i64,
+                    task.start_date, task.end_date, task.result_ttl as i64, task.meta,
+                    task.interval.map(|v| v as i64), task.run_at,
+                    task.jitter as i64, task.expires as i64,
+                    task.retry_backoff as i64, task.ignore_result as i64,
+                    task.acks_late as i64,
+                    task.soft_timeout.map(|v| v as i64),
                 ],
             ).map_err(|e| XhjobError::Store(format!("insert: {}", e)))?;
             Ok(())
@@ -261,6 +340,225 @@ impl TaskStore for SqliteStore {
             conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])
                 .map_err(|e| XhjobError::Store(format!("delete task: {}", e)))?;
             Ok(())
+        })
+    }
+
+    fn increment_execution_count(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "UPDATE tasks SET execution_count = execution_count + 1 WHERE id = ?1",
+                params![id],
+            ).map_err(|e| XhjobError::Store(format!("increment_execution_count update: {}", e)))?;
+            let new_count: i64 = conn.query_row(
+                "SELECT execution_count FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("increment_execution_count select: {}", e)))?;
+            Ok(new_count as u32)
+        })
+    }
+
+    fn remove_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let affected = conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])
+                .map_err(|e| XhjobError::Store(format!("remove_task: {}", e)))?;
+            if affected == 0 {
+                return Err(XhjobError::TaskNotFound(id));
+            }
+            conn.execute("DELETE FROM results WHERE task_id = ?1", params![id])
+                .map_err(|e| XhjobError::Store(format!("remove_task results: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn set_paused(&self, id: &str, paused: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let affected = conn.execute(
+                "UPDATE tasks SET paused = ?1 WHERE id = ?2",
+                params![paused as i64, id],
+            ).map_err(|e| XhjobError::Store(format!("set_paused: {}", e)))?;
+            if affected == 0 {
+                return Err(XhjobError::TaskNotFound(id));
+            }
+            Ok(())
+        })
+    }
+
+    fn cancel_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let state_str: String = conn.query_row(
+                "SELECT state FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("cancel_task query: {}", e)))?;
+            if state_str == "PENDING" {
+                conn.execute(
+                    "UPDATE tasks SET state = 'CANCELLED', cancel_requested = 1, finished_at = ?1 WHERE id = ?2",
+                    params![crate::store::now_ts() as i64, id],
+                ).map_err(|e| XhjobError::Store(format!("cancel_task update: {}", e)))?;
+            } else if state_str == "RUNNING" {
+                conn.execute(
+                    "UPDATE tasks SET cancel_requested = 1 WHERE id = ?1",
+                    params![id],
+                ).map_err(|e| XhjobError::Store(format!("cancel_task update: {}", e)))?;
+            } else {
+                return Err(XhjobError::InvalidTask(format!(
+                    "task {} already in terminal state: {}",
+                    id, state_str
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn cleanup_expired_results(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let now = crate::store::now_ts() as i64;
+            let deleted = conn.execute(
+                "DELETE FROM results WHERE task_id IN (
+                    SELECT id FROM tasks
+                    WHERE result_ttl > 0
+                      AND finished_at IS NOT NULL
+                      AND (?1 - finished_at) > result_ttl
+                )",
+                params![now],
+            ).map_err(|e| XhjobError::Store(format!("cleanup_expired_results: {}", e)))?;
+            Ok(deleted as u64)
+        })
+    }
+
+    fn list_tasks(&self, state_filter: Option<TaskState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut result = Vec::new();
+            match state_filter {
+                Some(state) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT * FROM tasks WHERE state = ?1 ORDER BY created_at ASC"
+                    ).map_err(|e| XhjobError::Store(format!("list_tasks prepare: {}", e)))?;
+                    let rows = stmt.query_map(params![state.as_str()], task_from_row)
+                        .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
+                    for row in rows {
+                        let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                        result.push(TaskSummary::from(&task));
+                    }
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT * FROM tasks ORDER BY created_at ASC"
+                    ).map_err(|e| XhjobError::Store(format!("list_tasks prepare: {}", e)))?;
+                    let rows = stmt.query_map([], task_from_row)
+                        .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
+                    for row in rows {
+                        let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                        result.push(TaskSummary::from(&task));
+                    }
+                }
+            }
+            Ok(result)
+        })
+    }
+
+    fn requeue_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let state_str: Option<String> = conn.query_row(
+                "SELECT state FROM tasks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            ).optional()
+                .map_err(|e| XhjobError::Store(format!("requeue_task query: {}", e)))?;
+            let state_str = match state_str {
+                Some(s) => s,
+                None => return Ok(false), // task does not exist
+            };
+            // Only requeue terminal Cancelled / Failed / Expired tasks.
+            let requeueable = matches!(state_str.as_str(), "CANCELLED" | "FAILED" | "EXPIRED");
+            if !requeueable {
+                return Ok(false);
+            }
+            let now = crate::store::now_ts() as i64;
+            conn.execute(
+                "UPDATE tasks SET state = 'PENDING', attempts = 0, last_error = NULL, \
+                 started_at = NULL, finished_at = NULL, cancel_requested = 0, \
+                 next_fire = ?1 WHERE id = ?2",
+                params![now, id],
+            ).map_err(|e| XhjobError::Store(format!("requeue_task update: {}", e)))?;
+            Ok(true)
+        })
+    }
+
+    fn reschedule_task(&self, id: &str, new_cron: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+        let id = id.to_string();
+        let new_cron = new_cron.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            // Load the existing task to check eligibility.
+            let row_opt: Option<(Option<String>, String, Option<String>)> = conn.query_row(
+                "SELECT cron, state, timezone FROM tasks WHERE id = ?1",
+                params![id],
+                |row| {
+                    let cron: Option<String> = row.get(0)?;
+                    let state: String = row.get(1)?;
+                    let tz: Option<String> = row.get(2)?;
+                    Ok((cron, state, tz))
+                },
+            ).optional()
+                .map_err(|e| XhjobError::Store(format!("reschedule_task query: {}", e)))?;
+            let (cron_opt, state_str, tz_opt) = match row_opt {
+                Some(r) => r,
+                None => return Ok(false), // task not found
+            };
+            // Only reschedule cron tasks (interval / runAt tasks return false).
+            if cron_opt.is_none() {
+                return Ok(false);
+            }
+            // Don't reschedule terminal tasks.
+            let is_terminal = matches!(state_str.as_str(),
+                "SUCCESS" | "FAILED" | "CANCELLED" | "EXPIRED");
+            if is_terminal {
+                return Ok(false);
+            }
+            // Validate the new cron by computing next_fire.
+            let now = crate::store::now_ts();
+            let new_next = crate::scheduler::cron::next_fire(&new_cron, now, tz_opt.as_deref())
+                .map_err(|e| XhjobError::CronParse(format!("invalid cron '{}': {}", new_cron, e)))?;
+            conn.execute(
+                "UPDATE tasks SET cron = ?1, next_fire = ?2 WHERE id = ?3",
+                params![new_cron, new_next, id],
+            ).map_err(|e| XhjobError::Store(format!("reschedule_task update: {}", e)))?;
+            // state / execution_count / attempts / meta preserved (untouched by UPDATE).
+            Ok(true)
+        })
+    }
+
+    fn reset_running_to_pending(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let now = crate::store::now_ts();
+            // Reset Running tasks with acks_late=1 to Pending + next_fire=now.
+            // Clear started_at / finished_at so the next execution records
+            // fresh timestamps.
+            let changed = conn.execute(
+                "UPDATE tasks
+                 SET state = 'PENDING',
+                     next_fire = ?1,
+                     started_at = NULL,
+                     finished_at = NULL
+                 WHERE state = 'RUNNING' AND acks_late = 1",
+                params![now],
+            ).map_err(|e| XhjobError::Store(format!("reset_running_to_pending update: {}", e)))?;
+            Ok(changed as u64)
         })
     }
 }

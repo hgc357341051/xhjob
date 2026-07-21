@@ -278,6 +278,13 @@ $id = Xhjob::task()
 
 Cron 表达式默认按系统本地时区（`chrono::Local`）求值。通过 `withTimezone(string $tz)` 可显式指定 IANA 时区名（如 `Asia/Shanghai`、`America/New_York`、`UTC`），`next_fire` 将按该时区计算。
 
+cron 表达式支持 5 段或 6 段：
+
+- 5 段：`分 时 日 月 周`（标准 Unix cron）
+- 6 段：`秒 分 时 日 月 周`（含秒级精度，第一段为秒）
+
+例如 `*/5 * * * * *` 表示每 5 秒触发；`0 */5 * * * *` 表示每 5 分钟整触发。
+
 ```php
 <?php
 xhjob_start();
@@ -300,6 +307,236 @@ xhjob_stop();
 
 完整示例参见 `examples/timezone.php`。
 
+## Cron 执行次数限制
+
+通过 `maxExecutions(N)` 可为 cron 任务指定最大执行次数，到达上限后任务自动终止（state=SUCCESS）。
+
+```php
+<?php
+xhjob_start();
+
+// 每 1 秒触发，最多执行 3 次
+$id = Xhjob::task()
+    ->viaShell('echo hi')
+    ->cron('*/1 * * * * *')
+    ->maxExecutions(3)
+    ->dispatch();
+
+// 等待执行完成
+while (true) {
+    $state = xhjob_state($id);
+    if ($state['state'] === 'SUCCESS') {
+        echo "executed {$state['execution_count']} times\n";
+        break;
+    }
+    usleep(500_000);
+}
+
+xhjob_stop();
+```
+
+- `maxExecutions(0)`（默认）= 无限触发直至 daemon 停止
+- 持久化场景下 daemon restart 后 execution_count 保留
+
+## 任务暂停 / 恢复 / 取消 / 删除
+
+参考 APScheduler `pause_job` / `resume_job` / `remove_job` 与 Celery `revoke`，提供 cron 作业生命周期管理：
+
+```php
+<?php
+xhjob_start();
+
+$id = Xhjob::task()
+    ->viaShell('echo hi')
+    ->cron('*/1 * * * * *')
+    ->dispatch();
+
+// 暂停（cron 不再触发，定义保留）
+xhjob_pause($id);
+
+// 恢复（下一次 tick 恢复触发）
+xhjob_resume($id);
+
+// 取消（Pending 立即 CANCELLED 终态；Running 不强制 kill，仅停止后续重试与 cron 触发）
+xhjob_cancel($id);
+
+// 删除（从 store 中删除任务定义，正在运行的实例不受影响）
+xhjob_remove($id);
+
+xhjob_stop();
+```
+
+- `xhjob_state($id)['state']` 返回 `CANCELLED` 表示任务已被取消
+- `paused` 与 `cancel_requested` 字段持久化到 SQLite，重启后保留
+
+## 任务起始 / 结束时间
+
+参考 APScheduler `start_date` / `end_date`，可为 cron 任务指定触发时间窗口：
+
+```php
+<?php
+xhjob_start();
+
+$now = time();
+
+// 仅在 [now+10s, now+60s] 窗口内触发
+$id = Xhjob::task()
+    ->viaShell('echo hi')
+    ->cron('*/1 * * * * *')
+    ->startAt($now + 10)
+    ->endAt($now + 60)
+    ->dispatch();
+
+xhjob_stop();
+```
+
+- `start_date` 之前 cron 不触发（但 next_fire 仍按 cron 推进）
+- `end_date` 之后任务 state 自动置为 SUCCESS 终态
+
+## 任务列表查询
+
+参考 APScheduler `get_jobs()`，可查询当前 service 中所有任务的摘要：
+
+```php
+<?php
+xhjob_start();
+
+Xhjob::task()->viaShell('echo a')->cron('*/1 * * * * *')->dispatch();
+Xhjob::task()->viaShell('echo b')->cron('*/5 * * * * *')->dispatch();
+
+// 列出全部任务
+$json = xhjob_list();
+$tasks = json_decode($json, true);
+foreach ($tasks as $t) {
+    echo "{$t['id']} state={$t['state']} cron={$t['cron']} count={$t['execution_count']}\n";
+}
+
+// 按状态过滤
+$pending = json_decode(xhjob_list('default', 'PENDING'), true);
+
+xhjob_stop();
+```
+
+每个 TaskSummary 元素字段：
+
+- `id` / `task_type` / `state` / `cron` / `attempts` / `priority`
+- `next_fire` / `paused` / `max_executions` / `execution_count`
+- `start_date` / `end_date` / `meta` / `created_at` / `finished_at`
+
+`state_filter` 可选值：`PENDING` / `RUNNING` / `INTERRUPTED` / `SUCCESS` / `FAILED` / `CANCELLED`
+
+## Misfire 处理
+
+参考 APScheduler `misfire_grace_time` + `coalesce`，xhjob 处理 cron 错过触发的策略：
+
+- **coalesce=true（默认）**：无论错过多少次触发，合并为一次执行（取最近一次）
+- **coalesce=false**：在 grace_time 窗口内（默认 60 秒）的错过触发仍执行一次；超过 grace_time 的错过触发直接跳过
+
+```php
+<?php
+// 默认行为（coalesce=true）
+Xhjob::task()
+    ->viaShell('echo hi')
+    ->cron('*/1 * * * * *')
+    ->dispatch();  // 即使 daemon 停了 10 分钟，恢复后只触发 1 次
+
+// 关闭 coalesce（coalesce=false）
+Xhjob::task()
+    ->viaShell('echo hi')
+    ->cron('*/1 * * * * *')
+    ->coalesce(false)
+    ->dispatch();  // daemon 停了 10 分钟，恢复后若在 grace_time 内则触发 1 次，否则跳过
+```
+
+> 注：`coalesce` 通过 `Xhjob::coalesce(bool): $this` 设置。
+
+## 任务结果过期清理
+
+参考 Celery `result_expires`，可为任务指定结果保留时长，超时后自动清理 result 行（保留 task 行）：
+
+```php
+<?php
+xhjob_start();
+
+$id = Xhjob::task()
+    ->viaShell('echo hello')
+    ->resultTtl(5)  // 5 秒后清理 result
+    ->dispatch();
+
+// 立即查询 - result 有 stdout
+$result = xhjob_result($id);
+
+// 等待 6 秒后查询 - result 已清理（stdout=null）
+sleep(6);
+$result = xhjob_result($id);
+
+// 但 task 仍可查询
+$state = xhjob_state($id);
+
+xhjob_stop();
+```
+
+- `resultTtl(0)`（默认）= 永久保留，与当前行为一致
+- daemon 后台周期性调用 `cleanup_expired_results`（每 60 秒一次节流）清理过期 result
+
+## 任务元数据
+
+参考 Celery `update_state` 的 meta 字段，可为任务附加任意用户元数据（JSON 字符串），便于业务侧追踪：
+
+```php
+<?php
+xhjob_start();
+
+$id = Xhjob::task()
+    ->viaHttp('POST', 'https://api.example.com/orders')
+    ->withBody(json_encode(['product' => 'widget']))
+    ->withMeta(json_encode(['order_id' => 'A123', 'user' => 'alice']))
+    ->dispatch();
+
+// 查询时拿到 meta
+$state = xhjob_state($id);
+$meta = json_decode($state['meta'], true);
+echo "order_id: {$meta['order_id']}\n";
+
+xhjob_stop();
+```
+
+- meta 持久化到 SQLite，daemon restart 后保留
+- meta 内容由用户自定义，xhjob 不解析 JSON 结构
+
+## 对照 APScheduler / Celery 的功能对齐
+
+xhjob 借鉴 Python 成熟定时任务模块 [APScheduler](https://apscheduler.readthedocs.io/) 与后台任务队列模块 [Celery](https://docs.celeryq.dev/) 的设计，对齐单机版合理可用的特性：
+
+### 已对齐 APScheduler
+
+- ✅ Cron 表达式（5/6 段，6 段含秒）
+- ✅ `max_instances` / `coalesce` / `misfire_grace_time`
+- ✅ `maxExecutions` 限制执行次数（参考 APScheduler `max_executions`）
+- ✅ `startAt` / `endAt` 时间窗口（参考 `start_date` / `end_date`）
+- ✅ `xhjob_pause` / `xhjob_resume`（参考 `pause_job` / `resume_job`）
+- ✅ `xhjob_remove`（参考 `remove_job`）
+- ✅ `xhjob_list`（参考 `get_jobs`）
+- ✅ `next_fire` 暴露在 `xhjob_state`（参考 `next_run_time`）
+
+### 已对齐 Celery
+
+- ✅ 重试机制 + 指数退避（`withRetry(max, delay)`）
+- ✅ `AsyncResult` 风格的 `xhjob_state` / `xhjob_result`
+- ✅ `xhjob_cancel`（参考 `revoke`）
+- ✅ `resultTtl` 结果过期清理（参考 `result_expires`）
+- ✅ `withMeta` 元数据（参考 `update_state` meta）
+- ✅ `priority` 队列优先级
+- ✅ 按错误类型真实判断是否重试（HTTP 5xx 重试 / 4xx 不重试）
+
+### 不对齐的特性（避免过度设计）
+
+- ❌ 分布式 worker / broker（Celery Redis/RabbitMQ 依赖）—— 超出单机目标
+- ❌ 任务链 chain / group / chord（Celery canvas）—— 留待未来
+- ❌ 任务事件流 events（Celery events）—— `Event` 结构体保留为未来接口，本轮不启用
+- ❌ beat 调度器（Celery beat）—— cron 调度已实现
+- ❌ 多 datastore 抽象（APScheduler SQLAlchemy/MongoDB/Redis）—— 仅支持 SQLite
+
 ## API 参考
 
 ### 顶层函数
@@ -311,8 +548,13 @@ xhjob_stop();
 | `xhjob_restart($name="default", $data_dir=null): bool` | 重启指定服务的 daemon |
 | `xhjob_status($name="default", $data_dir=null): array` | 查询 daemon 运行状态（`running`、`pid`） |
 | `xhjob_dispatch($task_json, $name="default", $data_dir=null): string` | 通过 JSON 字符串 dispatch 任务，返回 task_id；失败时返回 `error: <msg>` 字符串，用 `str_starts_with($id, 'error:')` 判断 |
-| `xhjob_state($id, $name="default", $data_dir=null): array` | 查询任务状态（`state`、`attempts`、`created_at`、`started_at`、`finished_at`、`last_error`） |
+| `xhjob_state($id, $name="default", $data_dir=null): array` | 查询任务状态（`state`、`attempts`、`created_at`、`started_at`、`finished_at`、`last_error`、`execution_count`、`max_executions`、`next_fire`、`paused`、`start_date`、`end_date`、`meta`） |
 | `xhjob_result($id, $name="default", $data_dir=null): array` | 查询任务结果（`body`、`status_code`、`stdout`、`stderr`、`exit_code`）；任务在产出结果前失败时返回 `error` 字段，提示查 `xhjob_state()` 的 `last_error` |
+| `xhjob_remove(string $id, string $name = "default", ?string $data_dir = null): bool` | 删除 cron 作业定义（不影响运行中实例） |
+| `xhjob_pause(string $id, string $name = "default", ?string $data_dir = null): bool` | 暂停 cron 作业（保留定义，不触发） |
+| `xhjob_resume(string $id, string $name = "default", ?string $data_dir = null): bool` | 恢复已暂停的 cron 作业 |
+| `xhjob_cancel(string $id, string $name = "default", ?string $data_dir = null): bool` | 取消任务（Pending→Cancelled 终态；Running→停止后续重试与 cron 触发，不强制 kill） |
+| `xhjob_list(string $name = "default", ?string $state_filter = null, ?string $data_dir = null): string` | 列出任务摘要（JSON 字符串，需 json_decode） |
 
 ### `Xhjob` 类（链式 API）
 
@@ -329,13 +571,18 @@ xhjob_stop();
 | `withEncoding(string $from): $this` | 设置 Shell 输出编码 |
 | `withTimezone(string $tz): $this` | 设置 Cron 时区 |
 | `withRetry(int $max, int $delay): $this` | 设置重试次数与基础延迟（秒） |
-| `cron(string $expr): $this` | 设置 cron 表达式（5 或 6 段） |
+| `cron(string $expr): $this` | 设置 cron 表达式（5 或 6 段表达式，6 段含秒） |
 | `timeout(int $secs): $this` | 设置执行超时（秒） |
 | `priority(int $p): $this` | 设置任务优先级（数值越大越先执行） |
 | `allowOverlap(bool $allow): $this` | 是否允许同一任务并发执行 |
 | `maxInstances(int $n): $this` | 最大并发实例数 |
 | `coalesce(bool $c): $this` | 是否合并错过的触发 |
 | `persist(bool $p): $this` | 是否启用 SQLite 持久化 |
+| `maxExecutions(int $n): $this` | 设置 cron 任务最大执行次数（0=无限，默认）；到达上限后 state=SUCCESS |
+| `startAt(int $ts): $this` | 设置任务起始时间（Unix ts）；此前 cron 不触发 |
+| `endAt(int $ts): $this` | 设置任务结束时间（Unix ts）；此后 state=SUCCESS 终态 |
+| `resultTtl(int $secs): $this` | 设置结果保留时长（0=永久，默认）；超时后 result 自动清理但 task 保留 |
+| `withMeta(string $json): $this` | 附加用户元数据（JSON 字符串），可在 xhjob_state 中读取 |
 | `dispatch(): string` | 提交任务到 daemon，返回 task_id；失败时返回 `error: <msg>` 字符串 |
 
 ## 环境变量
@@ -348,7 +595,7 @@ xhjob_stop();
 | `XHJOB_DB_DIR` (Unix) | `/tmp` | SQLite 数据库目录（优先级高于 `XHJOB_DATA_DIR`） |
 | `XHJOB_LOG_DIR` (Unix) | `/tmp` | 日志文件目录（优先级高于 `XHJOB_DATA_DIR`） |
 | `XHJOB_SERVICE_NAME` | `default` | daemon 子进程内当前服务名（由父进程自动设置） |
-| `XHJOB_PERSIST` | `0` | 设为 `1` 或 `true` 时 daemon 启用 SQLite 持久化存储 |
+| `XHJOB_PERSIST` | `0` | 设为 `1` 或 `true` 时 daemon 启用 SQLite 持久化存储；仅在 daemon 启动时读取一次，运行中修改需 restart 生效 |
 | `XHJOB_THREAD_POOL_SIZE` | `num_cpus` | 线程池大小 |
 | `XHJOB_COROUTINE_POOL_SIZE` | `1024` | 协程池大小 |
 | `XHJOB_SHELL_TIMEOUT` | `300` | Shell 任务默认超时（秒） |
