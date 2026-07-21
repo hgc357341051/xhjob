@@ -208,8 +208,8 @@ mod tests {
         fn cleanup_expired_results(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
             self.inner.cleanup_expired_results()
         }
-        fn list_tasks(&self, state_filter: Option<TaskState>) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
-            self.inner.list_tasks(state_filter)
+        fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + 'a>> {
+            self.inner.list_tasks(state_filter, tag_filter)
         }
         fn requeue_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
             self.inner.requeue_task(id)
@@ -219,6 +219,39 @@ mod tests {
         }
         fn reset_running_to_pending(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
             self.inner.reset_running_to_pending()
+        }
+        fn record_event(&self, task_id: &str, event_type: crate::store::EventType, payload: Option<&str>, ts: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.record_event(task_id, event_type, payload, ts)
+        }
+        fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskEvent>>> + Send + '_>> {
+            self.inner.list_events(since_ts, task_id_filter)
+        }
+        fn cleanup_expired_events(&self, ttl_secs: u64) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
+            self.inner.cleanup_expired_events(ttl_secs)
+        }
+        fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.create_chain(chain_id, tasks, created_at)
+        }
+        fn get_chain(&self, chain_id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::ChainRecord>>> + Send + '_>> {
+            self.inner.get_chain(chain_id)
+        }
+        fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.update_chain_step(chain_id, current_step, state, updated_at)
+        }
+        fn list_chains_by_state(&self, state: &str) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::ChainRecord>>> + Send + '_>> {
+            self.inner.list_chains_by_state(state)
+        }
+        fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.create_group(group_id, tasks, created_at)
+        }
+        fn get_group(&self, group_id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::GroupRecord>>> + Send + '_>> {
+            self.inner.get_group(group_id)
+        }
+        fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.update_group_state(group_id, state, updated_at)
+        }
+        fn list_groups_by_state(&self, state: &str) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::GroupRecord>>> + Send + '_>> {
+            self.inner.list_groups_by_state(state)
         }
     }
 

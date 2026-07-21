@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::errors::{Result, XhjobError};
-use super::{Task, TaskResult, TaskState, TaskStore, TaskSummary};
+use super::{Task, TaskResult, TaskState, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord};
 
 pub struct InMemoryStore {
     tasks: RwLock<HashMap<String, Task>>,
     results: RwLock<HashMap<String, TaskResult>>,
+    events: RwLock<Vec<TaskEvent>>,
+    chains: RwLock<HashMap<String, ChainRecord>>,
+    groups: RwLock<HashMap<String, GroupRecord>>,
 }
 
 impl InMemoryStore {
@@ -15,6 +18,9 @@ impl InMemoryStore {
         Self {
             tasks: RwLock::new(HashMap::new()),
             results: RwLock::new(HashMap::new()),
+            events: RwLock::new(Vec::new()),
+            chains: RwLock::new(HashMap::new()),
+            groups: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -208,13 +214,16 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_tasks(&self, state_filter: Option<TaskState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+    fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>> {
         Box::pin(async move {
             let map = self.tasks.read().await;
             let mut result = Vec::new();
             for task in map.values() {
                 if let Some(filter) = state_filter {
                     if task.state != filter { continue; }
+                }
+                if let Some(tag) = tag_filter {
+                    if !task.tags.iter().any(|t| t == tag) { continue; }
                 }
                 result.push(TaskSummary::from(task));
             }
@@ -294,6 +303,153 @@ impl TaskStore for InMemoryStore {
                 }
             }
             Ok(reset)
+        })
+    }
+
+    // ----- Event log (A17) -----
+
+    fn record_event(&self, task_id: &str, event_type: super::EventType, payload: Option<&str>, ts: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let task_id = task_id.to_string();
+        let payload = payload.map(|s| s.to_string());
+        Box::pin(async move {
+            let mut guard = self.events.write().await;
+            guard.push(TaskEvent { task_id, event_type, payload, ts });
+            Ok(())
+        })
+    }
+
+    fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>> {
+        let task_id_filter = task_id_filter.map(|s| s.to_string());
+        Box::pin(async move {
+            let guard = self.events.read().await;
+            let mut out: Vec<TaskEvent> = guard.iter()
+                .filter(|e| e.ts >= since_ts)
+                .filter(|e| match &task_id_filter {
+                    Some(id) => &e.task_id == id,
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.ts.cmp(&b.ts));
+            Ok(out)
+        })
+    }
+
+    fn cleanup_expired_events(&self, ttl_secs: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let now = crate::store::now_ts() as i64;
+            let cutoff = now.saturating_sub(ttl_secs as i64);
+            let mut guard = self.events.write().await;
+            let before = guard.len();
+            guard.retain(|e| e.ts >= cutoff);
+            let after = guard.len();
+            Ok((before - after) as u64)
+        })
+    }
+
+    // ----- Task chain (C15) -----
+
+    fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        let tasks = tasks.to_vec();
+        Box::pin(async move {
+            let mut guard = self.chains.write().await;
+            guard.insert(chain_id.clone(), ChainRecord {
+                chain_id,
+                tasks,
+                current_step: 0,
+                state: "pending".to_string(),
+                created_at,
+                updated_at: created_at,
+            });
+            Ok(())
+        })
+    }
+
+    fn get_chain(&self, chain_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        Box::pin(async move {
+            let guard = self.chains.read().await;
+            Ok(guard.get(&chain_id).cloned())
+        })
+    }
+
+    fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let mut guard = self.chains.write().await;
+            if let Some(c) = guard.get_mut(&chain_id) {
+                c.current_step = current_step;
+                c.state = state;
+                c.updated_at = updated_at;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_chains_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>> {
+        let state = state.to_string();
+        Box::pin(async move {
+            let guard = self.chains.read().await;
+            let mut out: Vec<ChainRecord> = guard.values()
+                .filter(|c| c.state == state)
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(out)
+        })
+    }
+
+    // ----- Task group (C16) -----
+
+    fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        let tasks = tasks.to_vec();
+        Box::pin(async move {
+            let mut guard = self.groups.write().await;
+            guard.insert(group_id.clone(), GroupRecord {
+                group_id,
+                tasks,
+                state: "pending".to_string(),
+                created_at,
+                updated_at: created_at,
+            });
+            Ok(())
+        })
+    }
+
+    fn get_group(&self, group_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        Box::pin(async move {
+            let guard = self.groups.read().await;
+            Ok(guard.get(&group_id).cloned())
+        })
+    }
+
+    fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let mut guard = self.groups.write().await;
+            if let Some(g) = guard.get_mut(&group_id) {
+                g.state = state;
+                g.updated_at = updated_at;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>> {
+        let state = state.to_string();
+        Box::pin(async move {
+            let guard = self.groups.read().await;
+            let mut out: Vec<GroupRecord> = guard.values()
+                .filter(|g| g.state == state)
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(out)
         })
     }
 }

@@ -34,8 +34,11 @@ rand = "0.8"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.27", features = ["process", "signal", "fs"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Console"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Console", "Win32_System_ProcessStatus"] }
 
 [profile.release]
 opt-level = 3

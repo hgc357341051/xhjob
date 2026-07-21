@@ -226,7 +226,47 @@ pub struct Task {
     /// Reference: Celery soft_time_limit.
     #[serde(default)]
     pub soft_timeout: Option<u64>,
+    /// misfire_grace_time (A13): per-job override of the global default
+    /// 60s misfire grace window. 0 = use global default (60s). When
+    /// `now - next_fire > grace_time`, the trigger is considered misfired;
+    /// `coalesce=true` collapses missed triggers into one fire (still
+    /// executes once), `coalesce=false` skips the trigger entirely. Only
+    /// effective for cron tasks; interval / runAt tasks ignore this field
+    /// (warn + ignore). Reference: APScheduler misfire_grace_time.
+    #[serde(default)]
+    pub misfire_grace_time: u64,
+    /// replace_existing (A14): when true and `id` is set, dispatch will
+    /// replace an existing task with the same id (full overwrite, state /
+    /// attempts / execution_count reset). When false (default), dispatch
+    /// returns an error on id conflict. Reference: APScheduler
+    /// replace_existing.
+    #[serde(default)]
+    pub replace_existing: bool,
+    /// tags (A15): user-supplied labels for grouping / filtering tasks.
+    /// Used by `list_tasks(tag_filter)` to filter the task list. Empty by
+    /// default. Reference: APScheduler tags / Celery queue routing.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// rate_limit_count (C12): max number of triggers allowed within
+    /// `rate_limit_window` seconds. 0 = no rate limiting (default). Pairs
+    /// with `rate_limit_window`. Reference: Celery rate_limit.
+    #[serde(default)]
+    pub rate_limit_count: u32,
+    /// rate_limit_window (C12): sliding window length in seconds for
+    /// rate limiting. 0 = no rate limiting (default). Reference: Celery
+    /// rate_limit.
+    #[serde(default)]
+    pub rate_limit_window: u64,
+    /// acks_on_failure (C13): when true (default), task failures respect
+    /// `retry_max` (transition to Failed terminal after exhausting retries).
+    /// When false, failures are retried indefinitely (ignoring retry_max)
+    /// until the task succeeds or is cancelled/removed. Complementary to
+    /// `acks_late`. Reference: Celery acks_on_failure.
+    #[serde(default = "default_acks_on_failure_true")]
+    pub acks_on_failure: bool,
 }
+
+fn default_acks_on_failure_true() -> bool { true }
 
 impl Task {
     pub fn new(task_type: TaskType, payload: serde_json::Value) -> Self {
@@ -270,6 +310,12 @@ impl Task {
             ignore_result: false,
             acks_late: false,
             soft_timeout: None,
+            misfire_grace_time: 0,
+            replace_existing: false,
+            tags: Vec::new(),
+            rate_limit_count: 0,
+            rate_limit_window: 0,
+            acks_on_failure: true,
         }
     }
 }
@@ -303,6 +349,8 @@ pub struct TaskSummary {
     pub meta: Option<String>,
     pub created_at: u64,
     pub finished_at: Option<u64>,
+    /// Tags (A15): user-supplied labels for grouping / filtering.
+    pub tags: Vec<String>,
 }
 
 impl From<&Task> for TaskSummary {
@@ -323,8 +371,94 @@ impl From<&Task> for TaskSummary {
             meta: t.meta.clone(),
             created_at: t.created_at,
             finished_at: t.finished_at,
+            tags: t.tags.clone(),
         }
     }
+}
+
+/// Event types emitted during task lifecycle (A17).
+/// Reference: APScheduler EVENT_JOB_* constants.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EventType {
+    Started,
+    Succeeded,
+    Failed,
+    Missed,
+    Cancelled,
+    Paused,
+    Resumed,
+    Expired,
+    MaxInstancesReached,
+    RateLimited,
+}
+
+impl EventType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventType::Started => "started",
+            EventType::Succeeded => "succeeded",
+            EventType::Failed => "failed",
+            EventType::Missed => "missed",
+            EventType::Cancelled => "cancelled",
+            EventType::Paused => "paused",
+            EventType::Resumed => "resumed",
+            EventType::Expired => "expired",
+            EventType::MaxInstancesReached => "max_instances_reached",
+            EventType::RateLimited => "rate_limited",
+        }
+    }
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "started" => Ok(EventType::Started),
+            "succeeded" => Ok(EventType::Succeeded),
+            "failed" => Ok(EventType::Failed),
+            "missed" => Ok(EventType::Missed),
+            "cancelled" => Ok(EventType::Cancelled),
+            "paused" => Ok(EventType::Paused),
+            "resumed" => Ok(EventType::Resumed),
+            "expired" => Ok(EventType::Expired),
+            "max_instances_reached" => Ok(EventType::MaxInstancesReached),
+            "rate_limited" => Ok(EventType::RateLimited),
+            other => Err(XhjobError::Store(format!("unknown event type: {}", other))),
+        }
+    }
+}
+
+/// A single task execution event record (A17).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskEvent {
+    pub task_id: String,
+    pub event_type: EventType,
+    pub payload: Option<String>,
+    pub ts: i64,
+}
+
+/// Chain record (C15). Persists a sequence of task configs to execute in order.
+/// Reference: Celery chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRecord {
+    pub chain_id: String,
+    /// Ordered list of task builder JSON configs.
+    pub tasks: Vec<serde_json::Value>,
+    pub current_step: u32,
+    /// "pending" / "running" / "succeeded" / "failed".
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Group record (C16). Persists a parallel batch of task configs.
+/// Reference: Celery group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupRecord {
+    pub group_id: String,
+    /// Parallel task configs.
+    pub tasks: Vec<serde_json::Value>,
+    /// "pending" / "running" / "succeeded" / "partial_failed" / "failed".
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// Unified task store abstraction.
@@ -360,9 +494,11 @@ pub trait TaskStore: Send + Sync {
     /// whose result_ttl > 0. Returns the number of deleted rows.
     /// Reference: Celery result_expires auto-cleanup.
     fn cleanup_expired_results(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
-    /// List all tasks in this store, optionally filtered by state.
-    /// Reference: APScheduler get_jobs.
-    fn list_tasks(&self, state_filter: Option<TaskState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+    /// List all tasks in this store, optionally filtered by state and/or tag.
+    /// When `tag_filter` is `Some(tag)`, only tasks whose `tags` array
+    /// contains `tag` are returned. Reference: APScheduler get_jobs +
+    /// tag-based filtering.
+    fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>>;
     /// Re-queue a terminal task (Cancelled / Failed / Expired) back to Pending
     /// so it can be triggered again. Resets `attempts=0` and sets
     /// `next_fire=now` so the next scan picks it up immediately. Returns
@@ -397,6 +533,47 @@ pub trait TaskStore: Send + Sync {
     ///
     /// Reference: Celery acks_late.
     fn reset_running_to_pending(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+
+    // ----- Event log (A17) -----
+
+    /// Record a task lifecycle event (started / succeeded / failed / etc.).
+    /// Reference: APScheduler add_listener + EVENT_JOB_*.
+    fn record_event(&self, task_id: &str, event_type: EventType, payload: Option<&str>, ts: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// List events since `since_ts` (Unix seconds), optionally filtered by
+    /// `task_id_filter`. Ordered by ts ASC.
+    fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>>;
+
+    /// Delete events older than `ttl_secs` seconds. Returns the count deleted.
+    fn cleanup_expired_events(&self, ttl_secs: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+
+    // ----- Task chain (C15) -----
+
+    /// Create a new chain record with the given task configs.
+    fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// Load a chain record by id.
+    fn get_chain(&self, chain_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>>;
+
+    /// Update chain step + state.
+    fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// List chains by state (for daemon restart recovery).
+    fn list_chains_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>>;
+
+    // ----- Task group (C16) -----
+
+    /// Create a new group record.
+    fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// Load a group record by id.
+    fn get_group(&self, group_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>>;
+
+    /// Update group state.
+    fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// List groups by state (for daemon restart recovery).
+    fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>>;
 }
 
 /// Choose store backend based on persist flag.
@@ -730,7 +907,7 @@ mod tests {
         t2.state = TaskState::Success;
         store.insert_task(t2).await.unwrap();
 
-        let summaries = store.list_tasks(None).await.unwrap();
+        let summaries = store.list_tasks(None, None).await.unwrap();
         assert_eq!(summaries.len(), 2);
         // Ordering: created_at ASC -> t1 before t2.
         assert_eq!(summaries[0].id, "t1");
@@ -760,11 +937,11 @@ mod tests {
         t3.state = TaskState::Pending;
         store.insert_task(t3).await.unwrap();
 
-        let pending = store.list_tasks(Some(TaskState::Pending)).await.unwrap();
+        let pending = store.list_tasks(Some(TaskState::Pending), None).await.unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|s| s.state == TaskState::Pending));
 
-        let success = store.list_tasks(Some(TaskState::Success)).await.unwrap();
+        let success = store.list_tasks(Some(TaskState::Success), None).await.unwrap();
         assert_eq!(success.len(), 1);
         assert_eq!(success[0].id, "t2");
     }

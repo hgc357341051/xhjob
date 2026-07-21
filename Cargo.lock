@@ -2653,6 +2653,7 @@ dependencies = [
  "crossbeam-channel",
  "encoding_rs",
  "ext-php-rs",
+ "libc",
  "nix",
  "num_cpus",
  "once_cell",

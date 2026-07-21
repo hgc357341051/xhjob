@@ -87,13 +87,15 @@ pub const MISFIRE_GRACE_TIME_SECS: u64 = 60;
 /// Decide whether a due cron task (next_fire <= now) should be enqueued or skipped.
 ///
 /// - `coalesce=true`: always fire (collapse N missed triggers into one).
-/// - `coalesce=false`: skip if the gap (`now - next_fire`) exceeds
-///   `MISFIRE_GRACE_TIME_SECS`.
-fn should_fire_due(next_fire: u64, now: u64, coalesce: bool) -> bool {
+/// - `coalesce=false`: skip if the gap (`now - next_fire`) exceeds the
+///   per-job `misfire_grace_time` (or the global default
+///   `MISFIRE_GRACE_TIME_SECS` when per-job override is 0).
+fn should_fire_due(next_fire: u64, now: u64, coalesce: bool, per_job_grace: u64) -> bool {
     if coalesce {
         return true;
     }
-    now.saturating_sub(next_fire) <= MISFIRE_GRACE_TIME_SECS
+    let grace = if per_job_grace > 0 { per_job_grace } else { MISFIRE_GRACE_TIME_SECS };
+    now.saturating_sub(next_fire) <= grace
 }
 
 /// Cron scheduler: scans active cron tasks every second and triggers due ones.
@@ -216,16 +218,24 @@ impl CronScheduler {
                     }
                 };
                 if next <= now {
-                    let fire = should_fire_due(next, now, task.coalesce);
+                    let fire = should_fire_due(next, now, task.coalesce, task.misfire_grace_time);
                     if fire {
                         due.push(task.id.clone());
                     } else {
+                        let grace = if task.misfire_grace_time > 0 { task.misfire_grace_time } else { MISFIRE_GRACE_TIME_SECS };
                         tracing::debug!(
                             task_id = %task.id,
                             gap_secs = now.saturating_sub(next),
-                            grace = MISFIRE_GRACE_TIME_SECS,
+                            grace = grace,
                             "MISFIRE_SKIP (coalesce=false)"
                         );
+                        // Record a `Missed` event so listeners can observe the misfire.
+                        let _ = self.store.record_event(
+                            &task.id,
+                            crate::store::EventType::Missed,
+                            None,
+                            now as i64,
+                        ).await;
                     }
                     // Either way, roll next_fire forward to the next occurrence
                     // so we don't keep re-evaluating the stale fire time.
@@ -317,25 +327,36 @@ mod tests {
     #[test]
     fn coalesce_true_always_fires_even_when_far_behind() {
         // coalesce=true (default): collapse missed triggers into one fire.
-        assert!(should_fire_due(0, 0, true));
-        assert!(should_fire_due(100, 150, true));
-        assert!(should_fire_due(100, 160, true));
-        assert!(should_fire_due(100, 10_000, true));
-        assert!(should_fire_due(0, 10_000, true));
+        assert!(should_fire_due(0, 0, true, 0));
+        assert!(should_fire_due(100, 150, true, 0));
+        assert!(should_fire_due(100, 160, true, 0));
+        assert!(should_fire_due(100, 10_000, true, 0));
+        assert!(should_fire_due(0, 10_000, true, 0));
     }
 
     #[test]
     fn coalesce_false_fires_within_grace_window() {
         // gap exactly == grace (60s): still fire (boundary is "exceeds").
-        assert!(should_fire_due(100, 150, false)); // gap=50
-        assert!(should_fire_due(100, 160, false)); // gap=60 == grace
+        assert!(should_fire_due(100, 150, false, 0)); // gap=50
+        assert!(should_fire_due(100, 160, false, 0)); // gap=60 == grace
     }
 
     #[test]
     fn coalesce_false_skips_when_beyond_grace_window() {
         // gap > grace: skip the fire (misfire).
-        assert!(!should_fire_due(100, 161, false)); // gap=61 > 60
-        assert!(!should_fire_due(0, 10_000, false)); // huge gap
+        assert!(!should_fire_due(100, 161, false, 0)); // gap=61 > 60
+        assert!(!should_fire_due(0, 10_000, false, 0)); // huge gap
+    }
+
+    #[test]
+    fn per_job_misfire_grace_time_overrides_global_default() {
+        // Per-job grace = 5s: gap=10s > 5s -> misfire.
+        assert!(!should_fire_due(100, 110, false, 5));
+        // Per-job grace = 30s: gap=20s < 30s -> fire.
+        assert!(should_fire_due(100, 120, false, 30));
+        // Per-job grace = 0 falls back to global 60s.
+        assert!(should_fire_due(100, 160, false, 0));
+        assert!(!should_fire_due(100, 161, false, 0));
     }
 
     /// Build a cron Task with the given next_fire + coalesce, for scan_once tests.

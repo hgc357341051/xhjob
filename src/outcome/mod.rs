@@ -47,6 +47,28 @@ pub struct StateInfo {
     /// sent after (timeout - soft_timeout) seconds of grace.
     /// Reference: Celery soft_time_limit.
     pub soft_timeout: Option<u64>,
+    /// misfire_grace_time (A13): per-job override of the global default
+    /// 60s misfire grace window. 0 = use global default.
+    pub misfire_grace_time: u64,
+    /// replace_existing (A14): whether dispatch replaces an existing task
+    /// with the same id (full overwrite).
+    pub replace_existing: bool,
+    /// tags (A15): user-supplied labels for grouping / filtering tasks.
+    pub tags: Vec<String>,
+    /// rate_limit_count (C12): max triggers within rate_limit_window secs.
+    /// 0 = no rate limiting.
+    pub rate_limit_count: u32,
+    /// rate_limit_window (C12): sliding window length in seconds for
+    /// rate limiting. 0 = no rate limiting.
+    pub rate_limit_window: u64,
+    /// acks_on_failure (C13): when true (default), task failures respect
+    /// retry_max. When false, failures are retried indefinitely.
+    pub acks_on_failure: bool,
+    /// timezone (A16): IANA timezone string used when evaluating the cron
+    /// expression. None = system local timezone.
+    pub timezone: Option<String>,
+    /// coalesce (A18): whether to collapse missed triggers into one fire.
+    pub coalesce: bool,
 }
 
 impl StateInfo {
@@ -72,6 +94,14 @@ impl StateInfo {
             ignore_result: task.ignore_result,
             acks_late: task.acks_late,
             soft_timeout: task.soft_timeout,
+            misfire_grace_time: task.misfire_grace_time,
+            replace_existing: task.replace_existing,
+            tags: task.tags.clone(),
+            rate_limit_count: task.rate_limit_count,
+            rate_limit_window: task.rate_limit_window,
+            acks_on_failure: task.acks_on_failure,
+            timezone: task.timezone.clone(),
+            coalesce: task.coalesce,
         }
     }
 }

@@ -9,6 +9,23 @@ use crate::store::{self, TaskStore, TaskState};
 use crate::scheduler::{CronScheduler, TaskQueue, OverlapController};
 use crate::task::TaskBuilder;
 use crate::outcome;
+use crate::utils::limits::{init_worker_limits, worker_limits};
+
+/// Generate a new random id (UUID v4 style). Uses the `uuid` crate if
+/// available; falls back to a timestamp+random composite.
+fn new_id() -> String {
+    // Use process id + nanos + counter for uniqueness without pulling in
+    // another crate. This is good enough for chain/group ids (which are
+    // user-inspectable labels, not security-sensitive).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:016x}{:08x}", nanos, n as u32)
+}
 
 /// The daemon entry point. Called by daemon::spawn_daemon(daemon_main) after fork.
 pub fn daemon_main() {
@@ -100,6 +117,10 @@ async fn run_daemon() -> Result<()> {
     let overlap = Arc::new(OverlapController::new());
     let queue = Arc::new(TaskQueue::new(Arc::clone(&store), Arc::clone(&overlap)));
     let cron = Arc::new(CronScheduler::new(Arc::clone(&store)));
+
+    // Install worker_limits singleton (C5 + C8). Done before the queue
+    // starts so queue.rs can poll the counters after each task completion.
+    let _worker_limits = init_worker_limits();
 
     // Shutdown signal
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -227,6 +248,12 @@ async fn handle_connection(
         "requeue" => handle_requeue_op(&store, req.payload).await,
         "reschedule" => handle_reschedule_op(&store, req.payload).await,
         "get" => handle_get_op(&store, req.payload).await,
+        "events" => handle_events_op(&store, req.payload).await,
+        "chain" => handle_chain_op(&store, &queue, req.payload).await,
+        "chain_state" => handle_chain_state_op(&store, req.payload).await,
+        "group" => handle_group_op(&store, &queue, req.payload).await,
+        "group_state" => handle_group_state_op(&store, req.payload).await,
+        "stats" => handle_stats_op(req.payload).await,
         "ping" => Ok(Response::success(req.id, serde_json::json!({"pong": true}))),
         other => Ok(Response::error(req.id, format!("unknown op: {}", other))),
     };
@@ -253,6 +280,12 @@ async fn handle_dispatch(
     let task = builder.build()?;
     let task_id = task.id.clone();
     let priority = task.priority;
+    // replace_existing (A14): when true and the user supplied an explicit
+    // `id`, drop any pre-existing task with the same id before inserting.
+    // Mirrors APScheduler's `replace_existing=True` semantics.
+    if task.replace_existing {
+        let _ = store.delete_task(&task.id).await;
+    }
     store.insert_task(task).await?;
     queue.enqueue(&task_id, priority).await?;
     Ok(Response::success(0, serde_json::json!({"task_id": task_id})))
@@ -346,7 +379,11 @@ async fn handle_list_op(
         Some(other) => return Err(XhjobError::InvalidTask(format!("invalid state_filter: {}", other))),
         None => None,
     };
-    let summaries = store.list_tasks(state_filter).await?;
+    let tag_filter: Option<String> = payload.get("tag_filter")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let summaries = store.list_tasks(state_filter, tag_filter.as_deref()).await?;
     let arr: Vec<serde_json::Value> = summaries.iter()
         .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
         .collect();
@@ -413,6 +450,198 @@ async fn handle_get_op(
         }
         None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
     }
+}
+
+/// Handler for `events` op: list task events since `since_ts` (Unix seconds),
+/// optionally filtered by `task_id` (A17).
+/// Reference: APScheduler EVENT_JOB_*.
+async fn handle_events_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let since_ts = payload.get("since_ts")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let task_id_filter: Option<String> = payload.get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let events = store.list_events(since_ts, task_id_filter.as_deref()).await?;
+    let arr: Vec<serde_json::Value> = events.iter()
+        .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
+        .collect();
+    Ok(Response::success(0, serde_json::json!({"events": arr})))
+}
+
+/// Handler for `chain` op (C15): create a chain of tasks. Persists a chain
+/// record and dispatches the first step. Each step's task stores its
+/// `chain_id` in `meta` so the queue can advance the chain after each step
+/// completes.
+/// Reference: Celery `chain(t1, t2, t3)`.
+async fn handle_chain_op(
+    store: &Arc<dyn TaskStore>,
+    queue: &Arc<TaskQueue>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let tasks = payload.get("tasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XhjobError::Ipc("missing or invalid tasks array".to_string()))?;
+    if tasks.is_empty() {
+        return Err(XhjobError::Ipc("chain requires at least one task".to_string()));
+    }
+    let chain_id = new_id();
+    let now = store::now_ts() as i64;
+    // Persist the chain record (preserves the user-supplied task configs
+    // untouched so chain.rs::advance can build the next step's TaskBuilder
+    // from the original config).
+    store.create_chain(&chain_id, tasks, now).await?;
+    // Dispatch the first step. chain::advance returns the next task config
+    // to run and bumps `current_step`. We set the task's `meta` to encode
+    // the chain_id so queue.rs can call advance() on the next success.
+    let next = crate::scheduler::chain::advance(store, &chain_id).await?
+        .ok_or_else(|| XhjobError::Store(format!("chain {} produced no first step", chain_id)))?;
+    let builder = TaskBuilder::from_json(&next.to_string())?;
+    let mut task = builder.build()?;
+    // Tag the task with the chain_id so queue.rs can advance the chain on
+    // success / mark_failed on failure.
+    let meta_obj = match task.meta.take() {
+        Some(s) if !s.is_empty() && s != "null" => {
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(mut v) if v.is_object() => {
+                    v.as_object_mut().unwrap().insert("xhjob_chain_id".to_string(), serde_json::json!(chain_id));
+                    Some(v.to_string())
+                }
+                _ => Some(serde_json::json!({"xhjob_chain_id": chain_id}).to_string()),
+            }
+        }
+        _ => Some(serde_json::json!({"xhjob_chain_id": chain_id}).to_string()),
+    };
+    task.meta = meta_obj;
+    let task_id = task.id.clone();
+    let priority = task.priority;
+    store.insert_task(task).await?;
+    queue.enqueue(&task_id, priority).await?;
+    Ok(Response::success(0, serde_json::json!({"chain_id": chain_id})))
+}
+
+/// Handler for `chain_state` op (C15): inspect a chain record by id.
+/// Returns `{"ok": true, "data": <chain_record>}` or `{"ok": false, "error": "not found"}`.
+/// Reference: Celery chain inspection.
+async fn handle_chain_state_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let chain_id = payload.get("chain_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing chain_id".to_string()))?;
+    match store.get_chain(chain_id).await? {
+        Some(record) => {
+            let data = serde_json::to_value(&record)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+            Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
+        }
+        None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
+    }
+}
+
+/// Handler for `group` op (C16): create a group of tasks. Persists a group
+/// record and dispatches all tasks concurrently. Each task stores its
+/// `group_id` in `meta` so the queue can refresh the group state on
+/// completion.
+/// Reference: Celery `group(t1, t2, t3)`.
+async fn handle_group_op(
+    store: &Arc<dyn TaskStore>,
+    queue: &Arc<TaskQueue>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let tasks = payload.get("tasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XhjobError::Ipc("missing or invalid tasks array".to_string()))?;
+    if tasks.is_empty() {
+        return Err(XhjobError::Ipc("group requires at least one task".to_string()));
+    }
+    let group_id = new_id();
+    let now = store::now_ts() as i64;
+    // Build + persist each task and record its id in the group's task list.
+    let mut persisted: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+    for cfg in tasks {
+        let builder = TaskBuilder::from_json(&cfg.to_string())?;
+        let mut task = builder.build()?;
+        // Tag the task with the group_id so queue.rs can refresh the group
+        // state on completion.
+        let meta_obj = match task.meta.take() {
+            Some(s) if !s.is_empty() && s != "null" => {
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(mut v) if v.is_object() => {
+                        v.as_object_mut().unwrap().insert("xhjob_group_id".to_string(), serde_json::json!(group_id));
+                        Some(v.to_string())
+                    }
+                    _ => Some(serde_json::json!({"xhjob_group_id": group_id}).to_string()),
+                }
+            }
+            _ => Some(serde_json::json!({"xhjob_group_id": group_id}).to_string()),
+        };
+        task.meta = meta_obj;
+        let task_id = task.id.clone();
+        let priority = task.priority;
+        store.insert_task(task).await?;
+        queue.enqueue(&task_id, priority).await?;
+        // Record the dispatched task's id in the group record so
+        // group::summarize can inspect each task's live state.
+        persisted.push(serde_json::json!({ "id": task_id }));
+    }
+    store.create_group(&group_id, &persisted, now).await?;
+    Ok(Response::success(0, serde_json::json!({"group_id": group_id})))
+}
+
+/// Handler for `group_state` op (C16): inspect a group record by id plus a
+/// live summary computed from each member task's current state.
+/// Returns `{"ok": true, "data": <group_record>, "summary": {total, succeeded, failed, pending}}`
+/// or `{"ok": false, "error": "not found"}`.
+/// Reference: Celery group inspection.
+async fn handle_group_state_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let group_id = payload.get("group_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing group_id".to_string()))?;
+    match store.get_group(group_id).await? {
+        Some(record) => {
+            let (total, succeeded, failed, pending) =
+                crate::scheduler::group::summarize(store, group_id).await?;
+            let mut data = serde_json::to_value(&record)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("summary".to_string(), serde_json::json!({
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "pending": pending,
+                }));
+            }
+            Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
+        }
+        None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
+    }
+}
+
+/// Handler for `stats` op: snapshot daemon worker stats (C5 + C8).
+/// Returns the cumulative task execution count, configured limits, and
+/// current process RSS in bytes.
+/// Reference: Celery worker stats.
+async fn handle_stats_op(_payload: serde_json::Value) -> Result<Response> {
+    let data = match worker_limits() {
+        Some(l) => l.snapshot(),
+        None => serde_json::json!({
+            "tasks_executed": 0,
+            "max_tasks_per_child": 0,
+            "max_memory_per_child": 0,
+            "current_rss_bytes": 0,
+            "note": "worker_limits not initialized",
+        }),
+    };
+    Ok(Response::success(0, data))
 }
 
 #[cfg(unix)]

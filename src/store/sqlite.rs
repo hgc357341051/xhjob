@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use rusqlite::{Connection, params, OptionalExtension};
 use crate::errors::{Result, XhjobError};
-use super::{Task, TaskType, TaskState, TaskResult, TaskStore, TaskSummary};
+use super::{Task, TaskType, TaskState, TaskResult, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -61,7 +61,13 @@ impl SqliteStore {
                 retry_backoff INTEGER NOT NULL DEFAULT 0,
                 ignore_result INTEGER NOT NULL DEFAULT 0,
                 acks_late INTEGER NOT NULL DEFAULT 0,
-                soft_timeout INTEGER
+                soft_timeout INTEGER,
+                misfire_grace_time INTEGER NOT NULL DEFAULT 0,
+                replace_existing INTEGER NOT NULL DEFAULT 0,
+                tags TEXT NOT NULL DEFAULT '[]',
+                rate_limit_count INTEGER NOT NULL DEFAULT 0,
+                rate_limit_window INTEGER NOT NULL DEFAULT 0,
+                acks_on_failure INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS results (
                 task_id      TEXT PRIMARY KEY,
@@ -71,6 +77,30 @@ impl SqliteStore {
                 stderr       TEXT,
                 exit_code    INTEGER,
                 FOREIGN KEY (task_id) REFERENCES tasks(id)
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id     TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                payload    TEXT,
+                ts         INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+            CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
+            CREATE TABLE IF NOT EXISTS chains (
+                chain_id     TEXT PRIMARY KEY,
+                tasks        TEXT NOT NULL,
+                current_step INTEGER NOT NULL DEFAULT 0,
+                state        TEXT NOT NULL DEFAULT 'pending',
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id    TEXT PRIMARY KEY,
+                tasks       TEXT NOT NULL,
+                state       TEXT NOT NULL DEFAULT 'pending',
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
             CREATE INDEX IF NOT EXISTS idx_tasks_next_fire ON tasks(next_fire);
@@ -93,6 +123,12 @@ impl SqliteStore {
         ensure_column(&conn, "ignore_result", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "acks_late", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "soft_timeout", "INTEGER")?;
+        ensure_column(&conn, "misfire_grace_time", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "replace_existing", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "tags", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(&conn, "rate_limit_count", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "rate_limit_window", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "acks_on_failure", "INTEGER NOT NULL DEFAULT 1")?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
@@ -176,6 +212,16 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         ignore_result: row.get::<_, i64>("ignore_result").unwrap_or(0) != 0,
         acks_late: row.get::<_, i64>("acks_late").unwrap_or(0) != 0,
         soft_timeout: row.get::<_, Option<i64>>("soft_timeout").ok().flatten().map(|v| v as u64),
+        // Round 4 fields. Use unwrap_or for legacy-row safety.
+        misfire_grace_time: row.get::<_, i64>("misfire_grace_time").unwrap_or(0) as u64,
+        replace_existing: row.get::<_, i64>("replace_existing").unwrap_or(0) != 0,
+        tags: {
+            let s: String = row.get::<_, String>("tags").unwrap_or_else(|_| "[]".to_string());
+            serde_json::from_str(&s).unwrap_or_default()
+        },
+        rate_limit_count: row.get::<_, i64>("rate_limit_count").unwrap_or(0) as u32,
+        rate_limit_window: row.get::<_, i64>("rate_limit_window").unwrap_or(0) as u64,
+        acks_on_failure: row.get::<_, i64>("acks_on_failure").unwrap_or(1) != 0,
     })
 }
 
@@ -186,6 +232,7 @@ impl TaskStore for SqliteStore {
             let payload_str = serde_json::to_string(&task.payload).unwrap_or_default();
             let type_str = task.task_type.as_str();
             let state_str = task.state.as_str();
+            let tags_str = serde_json::to_string(&task.tags).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
                 "INSERT OR REPLACE INTO tasks
                  (id, type, payload, cron, retry_max, retry_delay, timeout, priority,
@@ -193,8 +240,10 @@ impl TaskStore for SqliteStore {
                   next_fire, created_at, started_at, finished_at, last_error,
                   proxy, encoding, timezone, max_executions, execution_count,
                   paused, cancel_requested, start_date, end_date, result_ttl, meta,
-                  interval, run_at, jitter, expires, retry_backoff, ignore_result, acks_late, soft_timeout)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
+                  interval, run_at, jitter, expires, retry_backoff, ignore_result,
+                  acks_late, soft_timeout, misfire_grace_time, replace_existing,
+                  tags, rate_limit_count, rate_limit_window, acks_on_failure)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,
@@ -210,6 +259,12 @@ impl TaskStore for SqliteStore {
                     task.retry_backoff as i64, task.ignore_result as i64,
                     task.acks_late as i64,
                     task.soft_timeout.map(|v| v as i64),
+                    task.misfire_grace_time as i64,
+                    task.replace_existing as i64,
+                    tags_str,
+                    task.rate_limit_count as i64,
+                    task.rate_limit_window as i64,
+                    task.acks_on_failure as i64,
                 ],
             ).map_err(|e| XhjobError::Store(format!("insert: {}", e)))?;
             Ok(())
@@ -436,7 +491,8 @@ impl TaskStore for SqliteStore {
         })
     }
 
-    fn list_tasks(&self, state_filter: Option<TaskState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+    fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>> {
+        let tag_filter = tag_filter.map(|s| s.to_string());
         Box::pin(async move {
             let conn = self.conn.lock().await;
             let mut result = Vec::new();
@@ -449,6 +505,9 @@ impl TaskStore for SqliteStore {
                         .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
                     for row in rows {
                         let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                        if let Some(tag) = &tag_filter {
+                            if !task.tags.iter().any(|t| t == tag) { continue; }
+                        }
                         result.push(TaskSummary::from(&task));
                     }
                 }
@@ -460,6 +519,9 @@ impl TaskStore for SqliteStore {
                         .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
                     for row in rows {
                         let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                        if let Some(tag) = &tag_filter {
+                            if !task.tags.iter().any(|t| t == tag) { continue; }
+                        }
                         result.push(TaskSummary::from(&task));
                     }
                 }
@@ -559,6 +621,249 @@ impl TaskStore for SqliteStore {
                 params![now],
             ).map_err(|e| XhjobError::Store(format!("reset_running_to_pending update: {}", e)))?;
             Ok(changed as u64)
+        })
+    }
+
+    // ----- Event log (A17) -----
+
+    fn record_event(&self, task_id: &str, event_type: super::EventType, payload: Option<&str>, ts: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let task_id = task_id.to_string();
+        let payload = payload.map(|s| s.to_string());
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "INSERT INTO events (task_id, event_type, payload, ts) VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, event_type.as_str(), payload, ts],
+            ).map_err(|e| XhjobError::Store(format!("record_event: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>> {
+        let task_id_filter = task_id_filter.map(|s| s.to_string());
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut out = Vec::new();
+            match task_id_filter {
+                Some(tid) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT task_id, event_type, payload, ts FROM events
+                         WHERE ts >= ?1 AND task_id = ?2 ORDER BY ts ASC"
+                    ).map_err(|e| XhjobError::Store(format!("list_events prepare: {}", e)))?;
+                    let rows = stmt.query_map(params![since_ts, tid], |row| {
+                        let event_type_str: String = row.get(1)?;
+                        let event_type = super::EventType::from_str(&event_type_str)
+                            .unwrap_or(super::EventType::Started);
+                        Ok(TaskEvent {
+                            task_id: row.get(0)?,
+                            event_type,
+                            payload: row.get(2)?,
+                            ts: row.get(3)?,
+                        })
+                    }).map_err(|e| XhjobError::Store(format!("list_events query: {}", e)))?;
+                    for r in rows {
+                        if let Ok(e) = r { out.push(e); }
+                    }
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT task_id, event_type, payload, ts FROM events
+                         WHERE ts >= ?1 ORDER BY ts ASC"
+                    ).map_err(|e| XhjobError::Store(format!("list_events prepare: {}", e)))?;
+                    let rows = stmt.query_map(params![since_ts], |row| {
+                        let event_type_str: String = row.get(1)?;
+                        let event_type = super::EventType::from_str(&event_type_str)
+                            .unwrap_or(super::EventType::Started);
+                        Ok(TaskEvent {
+                            task_id: row.get(0)?,
+                            event_type,
+                            payload: row.get(2)?,
+                            ts: row.get(3)?,
+                        })
+                    }).map_err(|e| XhjobError::Store(format!("list_events query: {}", e)))?;
+                    for r in rows {
+                        if let Ok(e) = r { out.push(e); }
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn cleanup_expired_events(&self, ttl_secs: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let now = crate::store::now_ts() as i64;
+            let cutoff = now.saturating_sub(ttl_secs as i64);
+            let deleted = conn.execute(
+                "DELETE FROM events WHERE ts < ?1",
+                params![cutoff],
+            ).map_err(|e| XhjobError::Store(format!("cleanup_expired_events: {}", e)))?;
+            Ok(deleted as u64)
+        })
+    }
+
+    // ----- Task chain (C15) -----
+
+    fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        let tasks = tasks.to_vec();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let tasks_str = serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "INSERT OR REPLACE INTO chains (chain_id, tasks, current_step, state, created_at, updated_at)
+                 VALUES (?1, ?2, 0, 'pending', ?3, ?3)",
+                params![chain_id, tasks_str, created_at],
+            ).map_err(|e| XhjobError::Store(format!("create_chain: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn get_chain(&self, chain_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT chain_id, tasks, current_step, state, created_at, updated_at FROM chains WHERE chain_id = ?1"
+            ).map_err(|e| XhjobError::Store(format!("get_chain prepare: {}", e)))?;
+            let mut rows = stmt.query_map(params![chain_id], |row| {
+                let tasks_str: String = row.get(1)?;
+                let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
+                Ok(ChainRecord {
+                    chain_id: row.get(0)?,
+                    tasks,
+                    current_step: row.get::<_, i64>(2)? as u32,
+                    state: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            }).map_err(|e| XhjobError::Store(format!("get_chain query: {}", e)))?;
+            if let Some(row) = rows.next() {
+                if let Ok(c) = row { return Ok(Some(c)); }
+            }
+            Ok(None)
+        })
+    }
+
+    fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let chain_id = chain_id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "UPDATE chains SET current_step = ?1, state = ?2, updated_at = ?3 WHERE chain_id = ?4",
+                params![current_step as i64, state, updated_at, chain_id],
+            ).map_err(|e| XhjobError::Store(format!("update_chain_step: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn list_chains_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>> {
+        let state = state.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT chain_id, tasks, current_step, state, created_at, updated_at FROM chains WHERE state = ?1 ORDER BY created_at ASC"
+            ).map_err(|e| XhjobError::Store(format!("list_chains_by_state prepare: {}", e)))?;
+            let rows = stmt.query_map(params![state], |row| {
+                let tasks_str: String = row.get(1)?;
+                let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
+                Ok(ChainRecord {
+                    chain_id: row.get(0)?,
+                    tasks,
+                    current_step: row.get::<_, i64>(2)? as u32,
+                    state: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            }).map_err(|e| XhjobError::Store(format!("list_chains_by_state query: {}", e)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(c) = r { out.push(c); }
+            }
+            Ok(out)
+        })
+    }
+
+    // ----- Task group (C16) -----
+
+    fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        let tasks = tasks.to_vec();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let tasks_str = serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "INSERT OR REPLACE INTO groups (group_id, tasks, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'pending', ?3, ?3)",
+                params![group_id, tasks_str, created_at],
+            ).map_err(|e| XhjobError::Store(format!("create_group: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn get_group(&self, group_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT group_id, tasks, state, created_at, updated_at FROM groups WHERE group_id = ?1"
+            ).map_err(|e| XhjobError::Store(format!("get_group prepare: {}", e)))?;
+            let mut rows = stmt.query_map(params![group_id], |row| {
+                let tasks_str: String = row.get(1)?;
+                let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
+                Ok(GroupRecord {
+                    group_id: row.get(0)?,
+                    tasks,
+                    state: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            }).map_err(|e| XhjobError::Store(format!("get_group query: {}", e)))?;
+            if let Some(row) = rows.next() {
+                if let Ok(g) = row { return Ok(Some(g)); }
+            }
+            Ok(None)
+        })
+    }
+
+    fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let group_id = group_id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "UPDATE groups SET state = ?1, updated_at = ?2 WHERE group_id = ?3",
+                params![state, updated_at, group_id],
+            ).map_err(|e| XhjobError::Store(format!("update_group_state: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>> {
+        let state = state.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT group_id, tasks, state, created_at, updated_at FROM groups WHERE state = ?1 ORDER BY created_at ASC"
+            ).map_err(|e| XhjobError::Store(format!("list_groups_by_state prepare: {}", e)))?;
+            let rows = stmt.query_map(params![state], |row| {
+                let tasks_str: String = row.get(1)?;
+                let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
+                Ok(GroupRecord {
+                    group_id: row.get(0)?,
+                    tasks,
+                    state: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            }).map_err(|e| XhjobError::Store(format!("list_groups_by_state query: {}", e)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(g) = r { out.push(g); }
+            }
+            Ok(out)
         })
     }
 }

@@ -23,15 +23,24 @@ use crate::store::now_ts;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskBuilder {
     pub task_type: Option<TaskType>,
+    #[serde(default)]
     pub payload: serde_json::Value,
     pub cron: Option<String>,
+    #[serde(default)]
     pub retry_max: u32,
+    #[serde(default = "default_retry_delay")]
     pub retry_delay: u64,
+    #[serde(default = "default_timeout")]
     pub timeout: u64,
+    #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
     pub allow_overlap: bool,
+    #[serde(default = "default_max_instances")]
     pub max_instances: u32,
+    #[serde(default = "default_coalesce_true")]
     pub coalesce: bool,
+    #[serde(default)]
     pub persist: bool,
     /// Service name this builder dispatches to. Defaults to "default".
     #[serde(default = "default_service_name")]
@@ -119,11 +128,60 @@ pub struct TaskBuilder {
     /// Reference: Celery soft_time_limit.
     #[serde(default)]
     pub soft_timeout: Option<u64>,
+    /// misfire_grace_time (A13): per-job override of the global default
+    /// 60s misfire grace window. 0 = use global default (60s).
+    /// Reference: APScheduler misfire_grace_time.
+    #[serde(default)]
+    pub misfire_grace_time: u64,
+    /// Optional explicit task id (A14). When set, dispatch will use this id
+    /// instead of auto-generating a UUID. If `replace_existing` is true, an
+    /// existing task with the same id is fully replaced. If false, dispatch
+    /// errors out on id conflict.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// replace_existing (A14): when true and `id` is set, dispatch replaces
+    /// an existing task with the same id (full overwrite, state /
+    /// attempts / execution_count reset). Default false (error on conflict).
+    #[serde(default)]
+    pub replace_existing: bool,
+    /// tags (A15): user-supplied labels for grouping / filtering tasks.
+    /// Empty by default. Reference: APScheduler tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// rate_limit_count (C12): max number of triggers allowed within
+    /// `rate_limit_window` seconds. 0 = no rate limiting (default).
+    /// Reference: Celery rate_limit.
+    #[serde(default)]
+    pub rate_limit_count: u32,
+    /// rate_limit_window (C12): sliding window length in seconds for
+    /// rate limiting. 0 = no rate limiting (default).
+    /// Reference: Celery rate_limit.
+    #[serde(default)]
+    pub rate_limit_window: u64,
+    /// acks_on_failure (C13): when true (default), task failures respect
+    /// `retry_max`. When false, failures are retried indefinitely until
+    /// the task succeeds or is cancelled/removed.
+    /// Reference: Celery acks_on_failure.
+    #[serde(default = "default_acks_on_failure_true")]
+    pub acks_on_failure: bool,
 }
+
+fn default_acks_on_failure_true() -> bool { true }
 
 fn default_service_name() -> String {
     "default".to_string()
 }
+
+// Per-field serde defaults that mirror `TaskBuilder::default()`. Plain
+// `#[serde(default)]` would use the field type's `Default` (e.g. `0` for
+// `u64`), which differs from the struct's defaults for `retry_delay`,
+// `timeout`, `max_instances`, and `coalesce`. Providing explicit functions
+// ensures partial JSON (e.g. only `task_type` + `payload` from PHP users)
+// deserializes with the same sensible defaults the Rust builder API uses.
+fn default_retry_delay() -> u64 { 1 }
+fn default_timeout() -> u64 { 30 }
+fn default_max_instances() -> u32 { 1 }
+fn default_coalesce_true() -> bool { true }
 
 /// Compute a random jitter offset in `[0, secs]` using `rand::thread_rng()`.
 /// Used to spread out cron / interval task triggers and avoid thundering-herd
@@ -169,6 +227,13 @@ impl Default for TaskBuilder {
             ignore_result: false,
             acks_late: false,
             soft_timeout: None,
+            misfire_grace_time: 0,
+            id: None,
+            replace_existing: false,
+            tags: Vec::new(),
+            rate_limit_count: 0,
+            rate_limit_window: 0,
+            acks_on_failure: true,
         }
     }
 }
@@ -448,6 +513,80 @@ impl TaskBuilder {
         self
     }
 
+    /// Set per-job misfire_grace_time (A13) in seconds. 0 = use the global
+    /// default (60s). When `now - next_fire > grace_time`, the trigger is
+    /// considered misfired; `coalesce=true` collapses missed triggers into
+    /// one fire (still executes once), `coalesce=false` skips the trigger
+    /// entirely. Only effective for cron tasks; interval / runAt tasks
+    /// ignore this field (warn + ignore).
+    /// Exposed as `misfireGraceTime(int $secs)` in PHP (snake→camel auto-conversion).
+    /// Reference: APScheduler misfire_grace_time.
+    pub fn misfire_grace_time(mut self, secs: u64) -> Self {
+        self.misfire_grace_time = secs;
+        self
+    }
+
+    /// Set an explicit task id (A14). When set, dispatch will use this id
+    /// instead of auto-generating a UUID. If `replace_existing` is true, an
+    /// existing task with the same id is fully replaced (state /
+    /// attempts / execution_count reset). If false (default), dispatch
+    /// errors out on id conflict.
+    /// Exposed as `withId(string $id)` in PHP (snake→camel auto-conversion).
+    /// Reference: APScheduler id / replace_existing.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        let id = id.into();
+        self.id = if id.is_empty() { None } else { Some(id) };
+        self
+    }
+
+    /// Enable replace_existing (A14): when true and `id` is set, dispatch
+    /// replaces an existing task with the same id (full overwrite, state /
+    /// attempts / execution_count reset). When false (default), dispatch
+    /// returns an error on id conflict.
+    /// Exposed as `replaceExisting(bool $on)` in PHP (snake→camel auto-conversion).
+    /// Reference: APScheduler replace_existing.
+    pub fn replace_existing(mut self, on: bool) -> Self {
+        self.replace_existing = on;
+        self
+    }
+
+    /// Add a tag (A15) to this task. Tags are user-supplied labels for
+    /// grouping / filtering tasks. Multiple tags can be added by chaining.
+    /// Empty / duplicate tags are silently ignored.
+    /// Exposed as `tags(string ...$tags)` in PHP.
+    /// Reference: APScheduler tags.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        let t = tag.into();
+        if !t.is_empty() && !self.tags.iter().any(|x| x == &t) {
+            self.tags.push(t);
+        }
+        self
+    }
+
+    /// Set the rate limit (C12): max `count` triggers within `window`
+    /// seconds. 0 count = no rate limiting (default). A sliding window
+    /// algorithm enforces the limit; over-limit triggers record a
+    /// `RateLimited` event and are skipped (next_fire advanced by window).
+    /// Exposed as `rateLimit(int $count, int $window)` in PHP (snake→camel auto-conversion).
+    /// Reference: Celery rate_limit.
+    pub fn rate_limit(mut self, count: u32, window: u64) -> Self {
+        self.rate_limit_count = count;
+        self.rate_limit_window = window;
+        self
+    }
+
+    /// Set acks_on_failure (C13): when true (default), task failures respect
+    /// `retry_max` (transition to Failed terminal after exhausting retries).
+    /// When false, failures are retried indefinitely (ignoring retry_max)
+    /// until the task succeeds or is cancelled/removed. Complementary to
+    /// `acks_late`.
+    /// Exposed as `acksOnFailure(bool $on)` in PHP (snake→camel auto-conversion).
+    /// Reference: Celery acks_on_failure.
+    pub fn acks_on_failure(mut self, on: bool) -> Self {
+        self.acks_on_failure = on;
+        self
+    }
+
     /// Build the final Task struct (without dispatching).
     pub fn build(self) -> Result<Task> {
         let task_type = self.task_type.ok_or_else(|| XhjobError::InvalidTask(
@@ -479,6 +618,16 @@ impl TaskBuilder {
         task.ignore_result = self.ignore_result;
         task.acks_late = self.acks_late;
         task.soft_timeout = self.soft_timeout;
+        task.misfire_grace_time = self.misfire_grace_time;
+        // A14: explicit id — if set, override the auto-generated UUID.
+        if let Some(id) = self.id {
+            task.id = id;
+        }
+        task.replace_existing = self.replace_existing;
+        task.tags = self.tags;
+        task.rate_limit_count = self.rate_limit_count;
+        task.rate_limit_window = self.rate_limit_window;
+        task.acks_on_failure = self.acks_on_failure;
         // Warn when both ignore_result and result_ttl are set: they conflict
         // (one says "don't store", the other says "store then auto-clean").
         // ignore_result takes priority — no row is ever written.
@@ -644,5 +793,30 @@ mod tests {
             .build()
             .expect("build should succeed (warn + reset, not error)");
         assert_eq!(task.soft_timeout, None, "soft_timeout == timeout should also be reset to None");
+    }
+
+    /// Partial-JSON deserialization (Round 4 fix): PHP users typically pass
+    /// only `task_type` + `payload` to `xhjob_dispatch()`; the remaining
+    /// TaskBuilder fields must fall back to their struct-level defaults
+    /// (retry_delay=1, timeout=30, max_instances=1, coalesce=true), NOT the
+    /// raw type defaults (0, 0, 0, false) that plain `#[serde(default)]`
+    /// would produce. This test guards against regressions where a missing
+    /// `timeout` field silently produces timeout=0 and every task fails with
+    /// "exec: timeout after 0s".
+    #[test]
+    fn test_partial_json_uses_struct_defaults() {
+        let json = r#"{"task_type":"shell","payload":{"cmd":"echo hi"}}"#;
+        let b = TaskBuilder::from_json(json).expect("partial JSON should deserialize");
+        let task = b.build().expect("build should succeed with defaults");
+        assert_eq!(task.task_type, TaskType::Shell);
+        assert_eq!(task.retry_max, 0, "retry_max default = 0");
+        assert_eq!(task.retry_delay, 1, "retry_delay default = 1 (not 0)");
+        assert_eq!(task.timeout, 30, "timeout default = 30 (not 0)");
+        assert_eq!(task.priority, 0, "priority default = 0");
+        assert_eq!(task.max_instances, 1, "max_instances default = 1 (not 0)");
+        assert!(task.coalesce, "coalesce default = true (not false)");
+        assert!(!task.persist, "persist default = false");
+        assert!(!task.allow_overlap, "allow_overlap default = false");
+        assert!(task.acks_on_failure, "acks_on_failure default = true");
     }
 }

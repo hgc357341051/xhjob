@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod service;
 pub mod store;
 pub mod task;
+pub mod utils;
 
 pub use service::ServiceName;
 
@@ -855,6 +856,68 @@ impl Xhjob {
         self
     }
 
+    /// Set per-job misfire_grace_time (A13) in seconds. 0 = use global
+    /// default (60s). When `now - next_fire > grace_time`, the trigger is
+    /// considered misfired; `coalesce=true` collapses missed triggers into
+    /// one fire (still executes once), `coalesce=false` skips the trigger
+    /// entirely. Only effective for cron tasks.
+    /// PHP: `misfireGraceTime(int $secs): $this` (snake→camel auto-conversion)
+    /// Reference: APScheduler misfire_grace_time.
+    pub fn misfire_grace_time(&mut self, secs: i64) -> &mut Self {
+        self.builder.misfire_grace_time = secs.max(0) as u64;
+        self
+    }
+
+    /// Set an explicit task id (A14). When set, dispatch will use this id
+    /// instead of auto-generating a UUID. If `replaceExisting` is true, an
+    /// existing task with the same id is fully replaced.
+    /// PHP: `withId(string $id): $this` (snake→camel auto-conversion)
+    /// Reference: APScheduler id / replace_existing.
+    pub fn id(&mut self, id: String) -> &mut Self {
+        self.builder.id = if id.is_empty() { None } else { Some(id) };
+        self
+    }
+
+    /// Enable replace_existing (A14): when true and `id` is set, dispatch
+    /// replaces an existing task with the same id (full overwrite).
+    /// PHP: `replaceExisting(bool $on): $this` (snake→camel auto-conversion)
+    /// Reference: APScheduler replace_existing.
+    pub fn replace_existing(&mut self, on: bool) -> &mut Self {
+        self.builder.replace_existing = on;
+        self
+    }
+
+    /// Add a tag (A15) to this task. Multiple tags can be added by chaining.
+    /// Empty tags are silently ignored.
+    /// PHP: `tag(string $tag): $this`.
+    /// Reference: APScheduler tags.
+    pub fn tag(&mut self, tag: String) -> &mut Self {
+        if !tag.is_empty() && !self.builder.tags.iter().any(|t| t == &tag) {
+            self.builder.tags.push(tag);
+        }
+        self
+    }
+
+    /// Set the rate limit (C12): max `count` triggers within `window`
+    /// seconds. 0 count = no rate limiting.
+    /// PHP: `rateLimit(int $count, int $window): $this` (snake→camel auto-conversion)
+    /// Reference: Celery rate_limit.
+    pub fn rate_limit(&mut self, count: i64, window: i64) -> &mut Self {
+        self.builder.rate_limit_count = count.max(0) as u32;
+        self.builder.rate_limit_window = window.max(0) as u64;
+        self
+    }
+
+    /// Set acks_on_failure (C13): when true (default), task failures respect
+    /// `retry_max`. When false, failures are retried indefinitely until the
+    /// task succeeds or is cancelled/removed.
+    /// PHP: `acksOnFailure(bool $on): $this` (snake→camel auto-conversion)
+    /// Reference: Celery acks_on_failure.
+    pub fn acks_on_failure(&mut self, on: bool) -> &mut Self {
+        self.builder.acks_on_failure = on;
+        self
+    }
+
     pub fn dispatch(&mut self) -> String {
         let rt = match pool::coroutine_pool::global_runtime() {
             Some(rt) => rt,
@@ -869,6 +932,223 @@ impl Xhjob {
             Err(e) => format!("error: {}", e),
         }
     }
+}
+
+/// List task events since `since_ts` (Unix seconds), optionally filtered by
+/// `task_id` (A17). Returns a JSON array of `{task_id, event_type, payload,
+/// ts}` objects, or `"error: ..."` on failure.
+///
+/// Reference: APScheduler EVENT_JOB_*.
+/// PHP: `xhjob_events(int $since_ts, ?string $task_id = null, string $name = "default", string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_events(
+    since_ts: i64,
+    task_id: Option<String>,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({
+            "since_ts": since_ts,
+            "task_id": task_id,
+        });
+        match ipc::request("events", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("events")
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "[]".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Create a chain of tasks (C15). Sequential pipeline: each task's stdout is
+/// fed into the next task's input. The chain record is persisted with the
+/// ordered list of task configs and the daemon dispatches them one at a
+/// time, advancing only after the previous step succeeds. On any step
+/// failure the chain state becomes "failed" and remaining steps are
+/// skipped.
+///
+/// `tasks_json` is a JSON array of TaskBuilder config objects, e.g.
+/// `[{"type":"shell","cmd":"echo a"},{"type":"shell","cmd":"grep a"}]`.
+///
+/// Returns the chain_id on success, or `"error: ..."` on failure.
+///
+/// Reference: Celery `chain(t1, t2, t3)`.
+/// PHP: `xhjob_chain(string $tasks_json, string $name = "default", string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_chain(tasks_json: String, name: Option<String>, data_dir: Option<String>) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let tasks: serde_json::Value = match serde_json::from_str(&tasks_json) {
+            Ok(v) => v,
+            Err(e) => return format!("error: invalid json: {}", e),
+        };
+        let payload = serde_json::json!({ "tasks": tasks });
+        match ipc::request("chain", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("chain_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "error: missing chain_id".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Get the chain state (C15). Returns the full ChainRecord JSON
+/// (`{chain_id, tasks, current_step, state, created_at, updated_at}`)
+/// or `null` if the chain does not exist / daemon unreachable.
+///
+/// Reference: Celery chain inspection.
+/// PHP: `xhjob_chain_state(string $chain_id, string $name = "default", string $data_dir = null): ?string`
+#[php_function]
+pub fn xhjob_chain_state(chain_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_chain_state invalid service name: {}", e);
+            return None;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "chain_id": chain_id });
+        match ipc::request("chain_state", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return None;
+                }
+                let ok = resp.data.get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    return None;
+                }
+                resp.data.get("data").map(|d| d.to_string())
+            }
+            Err(e) => {
+                tracing::error!("xhjob_chain_state ipc: {}", e);
+                None
+            }
+        }
+    })
+}
+
+/// Create a group of tasks (C16). Parallel batch: all tasks are dispatched
+/// concurrently. As each task completes the daemon updates the group
+/// state. Final group state is "succeeded" (all ok) / "partial_failed"
+/// (some failed) / "failed" (all failed).
+///
+/// `tasks_json` is a JSON array of TaskBuilder config objects.
+///
+/// Returns the group_id on success, or `"error: ..."` on failure.
+///
+/// Reference: Celery `group(t1, t2, t3)`.
+/// PHP: `xhjob_group(string $tasks_json, string $name = "default", string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_group(tasks_json: String, name: Option<String>, data_dir: Option<String>) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let tasks: serde_json::Value = match serde_json::from_str(&tasks_json) {
+            Ok(v) => v,
+            Err(e) => return format!("error: invalid json: {}", e),
+        };
+        let payload = serde_json::json!({ "tasks": tasks });
+        match ipc::request("group", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("group_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "error: missing group_id".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Get the group state (C16). Returns the full GroupRecord JSON
+/// (`{group_id, tasks, state, created_at, updated_at}`) plus a live
+/// `summary` field `{total, succeeded, failed, pending}`, or `null` if
+/// the group does not exist / daemon unreachable.
+///
+/// Reference: Celery group inspection.
+/// PHP: `xhjob_group_state(string $group_id, string $name = "default", string $data_dir = null): ?string`
+#[php_function]
+pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_group_state invalid service name: {}", e);
+            return None;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "group_id": group_id });
+        match ipc::request("group_state", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return None;
+                }
+                let ok = resp.data.get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    return None;
+                }
+                resp.data.get("data").map(|d| d.to_string())
+            }
+            Err(e) => {
+                tracing::error!("xhjob_group_state ipc: {}", e);
+                None
+            }
+        }
+    })
 }
 
 // =========================================================================
@@ -895,4 +1175,9 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(xhjob_reschedule))
         .function(wrap_function!(xhjob_get))
         .function(wrap_function!(xhjob_run_daemon))
+        .function(wrap_function!(xhjob_events))
+        .function(wrap_function!(xhjob_chain))
+        .function(wrap_function!(xhjob_chain_state))
+        .function(wrap_function!(xhjob_group))
+        .function(wrap_function!(xhjob_group_state))
 }

@@ -46,7 +46,7 @@ impl TaskQueue {
     }
 
     /// Process one task: overlap check -> dispatch -> state update.
-    pub async fn process_one(&self) -> Result<()> {
+    pub async fn process_one(self: Arc<Self>) -> Result<()> {
         let task_id = match self.drain_next().await {
             Some(id) => id,
             None => return Ok(()),
@@ -74,10 +74,18 @@ impl TaskQueue {
             Some(now_ts()),
             None,
         ).await?;
+        // Record a `Started` event (A17).
+        let _ = self.store.record_event(
+            &task.id,
+            crate::store::EventType::Started,
+            None,
+            now_ts() as i64,
+        ).await;
 
         // Dispatch via coroutine pool
         let store = Arc::clone(&self.store);
         let overlap = Arc::clone(&self.overlap);
+        let queue_arc = Arc::clone(&self);
         let task_clone = task.clone();
         coroutine_pool::global().spawn(async move {
             let result = dispatch_task(&task_clone).await;
@@ -126,6 +134,13 @@ impl TaskQueue {
                     TaskState::Cancelled,
                     None,
                     Some(now_ts()),
+                ).await;
+                // Record a `Cancelled` event (A17).
+                let _ = store.record_event(
+                    &task_clone.id,
+                    crate::store::EventType::Cancelled,
+                    None,
+                    now_ts() as i64,
                 ).await;
                 overlap.on_finish(&task_clone.id).await;
                 return;
@@ -190,12 +205,27 @@ impl TaskQueue {
                                 None,
                                 Some(finished),
                             ).await;
+                            // Record a `Succeeded` event (A17) — terminal success.
+                            let _ = store.record_event(
+                                &task_clone.id,
+                                crate::store::EventType::Succeeded,
+                                None,
+                                finished as i64,
+                            ).await;
                         } else {
                             let _ = store.update_state(
                                 &task_clone.id,
                                 TaskState::Pending,
                                 None,
                                 Some(finished),
+                            ).await;
+                            // Record a `Succeeded` event (A17) — non-terminal
+                            // success (cron task will re-trigger).
+                            let _ = store.record_event(
+                                &task_clone.id,
+                                crate::store::EventType::Succeeded,
+                                None,
+                                finished as i64,
                             ).await;
                         }
                     }
@@ -208,6 +238,12 @@ impl TaskQueue {
                         TaskState::Success,
                         None,
                         Some(finished),
+                    ).await;
+                    let _ = store.record_event(
+                        &task_clone.id,
+                        crate::store::EventType::Succeeded,
+                        None,
+                        finished as i64,
                     ).await;
                     if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
                         if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
@@ -235,8 +271,18 @@ impl TaskQueue {
                         format!("shell exit {}", code)
                     }
                 };
+                // acks_on_failure (C13): when false, failures are retried
+                // indefinitely (ignoring retry_max). We simulate this by
+                // passing retry_max=u32::MAX to the policy so should_retry
+                // always returns true. acks_on_failure=true (default)
+                // preserves the original retry_max semantics.
+                let effective_retry_max = if task_clone.acks_on_failure {
+                    task_clone.retry_max
+                } else {
+                    u32::MAX
+                };
                 let policy = crate::retry::RetryPolicy::new(
-                    task_clone.retry_max, task_clone.retry_delay,
+                    effective_retry_max, task_clone.retry_delay,
                 );
                 if !policy.should_retry(&task_clone, &stored) {
                     // Not retryable: fail permanently right now.
@@ -251,12 +297,37 @@ impl TaskQueue {
                         task_clone.attempts + 1,
                         Some(format!("not retryable: {}", err_msg)),
                     ).await;
+                    let _ = store.record_event(
+                        &task_clone.id,
+                        crate::store::EventType::Failed,
+                        Some(&format!("{{\"error\":{}}}", serde_json::to_string(&err_msg).unwrap_or_default())),
+                        now_ts() as i64,
+                    ).await;
                 } else {
                     // Retryable: schedule retry (which itself may
                     // permanently fail if attempts are exhausted).
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg).await;
+                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone()).await;
+                    // Record a `Failed` event (A17) for the individual
+                    // attempt; the retry will be processed separately.
+                    let _ = store.record_event(
+                        &task_clone.id,
+                        crate::store::EventType::Failed,
+                        Some(&format!("{{\"error\":{}}}", serde_json::to_string(&err_msg).unwrap_or_default())),
+                        now_ts() as i64,
+                    ).await;
                 }
             }
+            // Chain (C15) + group (C16) + worker_limits (C5 + C8) hooks.
+            // Fire on terminal state transitions; the worker_limits counter
+            // is incremented for every completion regardless of final state.
+            let final_state = store.load_task(&task_clone.id).await
+                .ok().flatten()
+                .map(|t| t.state)
+                .unwrap_or(task_clone.state);
+            if final_state.is_terminal() {
+                notify_chain_and_group(&queue_arc, &store, &task_clone, final_state).await;
+            }
+            record_worker_limits();
             overlap.on_finish(&task_clone.id).await;
         });
 
@@ -272,7 +343,7 @@ impl TaskQueue {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    if let Err(e) = self.process_one().await {
+                    if let Err(e) = Arc::clone(&self).process_one().await {
                         tracing::warn!(error = %e, "queue process_one error");
                     }
                 }
@@ -312,6 +383,152 @@ impl TaskQueue {
         }
         Ok(())
     }
+}
+
+/// Extract a chain_id / group_id marker from a task's `meta` JSON string.
+/// Returns `None` if `meta` is missing, not a JSON object, or does not
+/// contain the requested key.
+fn extract_meta_id(task: &crate::store::Task, key: &str) -> Option<String> {
+    let s = task.meta.as_ref()?;
+    let s = s.trim();
+    if s.is_empty() || s == "null" { return None; }
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Hook fired after a task reaches a terminal state. Inspects the task's
+/// `meta` for `xhjob_chain_id` / `xhjob_group_id` markers (set by
+/// `daemon_main::handle_chain_op` / `handle_group_op`) and advances the
+/// chain or refreshes the group state accordingly.
+///
+/// Chain (C15):
+/// - On Success: advance to the next step. If a next step is returned,
+///   build it, tag it with the chain_id, persist, and enqueue.
+/// - On Failed / Cancelled: mark the chain as failed (remaining steps
+///   are skipped).
+///
+/// Group (C16): refresh the group state from the live task states
+/// regardless of which terminal state this task reached.
+async fn notify_chain_and_group(
+    queue: &Arc<TaskQueue>,
+    store: &Arc<dyn TaskStore>,
+    task: &crate::store::Task,
+    final_state: TaskState,
+) {
+    if let Some(chain_id) = extract_meta_id(task, "xhjob_chain_id") {
+        match final_state {
+            TaskState::Success => {
+                advance_chain_and_dispatch(queue, store, &chain_id).await;
+            }
+            TaskState::Failed | TaskState::Cancelled => {
+                if let Err(e) = crate::scheduler::chain::mark_failed(store, &chain_id).await {
+                    tracing::warn!(error = %e, chain_id = %chain_id, "chain mark_failed failed");
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(group_id) = extract_meta_id(task, "xhjob_group_id") {
+        if let Err(e) = crate::scheduler::group::refresh_state(store, &group_id).await {
+            tracing::warn!(error = %e, group_id = %group_id, "group refresh_state failed");
+        }
+    }
+}
+
+/// Advance the chain to the next step. If a next step config is returned,
+/// build it as a Task, tag its meta with `xhjob_chain_id`, persist, and
+/// enqueue via the in-memory queue.
+async fn advance_chain_and_dispatch(
+    queue: &Arc<TaskQueue>,
+    store: &Arc<dyn TaskStore>,
+    chain_id: &str,
+) {
+    match crate::scheduler::chain::advance(store, chain_id).await {
+        Ok(Some(next_config)) => {
+            let builder = match crate::task::TaskBuilder::from_json(&next_config.to_string()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, chain_id = chain_id, "chain next step json parse failed");
+                    return;
+                }
+            };
+            let mut task = match builder.build() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, chain_id = chain_id, "chain next step build failed");
+                    return;
+                }
+            };
+            // Preserve / install the chain_id marker in meta so the next
+            // completion can advance the chain again.
+            let meta_obj = match task.meta.take() {
+                Some(s) if !s.is_empty() && s != "null" => {
+                    match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(mut v) if v.is_object() => {
+                            v.as_object_mut().unwrap().insert(
+                                "xhjob_chain_id".to_string(),
+                                serde_json::json!(chain_id),
+                            );
+                            Some(v.to_string())
+                        }
+                        _ => Some(serde_json::json!({"xhjob_chain_id": chain_id}).to_string()),
+                    }
+                }
+                _ => Some(serde_json::json!({"xhjob_chain_id": chain_id}).to_string()),
+            };
+            task.meta = meta_obj;
+            let task_id = task.id.clone();
+            let priority = task.priority;
+            if let Err(e) = store.insert_task(task).await {
+                tracing::warn!(error = %e, chain_id = chain_id, "chain next step insert failed");
+                return;
+            }
+            if let Err(e) = queue.enqueue(&task_id, priority).await {
+                tracing::warn!(error = %e, chain_id = chain_id, "chain next step enqueue failed");
+            }
+        }
+        Ok(None) => {
+            tracing::info!(chain_id = chain_id, "chain completed");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, chain_id = chain_id, "chain advance failed");
+        }
+    }
+}
+
+/// Increment the worker_limits task-execution counter (C5 + C8). If either
+/// the max_tasks_per_child or max_memory_per_child limit is reached, spawn
+/// a background task that exits the daemon after a brief delay so the
+/// current state update can drain. The supervisor (systemd / supervisord /
+/// PHP `xhjob_start`) is responsible for restarting.
+fn record_worker_limits() {
+    let limits = match crate::utils::limits::worker_limits() {
+        Some(l) => l,
+        None => return,
+    };
+    let tasks_reached = limits.record_task_execution();
+    let mem_reached = limits.check_memory_limit();
+    if !tasks_reached && !mem_reached {
+        return;
+    }
+    if tasks_reached {
+        tracing::info!(
+            limit = limits.max_tasks_per_child,
+            executed = limits.tasks_executed.load(std::sync::atomic::Ordering::Relaxed),
+            "max_tasks_per_child reached, initiating daemon shutdown"
+        );
+    }
+    if mem_reached {
+        tracing::info!(
+            limit = limits.max_memory_per_child,
+            "max_memory_per_child reached, initiating daemon shutdown"
+        );
+    }
+    tokio::spawn(async {
+        // Give the current state update + IPC response a moment to flush.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(0);
+    });
 }
 
 #[cfg(test)]
@@ -426,7 +643,7 @@ mod tests {
     async fn test_cron_task_success_not_terminal_until_max() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         let overlap = Arc::new(OverlapController::new());
-        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+        let queue = Arc::new(TaskQueue::new(Arc::clone(&store), overlap));
 
         // Cron task with max_executions=3 and a shell command that succeeds
         // (exit 0). After one successful execution the task should remain
@@ -442,7 +659,7 @@ mod tests {
         // Enqueue and process once. process_one spawns the dispatch on the
         // global coroutine pool and returns immediately.
         queue.enqueue("t-cron-max-exec", 0).await.unwrap();
-        queue.process_one().await.unwrap();
+        Arc::clone(&queue).process_one().await.unwrap();
 
         // Poll until the dispatch completes (state transitions away from
         // Running). Cap at ~5s to avoid hanging the test on a regression.
@@ -483,7 +700,7 @@ mod tests {
     async fn test_ignore_result_skips_save_result() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         let overlap = Arc::new(OverlapController::new());
-        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+        let queue = Arc::new(TaskQueue::new(Arc::clone(&store), overlap));
 
         // Shell task with ignore_result=true. "echo hi" succeeds and would
         // normally produce a result row with stdout="hi\n".
@@ -495,7 +712,7 @@ mod tests {
         store.insert_task(task).await.unwrap();
 
         queue.enqueue("t-ignore-result", 0).await.unwrap();
-        queue.process_one().await.unwrap();
+        Arc::clone(&queue).process_one().await.unwrap();
 
         // Poll until the dispatch completes (state transitions away from
         // Running). Cap at ~5s to avoid hanging the test on a regression.
@@ -528,7 +745,7 @@ mod tests {
     async fn test_ignore_result_default_false_still_saves() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         let overlap = Arc::new(OverlapController::new());
-        let queue = TaskQueue::new(Arc::clone(&store), overlap);
+        let queue = Arc::new(TaskQueue::new(Arc::clone(&store), overlap));
 
         // Default ignore_result=false. "echo hi" produces stdout="hi\n".
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
@@ -539,7 +756,7 @@ mod tests {
         store.insert_task(task).await.unwrap();
 
         queue.enqueue("t-save-result", 0).await.unwrap();
-        queue.process_one().await.unwrap();
+        Arc::clone(&queue).process_one().await.unwrap();
 
         // Poll until completion.
         let mut tries = 0;
