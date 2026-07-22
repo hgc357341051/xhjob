@@ -35,6 +35,40 @@ fn normalize_data_dir(dir: Option<String>) -> Option<String> {
     dir.and_then(|d| if d.is_empty() { None } else { Some(d) })
 }
 
+/// P0 fix: wrap `ipc::request` in `tokio::time::timeout` at the call site.
+///
+/// Every PHP-FPM-facing entry point in this file routes its daemon IPC
+/// through this helper. A daemon that accepted the connection but then
+/// deadlocked / got SIGSTOP'd / crashed after accept would otherwise leave
+/// the PHP-FPM worker blocked forever in `read_exact` —
+/// `max_execution_time` does not interrupt C-level blocking calls, so the
+/// worker pool would be drained one by one until the site returns 502/504
+/// with no self-heal. The timeout bounds this wait so the worker can fail
+/// fast and return an error to PHP.
+///
+/// Default 5s (tunable via `XHJOB_IPC_TIMEOUT_SECS`); long enough for any
+/// local IPC op (SQLite write / cron scan / dispatch).
+async fn ipc_request(
+    op: &str,
+    payload: serde_json::Value,
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<ipc::Response, errors::XhjobError> {
+    let timeout_secs = ipc::default_ipc_timeout_secs();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        ipc::request(op, payload, service_name, data_dir),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_) => Err(errors::XhjobError::Ipc(format!(
+            "request timeout ({}s) for op={}",
+            timeout_secs, op
+        ))),
+    }
+}
+
 #[php_function]
 pub fn xhjob_start(name: Option<String>, data_dir: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
@@ -141,7 +175,7 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<
     let result: std::result::Result<String, String> = rt.block_on(async move {
         let payload: serde_json::Value = serde_json::from_str(&task_json)
             .map_err(|e| format!("invalid json: {}", e))?;
-        let resp = ipc::request("dispatch", payload, &service_name, data_dir.as_deref()).await
+        let resp = ipc_request("dispatch", payload, &service_name, data_dir.as_deref()).await
             .map_err(|e| format!("{}", e))?;
         if !resp.ok {
             return Err(resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -272,7 +306,7 @@ pub fn xhjob_remove(id: String, name: Option<String>, data_dir: Option<String>) 
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("remove", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("remove", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_remove ipc: {}", e);
@@ -301,7 +335,7 @@ pub fn xhjob_pause(id: String, name: Option<String>, data_dir: Option<String>) -
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("pause", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("pause", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_pause ipc: {}", e);
@@ -330,7 +364,7 @@ pub fn xhjob_resume(id: String, name: Option<String>, data_dir: Option<String>) 
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("resume", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("resume", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_resume ipc: {}", e);
@@ -359,7 +393,7 @@ pub fn xhjob_cancel(id: String, name: Option<String>, data_dir: Option<String>) 
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("cancel", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("cancel", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_cancel ipc: {}", e);
@@ -398,7 +432,7 @@ pub fn xhjob_list(
             "state_filter": state_filter,
             "tag_filter": tag,
         });
-        match ipc::request("list", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("list", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -434,7 +468,7 @@ pub fn xhjob_requeue(id: String, name: Option<String>, data_dir: Option<String>)
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("requeue", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("requeue", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return false;
@@ -474,7 +508,7 @@ pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id, "cron": cron });
-        match ipc::request("reschedule", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("reschedule", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return false;
@@ -520,7 +554,7 @@ pub fn xhjob_get(id: String, name: Option<String>, data_dir: Option<String>) -> 
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "id": id });
-        match ipc::request("get", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("get", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return None;
@@ -1023,7 +1057,7 @@ pub fn xhjob_events(
             "since_ts": since_ts,
             "task_id": task_id,
         });
-        match ipc::request("events", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("events", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1071,7 +1105,7 @@ pub fn xhjob_report_progress(
             "percent": percent,
             "meta": meta_json,
         });
-        match ipc::request("report_progress", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("report_progress", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_report_progress ipc: {}", e);
@@ -1108,7 +1142,7 @@ pub fn xhjob_pull_events(
             "since_ts": since_ts,
             "event_type": event_type,
         });
-        match ipc::request("pull_events", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("pull_events", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1150,7 +1184,7 @@ pub fn xhjob_inspect(
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "mode": mode });
-        match ipc::request("inspect", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("inspect", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1195,7 +1229,7 @@ pub fn xhjob_chain(tasks_json: String, name: Option<String>, data_dir: Option<St
             Err(e) => return format!("error: invalid json: {}", e),
         };
         let payload = serde_json::json!({ "tasks": tasks });
-        match ipc::request("chain", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("chain", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1232,7 +1266,7 @@ pub fn xhjob_chain_state(chain_id: String, name: Option<String>, data_dir: Optio
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "chain_id": chain_id });
-        match ipc::request("chain_state", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("chain_state", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return None;
@@ -1281,7 +1315,7 @@ pub fn xhjob_group(tasks_json: String, name: Option<String>, data_dir: Option<St
             Err(e) => return format!("error: invalid json: {}", e),
         };
         let payload = serde_json::json!({ "tasks": tasks });
-        match ipc::request("group", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("group", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1319,7 +1353,7 @@ pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Optio
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "group_id": group_id });
-        match ipc::request("group_state", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("group_state", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return None;
@@ -1375,7 +1409,7 @@ pub fn xhjob_chord(header_json: String, callback_json: String, name: Option<Stri
             Err(e) => return format!("error: invalid callback json: {}", e),
         };
         let payload = serde_json::json!({ "header": header, "callback": callback });
-        match ipc::request("chord", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("chord", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
@@ -1413,7 +1447,7 @@ pub fn xhjob_chord_state(chord_id: String, name: Option<String>, data_dir: Optio
     };
     rt.block_on(async move {
         let payload = serde_json::json!({ "chord_id": chord_id });
-        match ipc::request("chord_state", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request("chord_state", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
                     return None;
