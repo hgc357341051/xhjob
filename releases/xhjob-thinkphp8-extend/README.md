@@ -320,12 +320,15 @@ return [
 
 | 方法 | 说明 |
 |---|---|
-| `viaHttp(string $method, string $url)` | 设置为 HTTP 任务 |
-| `viaShell(string $cmd)` | 设置为 shell 任务 |
+| `TaskBuilder::http(string $method, string $url)` | 静态工厂：创建 HTTP 任务 |
+| `TaskBuilder::shell(string $cmd)` | 静态工厂：创建 shell 任务 |
 | `withHeaders(array $h)` | HTTP 请求头（仅 http 任务） |
 | `withBody(string $b)` | HTTP 请求体（仅 http 任务） |
-| `proxy(string $p)` | HTTP 代理（http/https/socks5/socks5h + Basic Auth） |
-| `encoding(string $enc)` | Shell 输出编码转换（GBK / Big5 / auto） |
+| `withProxy(string $p)` | HTTP 代理（http/https/socks5/socks5h + Basic Auth） |
+| `withEncoding(string $enc)` | Shell 输出编码转换（GBK / Big5 / auto） |
+| `withStdin(?string $stdin)` | Shell 子进程标准输入 |
+| `withWorkingDir(?string $dir)` | Shell 子进程工作目录 |
+| `withEnv(array $env)` | Shell 子进程自定义环境变量（覆盖默认） |
 
 ### 触发器
 
@@ -375,19 +378,21 @@ return [
 
 | 方法 | 说明 |
 |---|---|
-| `id(string $id)` | 指定任务 ID |
+| `withId(string $id)` | 指定任务 ID |
 | `replaceExisting(bool $on = true)` | 同 ID 任务替换策略 |
 | `tag(string $tag)` | 追加单个标签 |
 | `tags(array $tags)` | 设置标签数组 |
-| `meta(?string $json)` | 元数据（任意 JSON 字符串） |
-| `timezone(string $tz)` | 时区标识符，如 `Asia/Shanghai` |
+| `withMeta(?string $json)` | 元数据（任意 JSON 字符串） |
+| `withTimezone(string $tz)` | 时区标识符，如 `Asia/Shanghai` |
 
 ### 服务与目录
 
-| 方法 | 说明 |
-|---|---|
-| `service(string $name)` | 指定服务名（多实例） |
-| `dataDir(string $dir)` | 指定数据目录 |
+服务名与数据目录在 `TaskManager` / `Client` 构造时指定，或通过 `dispatch()` / `create()` 参数传入，而非 TaskBuilder 链式方法：
+
+```php
+$mgr = new TaskManager('my-service', '/var/lib/xhjob');
+$id  = $mgr->create($builder);
+```
 
 ### 终结方法
 

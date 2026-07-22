@@ -233,12 +233,20 @@ class TaskManager
      *
      * @return array 包含 state / attempts / created_at 等字段
      *
-     * @throws ServiceNotRunningException daemon 不可达时
+     * @throws ServiceNotRunningException daemon 不可达或任务不存在时
      */
     public function state(string $id): array
     {
         $raw = xhjob_state($id, $this->name, $this->dataDir);
         $parsed = $this->parseStateArray($raw);
+        // 原生函数在 daemon 不可达 / 任务不存在时返回带 'error' 键的数组。
+        // 不再静默吞错，按 docblock 契约抛出异常。
+        if (isset($parsed['error'])) {
+            throw new ServiceNotRunningException(
+                'state 失败：' . $parsed['error']
+                . " (id=$id, name={$this->name})"
+            );
+        }
         return $parsed;
     }
 
@@ -247,12 +255,19 @@ class TaskManager
      *
      * @param string $id 任务 ID
      *
-     * @return array 包含 stdout / stderr / exit_code 字段
+     * @return array 包含 stdout / stderr / exit_code 字段；
+     *               当结果不存在时（ignoreResult=true 或任务未产出输出），
+     *               返回带 'error' 键的数组，调用方可通过 isset($r['error']) 判断。
+     *               使用 state() 检查 daemon 可达性（其会抛异常）。
      */
     public function result(string $id): array
     {
         $raw = xhjob_result($id, $this->name, $this->dataDir);
-        return $this->parseStateArray($raw);
+        $parsed = $this->parseStateArray($raw);
+        // 原生函数在结果不存在时（ignoreResult=true / 任务未产出输出）
+        // 返回带 'error' 键的数组。这是预期的业务条件，不抛异常；
+        // 调用方通过 isset($r['error']) 或 empty($r['stdout']) 判断。
+        return $parsed;
     }
 
     /**

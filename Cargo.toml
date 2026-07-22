@@ -14,7 +14,7 @@ persist = ["rusqlite", "aes-gcm"]
 [dependencies]
 ext-php-rs = "0.15"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "stream", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "stream", "gzip", "deflate", "brotli"] }
 cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.9"

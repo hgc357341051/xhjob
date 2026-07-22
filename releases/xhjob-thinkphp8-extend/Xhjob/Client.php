@@ -337,19 +337,23 @@ class Client
      *
      * 注意：业务级错误（InvalidTaskConfigException，如配置非法）不重试；
      *      仅对 ServiceNotRunningException 等连接 / IPC 错误重试。
+     *      setTimeout 设置的整体超时软约束在此生效：跨重试的累计耗时
+     *      超过阈值后停止重试并抛出 ServiceNotRunningException。
      *
      * @param callable    $fn           待调用闭包
      * @param mixed|null  $fallback     所有重试失败后的兜底返回值
      *
      * @return mixed
      *
-     * @throws InvalidTaskConfigException 业务级错误透传
+     * @throws InvalidTaskConfigException    业务级错误透传
+     * @throws ServiceNotRunningException    超时或重试耗尽
      */
     private function callWithRetry(callable $fn, $fallback = null)
     {
         $attempts = 0;
         $maxAttempts = $this->retries + 1;
         $lastException = null;
+        $deadline = $this->timeoutSec > 0 ? microtime(true) + $this->timeoutSec : 0;
         while ($attempts < $maxAttempts) {
             try {
                 return $fn();
@@ -359,6 +363,13 @@ class Client
             } catch (\Throwable $e) {
                 $lastException = $e;
                 $attempts++;
+                // setTimeout 软约束：跨重试累计耗时超过阈值则提前终止
+                if ($deadline > 0 && microtime(true) >= $deadline) {
+                    throw new ServiceNotRunningException(
+                        '操作超时（setTimeout=' . $this->timeoutSec . 's）：'
+                        . $e->getMessage()
+                    );
+                }
                 if ($attempts < $maxAttempts) {
                     usleep($this->retryDelayMs * 1000);
                 }

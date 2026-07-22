@@ -340,7 +340,12 @@ impl TaskBuilder {
 
     /// Set task type to Shell with command.
     pub fn via_shell(mut self, cmd: impl Into<String>) -> Self {
-        let payload = ShellPayload { cmd: cmd.into() };
+        let payload = ShellPayload {
+            cmd: cmd.into(),
+            stdin: None,
+            working_dir: None,
+            env: None,
+        };
         self.payload = serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null);
         self.task_type = Some(TaskType::Shell);
         self

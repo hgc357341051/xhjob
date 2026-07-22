@@ -128,6 +128,16 @@ impl Executor for HttpExecutor {
                         .ok().and_then(|s| s.parse::<u64>().ok())
                         .filter(|n| *n > 0)
                         .unwrap_or(10)
+                ))
+                // MEDIUM fix: explicit redirect policy. Previously relied on
+                // reqwest's default (follow up to 10 redirects silently).
+                // Making the limit explicit + tunable via XHJOB_HTTP_MAX_REDIRECTS
+                // (0 = disable redirects). Mitigates SSRF amplification and makes
+                // the redirect budget visible to operators. Default 5.
+                .redirect(reqwest::redirect::Policy::limited(
+                    std::env::var("XHJOB_HTTP_MAX_REDIRECTS")
+                        .ok().and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(5)
                 ));
 
             if let Some(proxy_str) = &proxy {

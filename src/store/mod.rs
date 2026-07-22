@@ -111,6 +111,16 @@ pub struct HttpPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellPayload {
     pub cmd: String,
+    /// Optional stdin to feed to the child process. None = /dev/null.
+    #[serde(default)]
+    pub stdin: Option<String>,
+    /// Optional working directory. None = inherit daemon cwd.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Optional user-supplied environment variables, injected after the
+    /// minimal PATH/HOME/XHJOB_OWNER defaults so they take precedence.
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
 }
 
 /// Task definition.

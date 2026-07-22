@@ -461,6 +461,64 @@ class TaskBuilder
     }
 
     /**
+     * 设置 shell 任务的标准输入（仅 shell 任务）
+     *
+     * 对应 Rust ShellPayload.stdin 字段。内容会通过管道写入子进程的
+     * stdin；未设置时 stdin 为 /dev/null。
+     *
+     * @param string|null $stdin 标准输入内容（null 表示不注入）
+     *
+     * @return self
+     */
+    public function withStdin(?string $stdin): self
+    {
+        if ($this->config['task_type'] !== 'shell') {
+            throw new InvalidTaskConfigException('withStdin 仅适用于 shell 任务');
+        }
+        $this->config['payload']['stdin'] = $stdin;
+        return $this;
+    }
+
+    /**
+     * 设置 shell 任务的工作目录（仅 shell 任务）
+     *
+     * 对应 Rust ShellPayload.working_dir 字段。子进程会在执行前
+     * chdir 到该目录；未设置时继承 daemon 当前目录。
+     *
+     * @param string|null $dir 工作目录路径（null 表示不设置）
+     *
+     * @return self
+     */
+    public function withWorkingDir(?string $dir): self
+    {
+        if ($this->config['task_type'] !== 'shell') {
+            throw new InvalidTaskConfigException('withWorkingDir 仅适用于 shell 任务');
+        }
+        $this->config['payload']['working_dir'] = $dir;
+        return $this;
+    }
+
+    /**
+     * 设置 shell 任务的环境变量（仅 shell 任务）
+     *
+     * 对应 Rust ShellPayload.env 字段。键值对会在默认的
+     * PATH/HOME/XHJOB_OWNER 之后注入，因此用户变量优先级更高
+     * （可覆盖默认 PATH）。
+     *
+     * @param array $env 环境变量键值对，如 ['FOO' => 'bar']
+     *
+     * @return self
+     */
+    public function withEnv(array $env): self
+    {
+        if ($this->config['task_type'] !== 'shell') {
+            throw new InvalidTaskConfigException('withEnv 仅适用于 shell 任务');
+        }
+        $this->config['payload']['env'] = empty($env) ? (object)[] : $env;
+        return $this;
+    }
+
+    /**
      * 设置时区
      *
      * @param string $tz 时区标识符，如 "Asia/Shanghai"

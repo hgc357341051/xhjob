@@ -1,0 +1,44 @@
+{
+    "name": "xhjob/thinkphp8-extend",
+    "description": "Xhjob task queue ThinkPHP 8 extension package - PHP client for the xhjob Rust extension",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": [
+        "xhjob",
+        "task-queue",
+        "cron",
+        "thinkphp",
+        "async",
+        "job-scheduler"
+    ],
+    "authors": [
+        {
+            "name": "xhjob"
+        }
+    ],
+    "require": {
+        "php": ">=8.0.0",
+        "ext-xhjob": "*"
+    },
+    "require-dev": {
+        "topthink/framework": "^8.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Xhjob\\": "Xhjob/"
+        },
+        "files": [
+            "Xhjob/helper.php"
+        ]
+    },
+    "extra": {
+        "think": {
+            "services": [
+                "Xhjob\\ServiceProvider"
+            ]
+        }
+    },
+    "suggest": {
+        "topthink/framework": "ThinkPHP 8 framework for full integration (ServiceProvider / Facade)"
+    }
+}

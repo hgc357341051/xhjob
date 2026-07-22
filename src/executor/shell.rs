@@ -35,14 +35,36 @@ impl Executor for ShellExecutor {
             let payload: ShellPayload = serde_json::from_value(payload_val)
                 .map_err(|e| XhjobError::exec(format!("invalid shell payload: {}", e)))?;
 
-            let mut cmd = build_command(&payload.cmd);
+            let mut cmd = build_command(&payload);
+
+            // stdin: pipe only when the payload supplies input bytes,
+            // otherwise /dev/null (the historical default).
+            let stdin_bytes = payload.stdin.as_ref().map(|s| s.as_bytes().to_vec());
+            let stdin_cfg = if stdin_bytes.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            };
 
             // Spawn the child process
             let mut child = cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .stdin(std::process::Stdio::null())
+                .stdin(stdin_cfg)
                 .spawn()
                 .map_err(|e| XhjobError::exec(format!("spawn: {}", e)))?;
+
+            // Feed stdin to the child in its own task so it does not block
+            // the stdout/stderr drain tasks or the wait future. Best-effort:
+            // if the child exits before reading all stdin, the write may
+            // fail and we simply ignore the error. Dropping the handle
+            // closes the pipe, signalling EOF to the child.
+            if let (Some(bytes), Some(mut child_stdin)) = (stdin_bytes, child.stdin.take()) {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = child_stdin.write_all(&bytes).await;
+                    drop(child_stdin);
+                });
+            }
 
             // Wait with timeout
             let stdout_fut = child.stdout.take();
@@ -318,11 +340,11 @@ fn detect_encoding() -> &'static str {
 ///   (no leakage of daemon's PATH / HOME / secrets into user tasks) and
 ///   re-adds only `PATH` and `HOME`. This is defence-in-depth against
 ///   tasks that happen to share the daemon's uid.
-fn build_command(cmd: &str) -> tokio::process::Command {
+fn build_command(payload: &ShellPayload) -> tokio::process::Command {
     #[cfg(unix)]
     {
         let mut c = tokio::process::Command::new("bash");
-        c.arg("-c").arg(cmd);
+        c.arg("-c").arg(&payload.cmd);
         // Put the child in its own process group so we can signal the
         // whole tree on timeout/cancel. (tokio re-exports this from
         // std::os::unix::process::CommandExt via its Command type.)
@@ -350,13 +372,36 @@ fn build_command(cmd: &str) -> tokio::process::Command {
                 c.env("XHJOB_OWNER", owner);
             }
         }
+        // User-supplied env vars are injected last so they take precedence
+        // over the defaults above (e.g. a custom PATH).
+        if let Some(user_env) = payload.env.as_ref() {
+            for (k, v) in user_env {
+                c.env(k, v);
+            }
+        }
+        // working_dir: when Some and non-empty, chdir before exec.
+        if let Some(dir) = payload.working_dir.as_ref() {
+            if !dir.is_empty() {
+                c.current_dir(dir);
+            }
+        }
         c
     }
     #[cfg(windows)]
     {
         let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(cmd);
+        c.arg("/C").arg(&payload.cmd);
         c.kill_on_drop(true);
+        if let Some(user_env) = payload.env.as_ref() {
+            for (k, v) in user_env {
+                c.env(k, v);
+            }
+        }
+        if let Some(dir) = payload.working_dir.as_ref() {
+            if !dir.is_empty() {
+                c.current_dir(dir);
+            }
+        }
         c
     }
 }
