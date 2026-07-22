@@ -15,14 +15,36 @@ impl UnixListenerWrapper {
         // ensure parent dir exists (e.g. user-specified data_dir may not exist yet)
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
+            // P0 fix: set parent directory to 0o700 to prevent symlink
+            // TOCTOU attacks on the socket file path.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         // remove stale socket file
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)
             .map_err(|e| XhjobError::Ipc(format!("bind {}: {}", path, e)))?;
-        // set socket file permissions to 0o660
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+        // P0 fix: use fchmod on the raw fd (not path-based chmod) to close
+        // the TOCTOU window. With path-based chmod, an attacker who can create
+        // a symlink at `path` between bind() and set_permissions() could
+        // make us chmod a different file (e.g. /etc/passwd). fchmod operates
+        // on the already-bound socket fd so no path resolution occurs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // tokio::net::UnixListener on unix implements AsRawFd.
+            let fd = listener.as_raw_fd();
+            // fchmod the socket fd to 0o660 atomically (no path lookup).
+            let ret = unsafe { libc::fchmod(fd, 0o660) };
+            if ret != 0 {
+                // Fallback: path-based chmod if fchmod fails.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+            }
+        }
         Ok(Self { inner: listener })
     }
 }

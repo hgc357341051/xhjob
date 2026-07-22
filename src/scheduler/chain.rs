@@ -16,6 +16,28 @@
 use crate::errors::{Result, XhjobError};
 use crate::store::{ChainRecord, TaskStore};
 use crate::store::now_ts;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+/// P0 fix: per-chain mutex map. Prevents the check-then-act race in
+/// advance() where two concurrent task completions could both read
+/// current_step=N, both return tasks[N], and both increment current_step
+/// to N+2 — skipping a step and duplicating a step. The mutex serializes
+/// advance per chain_id so only one caller reads + increments current_step.
+static CHAIN_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+
+fn chain_locks() -> &'static Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>> {
+    CHAIN_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn get_chain_lock(chain_id: &str) -> std::sync::Arc<Mutex<()>> {
+    let mut map = chain_locks().lock().await;
+    map.entry(chain_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
+
+use std::sync::Arc;
 
 /// Advance to the next step in the chain after a successful task execution.
 ///
@@ -26,6 +48,10 @@ pub async fn advance(
     store: &std::sync::Arc<dyn TaskStore>,
     chain_id: &str,
 ) -> Result<Option<serde_json::Value>> {
+    // P0 fix: acquire per-chain mutex before the check-then-act sequence.
+    let lock = get_chain_lock(chain_id).await;
+    let _guard = lock.lock().await;
+
     let now = now_ts() as i64;
     let mut record = store.get_chain(chain_id).await?
         .ok_or_else(|| XhjobError::Store(format!("chain not found: {}", chain_id)))?;

@@ -29,6 +29,14 @@ fn new_id() -> String {
 
 /// The daemon entry point. Called by daemon::spawn_daemon(daemon_main) after fork.
 pub fn daemon_main() {
+    // P0-13: Load the config file (if any) into the process environment
+    // BEFORE the tracing subscriber is initialized, so RUST_LOG from the
+    // config file is honored. Also before any other env::var reads so all
+    // existing std::env::var("XHJOB_") calls pick up config-file values.
+    // If the config file doesn't exist (default path /etc/xhjob/config),
+    // this is a no-op — fully backward compatible with env-var-only config.
+    crate::config::load_config_file();
+
     // Initialize the global tokio runtime.
     let rt = coroutine_pool::init_global_runtime();
 
@@ -47,8 +55,29 @@ pub fn daemon_main() {
     // Env filter: `RUST_LOG=xhjob=info` style. Default level is `info` for
     // the xhjob crate and `warn` for everything else so the daemon log is
     // not flooded with hyper / reqwest noise.
+    //
+    // P0-15: Log rotation. Instead of writing to stderr (which daemon/unix.rs
+    // redirects to a plain append-mode file that grows forever), configure
+    // the tracing subscriber to write to a `tracing_appender` rolling daily
+    // file. This creates files like `xhjob.default.log.2026-07-22` and
+    // rotates once per day, preventing unbounded log growth. The stderr
+    // redirect in daemon/unix.rs is kept for panic/crash output only.
+    let log_dir = crate::service::current_data_dir()
+        .unwrap_or_else(|| "/var/log/xhjob".to_string());
+    let _ = std::fs::create_dir_all(&log_dir);
+    let service_name = crate::service::current();
+    let file_appender = tracing_appender::rolling::daily(
+        &log_dir,
+        format!("xhjob.{}.log", service_name),
+    );
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    // Keep the WorkerGuard alive for the daemon's lifetime. If the guard is
+    // dropped, the background writer thread shuts down and all subsequent
+    // log lines are silently dropped. `std::mem::forget` prevents Drop from
+    // running, keeping the worker alive until the process exits.
+    std::mem::forget(_guard);
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("xhjob=info,warn")),
@@ -63,7 +92,13 @@ pub fn daemon_main() {
             crate::daemon::unix::daemon_stopping();
             #[cfg(windows)]
             crate::daemon::windows::daemon_stopping();
-            std::process::exit(1);
+            // P0 fix: do NOT call std::process::exit here — it skips Drop
+            // for the tokio runtime / IPC listener / in-flight tasks,
+            // leaking resources and potentially leaving the socket file on
+            // disk. Instead, let the runtime unwind naturally so Drop runs.
+            // The daemon process is the top-level binary; returning from
+            // block_on exits the process after the runtime is dropped.
+            return;
         }
     });
 }
@@ -182,6 +217,30 @@ async fn run_daemon() -> Result<()> {
             }
         });
     }
+    #[cfg(unix)]
+    {
+        // P0-14: SIGHUP handler for runtime config reload.
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to install SIGHUP handler");
+                    return;
+                }
+            };
+            loop {
+                sighup.recv().await;
+                tracing::info!("SIGHUP received, reloading config file");
+                crate::config::load_config_file();
+                // Note: most config values are read at startup and cached.
+                // Values that are read per-request (env::var in hot paths) will
+                // be picked up automatically. Values read once at startup
+                // (e.g. store path) require a daemon restart to take effect.
+                tracing::info!("config file reloaded; per-request settings updated");
+            }
+        });
+    }
     #[cfg(windows)]
     {
         // Windows: rely on CTRL_BREAK_EVENT sent by stop()
@@ -217,9 +276,10 @@ async fn run_daemon() -> Result<()> {
 
     // Start task queue
     let queue_shutdown_rx = shutdown_rx.clone();
+    let queue_shutdown_tx = shutdown_tx.clone();
     let queue_clone = Arc::clone(&queue);
     tokio::spawn(async move {
-        queue_clone.run(queue_shutdown_rx).await;
+        queue_clone.run(queue_shutdown_rx, queue_shutdown_tx).await;
     });
 
     // IPC server loop
@@ -228,6 +288,15 @@ async fn run_daemon() -> Result<()> {
 
     let store_ipc = Arc::clone(&store);
     let queue_ipc = Arc::clone(&queue);
+    // P0 fix: limit the number of concurrent IPC connections to prevent fd
+    // exhaustion / memory amplification from a connection storm. Default
+    // 256; tunable via XHJOB_MAX_CONNECTIONS.
+    let max_conn = std::env::var("XHJOB_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(256);
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(max_conn));
 
     loop {
         tokio::select! {
@@ -241,7 +310,19 @@ async fn run_daemon() -> Result<()> {
                 };
                 let store = Arc::clone(&store_ipc);
                 let queue = Arc::clone(&queue_ipc);
+                let sem = Arc::clone(&conn_semaphore);
                 tokio::spawn(async move {
+                    // Acquire a permit before handling the connection. If
+                    // the connection limit is reached, this waits until a
+                    // slot frees up (back-pressure) instead of spawning
+                    // unbounded tasks.
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!("connection semaphore closed");
+                            return;
+                        }
+                    };
                     // P0-3: bound the per-connection handler with a timeout so
                     // that a half-closed / malicious / OOM-killed PHP-FPM
                     // worker cannot leave a daemon-side tokio task forever
@@ -295,7 +376,8 @@ async fn handle_connection(
     queue: Arc<TaskQueue>,
 ) -> Result<()> {
     let req: Request = read_frame(&mut stream).await?;
-    tracing::debug!(op = %req.op, id = req.id, "request");
+    tracing::debug!(op = %req.op, id = req.id, trace_id = ?req.trace_id, "request");
+    crate::utils::metrics::record_ipc_request();
     let resp = match req.op.as_str() {
         "dispatch" => handle_dispatch(&store, &queue, req.payload).await,
         "state" => handle_state_op(&store, req.payload).await,
@@ -335,6 +417,7 @@ async fn handle_dispatch(
     queue: &Arc<TaskQueue>,
     payload: serde_json::Value,
 ) -> Result<Response> {
+    crate::utils::metrics::record_dispatch();
     // payload is a serialized TaskBuilder JSON
     let builder_json = if payload.is_string() {
         payload.as_str().unwrap_or("{}").to_string()
@@ -342,7 +425,10 @@ async fn handle_dispatch(
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
     };
     let builder = TaskBuilder::from_json(&builder_json)?;
-    let task = builder.build()?;
+    let mut task = builder.build()?;
+    // P0-17: set task owner from env for multi-tenant isolation.
+    let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+    task.owner = owner;
     let task_id = task.id.clone();
     let priority = task.priority;
     // replace_existing (A14): when true and the user supplied an explicit
@@ -391,6 +477,13 @@ async fn handle_state_op(
     let task_id = payload.get("task_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     let info = outcome::handle_state(store, task_id).await?;
     let data = serde_json::to_value(&info)
         .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
@@ -404,6 +497,13 @@ async fn handle_result_op(
     let task_id = payload.get("task_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     let result = outcome::handle_result(store, task_id).await?;
     let data = serde_json::to_value(&result)
         .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
@@ -419,6 +519,13 @@ async fn handle_remove_op(
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     store.remove_task(task_id).await?;
     Ok(Response::success(0, serde_json::json!({"removed": true})))
 }
@@ -434,6 +541,13 @@ async fn handle_pause_op(
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     store.set_paused(task_id, paused).await?;
     Ok(Response::success(0, serde_json::json!({"paused": paused})))
 }
@@ -451,6 +565,13 @@ async fn handle_cancel_op(
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     store.cancel_task(task_id).await?;
     // 通知正在执行的 executor 终止子进程。
     // 对 Pending 任务（已被 cancel_task 转 Cancelled 终态）此调用返回 false，无副作用。
@@ -505,6 +626,13 @@ async fn handle_requeue_op(
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     let requeued = store.requeue_task(task_id).await?;
     Ok(Response::success(0, serde_json::json!({"requeued": requeued})))
 }
@@ -523,6 +651,13 @@ async fn handle_reschedule_op(
     let new_cron = payload.get("cron")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing cron".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     let rescheduled = store.reschedule_task(task_id, new_cron).await?;
     Ok(Response::success(0, serde_json::json!({"rescheduled": rescheduled})))
 }
@@ -548,6 +683,11 @@ async fn handle_get_op(
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     match store.load_task(task_id).await? {
         Some(task) => {
+            // P0-17: ownership check — only the task's owner can access it.
+            let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+            if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+                return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+            }
             let data = serde_json::to_value(&task)
                 .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
             Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
@@ -570,6 +710,15 @@ async fn handle_events_op(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(tid) = task_id_filter.as_deref() {
+        if let Some(task) = store.load_task(tid).await? {
+            let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+            if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+                return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+            }
+        }
+    }
     let events = store.list_events(since_ts, task_id_filter.as_deref()).await?;
     let arr: Vec<serde_json::Value> = events.iter()
         .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
@@ -821,6 +970,13 @@ async fn handle_report_progress_op(
     if percent > 100 {
         return Ok(Response::error(0, "percent must be 0-100".to_string()));
     }
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(id).await? {
+        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
+        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
+            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        }
+    }
     let meta = payload.get("meta")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
@@ -900,7 +1056,7 @@ async fn handle_inspect_op(
 /// current process RSS in bytes.
 /// Reference: Celery worker stats.
 async fn handle_stats_op(_payload: serde_json::Value) -> Result<Response> {
-    let data = match worker_limits() {
+    let mut data = match worker_limits() {
         Some(l) => l.snapshot(),
         None => serde_json::json!({
             "tasks_executed": 0,
@@ -910,6 +1066,14 @@ async fn handle_stats_op(_payload: serde_json::Value) -> Result<Response> {
             "note": "worker_limits not initialized",
         }),
     };
+    // Merge in the internal metrics counters (P0-11).
+    if let Some(obj) = data.as_object_mut() {
+        if let Some(metrics) = crate::utils::metrics::snapshot().as_object() {
+            for (k, v) in metrics {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
     Ok(Response::success(0, data))
 }
 

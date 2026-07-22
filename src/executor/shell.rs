@@ -103,6 +103,36 @@ impl Executor for ShellExecutor {
                 }
             };
 
+            // P0 fix: drain stdout/stderr CONCURRENTLY with the wait, so that
+            // a high-volume child cannot deadlock on a full OS pipe buffer.
+            // Previously the code did `child.wait().await` first and only
+            // then read the pipes — if the child produced more than ~64KB
+            // of output the pipe buffer filled, the child blocked on write,
+            // and `wait()` never returned (classic pipe deadlock).
+            //
+            // We spawn two read tasks and race the wait against the cancel
+            // watcher; on completion/cancel we collect whatever was captured.
+            let stdout_task = tokio::spawn(async move {
+                if let Some(mut s) = stdout_fut {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf).await;
+                    Some(buf)
+                } else {
+                    None
+                }
+            });
+            let stderr_task = tokio::spawn(async move {
+                if let Some(mut s) = stderr_fut {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf).await;
+                    Some(buf)
+                } else {
+                    None
+                }
+            });
+
             // 与 cancel 检查循环并发：当提供 cancel_flag 时，每 200ms 检查一次；
             // 检测到取消则终止子进程并返回 cancelled 错误。
             // Reference: Celery revoke (terminate=true).
@@ -143,21 +173,28 @@ impl Executor for ShellExecutor {
                 wait_fut.await
             };
 
+            // Collect whatever the read tasks captured (they may still be
+            // running if the child was killed before EOF; await them with a
+            // short grace so we don't block forever on a closed pipe).
+            let stdout_buf = tokio::time::timeout(
+                Duration::from_millis(500),
+                stdout_task,
+            ).await
+                .map_err(|_| XhjobError::Exec("stdout drain timeout".to_string()))?
+                .map_err(|e| XhjobError::Exec(format!("stdout join: {}", e)))?
+                .unwrap_or_default();
+            let stderr_buf = tokio::time::timeout(
+                Duration::from_millis(500),
+                stderr_task,
+            ).await
+                .map_err(|_| XhjobError::Exec("stderr drain timeout".to_string()))?
+                .map_err(|e| XhjobError::Exec(format!("stderr join: {}", e)))?
+                .unwrap_or_default();
+
             let (stdout_text, stderr_text, exit_code) = match status_result {
                 Ok(status) => {
-                    // Read stdout/stderr from the captured pipes
-                    let stdout_text = if let Some(mut s) = stdout_fut {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = s.read_to_end(&mut buf).await;
-                        decode_output(&buf, encoding.as_ref())?
-                    } else { String::new() };
-                    let stderr_text = if let Some(mut s) = stderr_fut {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = s.read_to_end(&mut buf).await;
-                        decode_output(&buf, encoding.as_ref())?
-                    } else { String::new() };
+                    let stdout_text = decode_output(&stdout_buf, encoding.as_ref())?;
+                    let stderr_text = decode_output(&stderr_buf, encoding.as_ref())?;
                     let code = status.code().unwrap_or(-1);
                     (stdout_text, stderr_text, code)
                 }

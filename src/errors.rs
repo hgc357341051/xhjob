@@ -1,41 +1,40 @@
-use std::fmt;
-use std::io;
+// P0 fix: switched to thiserror for proper source() chain support.
+// Previously the std::error::Error impl was empty (`impl Error for XhjobError {}`),
+// meaning the root cause of Io errors was lost when printed. With thiserror,
+// #[from] generates both From and source() automatically.
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum XhjobError {
-    Io(io::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("ipc: {0}")]
     Ipc(String),
+
+    #[error("store: {0}")]
     Store(String),
+
+    #[error("task not found: {0}")]
     TaskNotFound(String),
+
+    #[error("daemon not running")]
     DaemonNotRunning,
+
+    #[error("daemon already running")]
     DaemonAlreadyRunning,
+
+    #[error("invalid task: {0}")]
     InvalidTask(String),
+
+    #[error("cron parse: {0}")]
     CronParse(String),
+
+    #[error("exec: {0}")]
     Exec(String),
+
+    #[error("config: {0}")]
     Config(String),
-}
-
-impl fmt::Display for XhjobError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            XhjobError::Io(e) => write!(f, "io: {}", e),
-            XhjobError::Ipc(s) => write!(f, "ipc: {}", s),
-            XhjobError::Store(s) => write!(f, "store: {}", s),
-            XhjobError::TaskNotFound(id) => write!(f, "task not found: {}", id),
-            XhjobError::DaemonNotRunning => write!(f, "daemon not running"),
-            XhjobError::DaemonAlreadyRunning => write!(f, "daemon already running"),
-            XhjobError::InvalidTask(s) => write!(f, "invalid task: {}", s),
-            XhjobError::CronParse(s) => write!(f, "cron parse: {}", s),
-            XhjobError::Exec(s) => write!(f, "exec: {}", s),
-            XhjobError::Config(s) => write!(f, "config: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for XhjobError {}
-
-impl From<io::Error> for XhjobError {
-    fn from(e: io::Error) -> Self { XhjobError::Io(e) }
 }
 
 pub type Result<T> = std::result::Result<T, XhjobError>;

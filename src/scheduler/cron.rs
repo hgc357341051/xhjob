@@ -113,12 +113,31 @@ impl CronScheduler {
         let now = now_ts();
         let active = self.store.load_active_tasks().await?;
         let mut due = Vec::new();
+        // P0 fix: cap the number of tasks fired per scan tick to prevent
+        // cron storms (e.g. 1000 tasks all due at the same second) from
+        // overwhelming the executor pool / pending queue. Default 500;
+        // tunable via XHJOB_MAX_CRON_PER_TICK.
+        let max_per_tick = std::env::var("XHJOB_MAX_CRON_PER_TICK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(500);
         for task in active {
+            if due.len() >= max_per_tick {
+                tracing::warn!(
+                    fired = due.len(),
+                    cap = max_per_tick,
+                    "cron scan capped at max_per_tick; remaining due tasks will fire on the next tick"
+                );
+                break;
+            }
             // Skip tasks that have reached their max executions limit
             if task.max_executions > 0 && task.execution_count >= task.max_executions {
                 // Mark as Success terminal state if not already
                 if task.state != TaskState::Success {
-                    let _ = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await;
+                    if let Err(e) = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "update_state to Success (max_executions) failed");
+                    }
                 }
                 continue;
             }
@@ -132,19 +151,23 @@ impl CronScheduler {
             if task.expires > 0 && task.state == TaskState::Pending {
                 let expiry_ts = task.created_at.saturating_add(task.expires);
                 if now > expiry_ts {
-                    let _ = self.store.update_state(
+                    if let Err(e) = self.store.update_state(
                         &task.id,
                         TaskState::Expired,
                         None,
                         Some(now_ts()),
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "update_state to Expired failed");
+                    }
                     // 记录 Expired 事件（A17）—— 终态过期。
-                    let _ = self.store.record_event(
+                    if let Err(e) = self.store.record_event(
                         &task.id,
                         crate::store::EventType::Expired,
                         None,
                         now as i64,
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "record_event Expired failed");
+                    }
                     continue;
                 }
             }
@@ -165,7 +188,9 @@ impl CronScheduler {
             if let Some(end_ts) = task.end_date {
                 if (now as i64) > end_ts {
                     if task.state != TaskState::Success {
-                        let _ = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await;
+                        if let Err(e) = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await {
+                            tracing::warn!(task_id = %task.id, error = %e, "update_state to Success (end_date) failed");
+                        }
                     }
                     continue;
                 }
@@ -173,19 +198,29 @@ impl CronScheduler {
             // Scheduling priority: runAt > cron > interval.
             //
             // DateTrigger (runAt): one-shot trigger at the given timestamp.
-            // Fires once and immediately transitions to Success terminal state.
+            // Fires once — the task is enqueued for execution and its
+            // next_fire is set to a far-future sentinel (u64::MAX) so that
+            // scan_once does NOT re-fire it on the next tick. The actual
+            // Success terminal transition happens in process_one after the
+            // task completes (non-cron path), NOT here.
+            //
+            // P0 fix: previously scan_once marked the task as Success
+            // immediately after enqueueing it, but BEFORE process_one had a
+            // chance to run. This caused a race: the task was marked Success
+            // (terminal) while still Pending in the in-memory queue. When
+            // process_one drained it, it saw state=Success (terminal) and
+            // skipped execution — the task never actually ran.
             // Reference: APScheduler DateTrigger.
             if let Some(run_at_ts) = task.run_at {
                 let next = task.next_fire.unwrap_or(run_at_ts as u64);
                 if next <= now {
                     due.push(task.id.clone());
-                    // DateTrigger is one-shot: transition to Success terminal.
-                    let _ = self.store.update_state(
-                        &task.id,
-                        TaskState::Success,
-                        None,
-                        Some(now_ts()),
-                    ).await;
+                    // Set next_fire to far-future sentinel so scan_once
+                    // does not re-fire this one-shot task. process_one will
+                    // transition it to Success after execution.
+                    if let Err(e) = self.store.update_next_fire(&task.id, Some(u64::MAX)).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (run_at sentinel) failed");
+                    }
                 }
                 continue;
             }
@@ -208,7 +243,9 @@ impl CronScheduler {
                         if task.jitter > 0 {
                             new_next += rand_jitter(task.jitter);
                         }
-                        let _ = self.store.update_next_fire(&task.id, Some(new_next)).await;
+                        if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
+                            tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (interval) failed");
+                        }
                     }
                     continue;
                 }
@@ -247,12 +284,14 @@ impl CronScheduler {
                             "MISFIRE_SKIP (coalesce=false)"
                         );
                         // Record a `Missed` event so listeners can observe the misfire.
-                        let _ = self.store.record_event(
+                        if let Err(e) = self.store.record_event(
                             &task.id,
                             crate::store::EventType::Missed,
                             None,
                             now as i64,
-                        ).await;
+                        ).await {
+                            tracing::warn!(task_id = %task.id, error = %e, "record_event Missed failed");
+                        }
                     }
                     // Either way, roll next_fire forward to the next occurrence
                     // so we don't keep re-evaluating the stale fire time.
@@ -262,7 +301,9 @@ impl CronScheduler {
                         if task.jitter > 0 {
                             new_next += rand_jitter(task.jitter);
                         }
-                        let _ = self.store.update_next_fire(&task.id, Some(new_next)).await;
+                        if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
+                            tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (cron roll-forward) failed");
+                        }
                     } else {
                         tracing::warn!(
                             task_id = %task.id,
@@ -605,7 +646,11 @@ mod tests {
     async fn test_run_at_one_shot_terminal() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         let now = now_ts();
-        // runAt in the past: should fire immediately and go Success terminal.
+        // runAt in the past: should fire (enqueue) and set next_fire to
+        // far-future sentinel so scan_once does NOT re-fire it. The actual
+        // Success terminal transition happens in process_one after execution,
+        // NOT in scan_once (P0 fix: previously scan_once marked Success
+        // before the task ran, causing it to be skipped by process_one).
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo r"}));
         task.id = "t-runat".to_string();
         task.run_at = Some((now - 5) as i64);
@@ -616,16 +661,16 @@ mod tests {
         let due = sched.scan_once().await.unwrap();
         assert_eq!(due, vec!["t-runat".to_string()]);
 
-        // After firing, state should be Success (terminal).
+        // After firing, next_fire should be set to far-future sentinel.
         let updated = store.load_task("t-runat").await.unwrap().unwrap();
-        assert_eq!(updated.state, TaskState::Success,
-            "runAt task should immediately transition to Success after firing");
-        assert!(updated.state.is_terminal());
+        assert_eq!(
+            updated.next_fire, Some(u64::MAX),
+            "runAt task next_fire should be set to u64::MAX sentinel after firing"
+        );
 
-        // A second scan should NOT re-fire (terminal tasks are filtered out
-        // by load_active_tasks).
+        // A second scan should NOT re-fire (next_fire is far future).
         let due2 = sched.scan_once().await.unwrap();
-        assert!(due2.is_empty(), "expected no re-fire for terminal runAt task, got {:?}", due2);
+        assert!(due2.is_empty(), "expected no re-fire for runAt task with sentinel next_fire, got {:?}", due2);
     }
 
     /// Jitter (A9): when set on an interval task, scan_once advances

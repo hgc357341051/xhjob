@@ -23,6 +23,29 @@ use crate::errors::Result;
 use crate::store::{ChordRecord, TaskState, TaskStore, now_ts};
 use crate::task::TaskBuilder;
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+/// P0 fix: per-chord mutex map. Prevents the check-then-act race in
+/// refresh_state where two concurrent header-task completions could both
+/// pass the "all succeeded" check, both insert the callback, and both
+/// update_chord_state to "success" — resulting in a duplicate callback
+/// dispatch. The guard serializes refresh_state per chord_id so only one
+/// caller at a time can observe "all succeeded" and insert the callback.
+static CHORD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+
+fn chord_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    CHORD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Acquire (or create) the per-chord mutex for `chord_id`. Returns the
+/// Arc<Mutex> so the caller can `.lock().await` it.
+async fn get_chord_lock(chord_id: &str) -> Arc<Mutex<()>> {
+    let mut map = chord_locks().lock().await;
+    map.entry(chord_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Result of a `refresh_state` call. The caller inspects `new_state` and,
 /// when `callback_task_id` is `Some`, loads that task from the store and
@@ -67,6 +90,14 @@ pub async fn refresh_state(
     store: &Arc<dyn TaskStore>,
     chord_id: &str,
 ) -> Result<ChordRefreshResult> {
+    // P0 fix: acquire per-chord mutex before the check-then-act sequence.
+    // Without this, two concurrent header completions race: both see
+    // "all succeeded", both insert the callback, both set state="success"
+    // — duplicate callback dispatch. The mutex serializes refresh_state
+    // per chord_id so only one caller inserts the callback.
+    let lock = get_chord_lock(chord_id).await;
+    let _guard = lock.lock().await;
+
     let record = match store.get_chord(chord_id).await? {
         Some(r) => r,
         None => {
@@ -138,6 +169,7 @@ pub async fn refresh_state(
 
     if succeeded == total && total > 0 {
         // All header tasks succeeded — dispatch the callback.
+        // The per-chord mutex guarantees we only get here once.
         let mut callback: TaskBuilder = serde_json::from_str(&record.callback_json)
             .map_err(|e| crate::errors::XhjobError::Store(format!("chord callback parse: {}", e)))?;
         let meta_json = serde_json::to_string(&results)

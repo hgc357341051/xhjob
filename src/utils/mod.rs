@@ -2,3 +2,4 @@
 
 pub mod limits;
 pub mod memory;
+pub mod metrics;

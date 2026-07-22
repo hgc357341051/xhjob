@@ -9,6 +9,8 @@ use crate::errors::{Result, XhjobError};
 pub mod in_memory;
 #[cfg(feature = "persist")]
 pub mod sqlite;
+#[cfg(feature = "persist")]
+pub mod crypto;
 
 pub use in_memory::InMemoryStore;
 #[cfg(feature = "persist")]
@@ -296,6 +298,11 @@ pub struct Task {
     /// Reference: Celery chord.
     #[serde(default)]
     pub chord_id: Option<String>,
+    /// Owner of this task (for multi-tenant isolation). Set from XHJOB_OWNER
+    /// at dispatch time. Empty string = no ownership (backward compatible,
+    /// all workers can access). When set, only the same owner can query/modify.
+    #[serde(default)]
+    pub owner: String,
 }
 
 fn default_acks_on_failure_true() -> bool { true }
@@ -352,6 +359,7 @@ impl Task {
             progress: None,
             progress_meta: None,
             chord_id: None,
+            owner: String::new(),
         }
     }
 }

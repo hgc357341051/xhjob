@@ -68,9 +68,30 @@ impl TaskQueue {
         }
     }
 
+    /// Maximum number of pending tasks in the in-memory queue. When this
+    /// limit is reached, new enqueues are rejected with an error (back-pressure),
+    /// preventing unbounded memory growth during cron storms / external
+    /// dispatch floods. Default 10000; tunable via XHJOB_MAX_PENDING.
+    const MAX_PENDING_DEFAULT: usize = 10_000;
+
     /// Enqueue a task by id (already persisted in the store).
     pub async fn enqueue(&self, task_id: &str, priority: i32) -> Result<()> {
+        let max_pending = std::env::var("XHJOB_MAX_PENDING")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::MAX_PENDING_DEFAULT);
         let mut g = self.pending.lock().await;
+        // P0 fix: bound the pending queue to prevent unbounded growth.
+        // If full, return an error — callers (cron scan, retry scan, dispatch)
+        // will log a warning and the task remains in the store as Pending;
+        // scan_retries will re-enqueue it on the next tick.
+        if g.len() >= max_pending {
+            return Err(crate::errors::XhjobError::Store(format!(
+                "pending queue full ({} >= {}); task {} will be retried on next scan",
+                g.len(), max_pending, task_id
+            )));
+        }
         g.push((priority, task_id.to_string()));
         // Sort by priority descending (higher priority first)
         g.sort_by(|a, b| b.0.cmp(&a.0));
@@ -111,19 +132,23 @@ impl TaskQueue {
         if task.expires > 0 && task.state == TaskState::Pending {
             let expiry_ts = task.created_at.saturating_add(task.expires);
             if now > expiry_ts {
-                let _ = self.store.update_state(
+                if let Err(e) = self.store.update_state(
                     &task.id,
                     TaskState::Expired,
                     None,
                     Some(now),
-                ).await;
+                ).await {
+                    tracing::warn!(task_id = %task.id, error = %e, "update_state to Expired failed");
+                }
                 // 记录 Expired 事件（A17）—— 终态过期。
-                let _ = self.store.record_event(
+                if let Err(e) = self.store.record_event(
                     &task.id,
                     crate::store::EventType::Expired,
                     None,
                     now as i64,
-                ).await;
+                ).await {
+                    tracing::warn!(task_id = %task.id, error = %e, "record_event Expired failed");
+                }
                 return Ok(());
             }
         }
@@ -143,7 +168,9 @@ impl TaskQueue {
                 let pri = task.priority;
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(delay)).await;
-                    let _ = q.enqueue(&tid, pri).await;
+                    if let Err(e) = q.enqueue(&tid, pri).await {
+                        tracing::warn!(task_id = %tid, error = %e, "start_date re-enqueue failed");
+                    }
                 });
                 return Ok(());
             }
@@ -154,16 +181,20 @@ impl TaskQueue {
         // window 秒后重新入队。对一次性任务也生效（确保限流期间不丢失）。
         // Reference: Celery rate_limit.
         if !self.rate_limiter.check_and_record(&task, now).await {
-            let _ = self.store.record_event(
+            if let Err(e) = self.store.record_event(
                 &task.id,
                 crate::store::EventType::RateLimited,
                 None,
                 now as i64,
-            ).await;
+            ).await {
+                tracing::warn!(task_id = %task.id, error = %e, "record_event RateLimited failed");
+            }
             // 推进 next_fire 到 window 后（cron/interval 任务避免 scan_once 重复 enqueue）
             let window = task.rate_limit_window;
             if task.cron.is_some() || task.interval.is_some() {
-                let _ = self.store.update_next_fire(&task.id, Some(now + window)).await;
+                if let Err(e) = self.store.update_next_fire(&task.id, Some(now + window)).await {
+                    tracing::warn!(task_id = %task.id, error = %e, "update_next_fire for rate_limit failed");
+                }
             }
             // 延迟重新入队
             let q = Arc::clone(&self);
@@ -171,7 +202,9 @@ impl TaskQueue {
             let pri = task.priority;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(window)).await;
-                let _ = q.enqueue(&tid, pri).await;
+                if let Err(e) = q.enqueue(&tid, pri).await {
+                    tracing::warn!(task_id = %tid, error = %e, "rate_limit re-enqueue failed");
+                }
             });
             return Ok(());
         }
@@ -190,12 +223,14 @@ impl TaskQueue {
             None,
         ).await?;
         // Record a `Started` event (A17).
-        let _ = self.store.record_event(
+        if let Err(e) = self.store.record_event(
             &task.id,
             crate::store::EventType::Started,
             None,
             now_ts() as i64,
-        ).await;
+        ).await {
+            tracing::warn!(task_id = %task.id, error = %e, "record_event Started failed");
+        }
 
         // Dispatch via pool (async by default, thread when XHJOB_POOL_MODE=thread).
         // Thread mode (1:1): each task runs in a dedicated OS worker thread via
@@ -231,7 +266,9 @@ impl TaskQueue {
                         // still transitions correctly.
                         stored = r;
                     } else {
-                        let _ = store.save_result(&task_clone.id, r).await;
+                        if let Err(e) = store.save_result(&task_clone.id, r).await {
+                            tracing::warn!(task_id = %task_clone.id, error = %e, "save_result failed");
+                        }
                         // Reload the persisted TaskResult so retry policy sees the
                         // same data the success/failure check used.
                         stored = store.load_result(&task_clone.id).await
@@ -255,19 +292,24 @@ impl TaskQueue {
                 .map(|t| t.cancel_requested)
                 .unwrap_or(false);
             if cancel_requested {
-                let _ = store.update_state(
+                if let Err(e) = store.update_state(
                     &task_clone.id,
                     TaskState::Cancelled,
                     None,
                     Some(now_ts()),
-                ).await;
+                ).await {
+                    tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Cancelled failed");
+                }
                 // Record a `Cancelled` event (A17).
-                let _ = store.record_event(
+                if let Err(e) = store.record_event(
                     &task_clone.id,
                     crate::store::EventType::Cancelled,
                     None,
                     now_ts() as i64,
-                ).await;
+                ).await {
+                    tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Cancelled failed");
+                }
+                crate::utils::metrics::record_cancel();
                 overlap.on_finish(&task_clone.id).await;
                 return;
             }
@@ -288,20 +330,27 @@ impl TaskQueue {
                     effective_retry_max, task_clone.retry_delay,
                 );
                 if !policy.should_retry(&task_clone, &synthetic) {
-                    let _ = store.update_state(
+                    if let Err(e) = store.update_state(
                         &task_clone.id,
                         TaskState::Failed,
                         None,
                         Some(now_ts()),
-                    ).await;
-                    let _ = store.set_attempts_and_error(
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Failed failed");
+                    }
+                    if let Err(e) = store.set_attempts_and_error(
                         &task_clone.id,
                         task_clone.attempts + 1,
                         Some(format!("not retryable: {}", err_str)),
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "set_attempts_and_error failed");
+                    }
                 } else {
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_str, effective_retry_max).await;
+                    if let Err(e) = crate::retry::schedule_retry(&store, &task_clone, err_str, effective_retry_max).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                    }
                 }
+                crate::utils::metrics::record_failure();
                 overlap.on_finish(&task_clone.id).await;
                 return;
             }
@@ -337,63 +386,78 @@ impl TaskQueue {
                     // 一次后立即 Success 终态，周期触发被提前终止。
                     if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
                         if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
-                            let _ = store.update_state(
+                            if let Err(e) = store.update_state(
                                 &task_clone.id,
                                 TaskState::Success,
                                 None,
                                 Some(finished),
-                            ).await;
+                            ).await {
+                                tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Success failed");
+                            }
                             // Record a `Succeeded` event (A17) — terminal success.
-                            let _ = store.record_event(
+                            if let Err(e) = store.record_event(
                                 &task_clone.id,
                                 crate::store::EventType::Succeeded,
                                 None,
                                 finished as i64,
-                            ).await;
+                            ).await {
+                                tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Succeeded failed");
+                            }
                         } else {
-                            let _ = store.update_state(
+                            if let Err(e) = store.update_state(
                                 &task_clone.id,
                                 TaskState::Pending,
                                 None,
                                 Some(finished),
-                            ).await;
+                            ).await {
+                                tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Pending failed");
+                            }
                             // Record a `Succeeded` event (A17) — non-terminal
                             // success (周期任务将由 scan_once 重新触发)。
-                            let _ = store.record_event(
+                            if let Err(e) = store.record_event(
                                 &task_clone.id,
                                 crate::store::EventType::Succeeded,
                                 None,
                                 finished as i64,
-                            ).await;
+                            ).await {
+                                tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Succeeded failed");
+                            }
                         }
                     }
                 } else {
                     // 非周期任务（包括 run_at 一次性任务）: 立即进入 Success
                     // 终态，然后递增 execution_count 作为记账。原始逻辑保持
                     // 不变。
-                    let _ = store.update_state(
+                    if let Err(e) = store.update_state(
                         &task_clone.id,
                         TaskState::Success,
                         None,
                         Some(finished),
-                    ).await;
-                    let _ = store.record_event(
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Success failed");
+                    }
+                    if let Err(e) = store.record_event(
                         &task_clone.id,
                         crate::store::EventType::Succeeded,
                         None,
                         finished as i64,
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Succeeded failed");
+                    }
                     if let Ok(new_count) = store.increment_execution_count(&task_clone.id).await {
                         if task_clone.max_executions > 0 && new_count >= task_clone.max_executions {
-                            let _ = store.update_state(
+                            if let Err(e) = store.update_state(
                                 &task_clone.id,
                                 TaskState::Success,
                                 None,
                                 Some(crate::store::now_ts()),
-                            ).await;
+                            ).await {
+                                tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Success failed");
+                            }
                         }
                     }
                 }
+                crate::utils::metrics::record_success();
             } else {
                 // Failure: build a human-readable error summary and
                 // consult the retry policy. If the result is not
@@ -424,36 +488,47 @@ impl TaskQueue {
                 );
                 if !policy.should_retry(&task_clone, &stored) {
                     // Not retryable: fail permanently right now.
-                    let _ = store.update_state(
+                    if let Err(e) = store.update_state(
                         &task_clone.id,
                         TaskState::Failed,
                         None,
                         Some(now_ts()),
-                    ).await;
-                    let _ = store.set_attempts_and_error(
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "update_state to Failed failed");
+                    }
+                    if let Err(e) = store.set_attempts_and_error(
                         &task_clone.id,
                         task_clone.attempts + 1,
                         Some(format!("not retryable: {}", err_msg)),
-                    ).await;
-                    let _ = store.record_event(
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "set_attempts_and_error failed");
+                    }
+                    if let Err(e) = store.record_event(
                         &task_clone.id,
                         crate::store::EventType::Failed,
                         Some(&format!("{{\"error\":{}}}", serde_json::to_string(&err_msg).unwrap_or_default())),
                         now_ts() as i64,
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Failed failed");
+                    }
                 } else {
                     // Retryable: schedule retry (which itself may
                     // permanently fail if attempts are exhausted).
-                    let _ = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone(), effective_retry_max).await;
+                    if let Err(e) = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone(), effective_retry_max).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                    }
                     // Record a `Failed` event (A17) for the individual
                     // attempt; the retry will be processed separately.
-                    let _ = store.record_event(
+                    if let Err(e) = store.record_event(
                         &task_clone.id,
                         crate::store::EventType::Failed,
                         Some(&format!("{{\"error\":{}}}", serde_json::to_string(&err_msg).unwrap_or_default())),
                         now_ts() as i64,
-                    ).await;
+                    ).await {
+                        tracing::warn!(task_id = %task_clone.id, error = %e, "record_event Failed failed");
+                    }
                 }
+                crate::utils::metrics::record_failure();
             }
             // Chain (C15) + group (C16) + worker_limits (C5 + C8) hooks.
             // Fire on terminal state transitions; the worker_limits counter
@@ -465,7 +540,12 @@ impl TaskQueue {
             if final_state.is_terminal() {
                 notify_chain_and_group(&queue_arc, &store, &task_clone, final_state).await;
             }
-            record_worker_limits();
+            // P0 fix: record task execution counter for worker_limits (C5+C8).
+            // The actual limit check + graceful shutdown is done in run()
+            // after each iteration — no std::process::exit here.
+            if let Some(limits) = crate::utils::limits::worker_limits() {
+                limits.record_task_execution();
+            }
             overlap.on_finish(&task_clone.id).await;
         };
 
@@ -492,10 +572,17 @@ impl TaskQueue {
 
     /// Run the queue loop. Pulls pending tasks and processes them.
     /// Stops when `shutdown` becomes true.
-    pub async fn run(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(
+        self: Arc<Self>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) {
         let mut shutdown_rx = shutdown;
         let mut retry_scan_ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         retry_scan_ticker.tick().await; // discard first immediate tick
+        // Store shutdown_tx so record_worker_limits can trigger graceful
+        // shutdown instead of std::process::exit (which skips Drop).
+        let shutdown_tx = Arc::new(shutdown_tx);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
@@ -515,6 +602,37 @@ impl TaskQueue {
                     }
                 }
             }
+            // P0 fix: check worker limits after each iteration. If a limit
+            // is reached, trigger graceful shutdown via the watch channel
+            // (NOT std::process::exit, which would skip Drop).
+            // Note: record_task_execution() is called per-task in
+            // task_future; here we only read the counters + check memory.
+            let limits = match crate::utils::limits::worker_limits() {
+                Some(l) => l,
+                None => continue,
+            };
+            let tasks_reached = limits.max_tasks_per_child > 0
+                && limits.tasks_executed.load(std::sync::atomic::Ordering::Relaxed)
+                    >= limits.max_tasks_per_child;
+            let mem_reached = limits.check_memory_limit();
+            if !tasks_reached && !mem_reached {
+                continue;
+            }
+            if tasks_reached {
+                tracing::info!(
+                    limit = limits.max_tasks_per_child,
+                    executed = limits.tasks_executed.load(std::sync::atomic::Ordering::Relaxed),
+                    "max_tasks_per_child reached, initiating graceful daemon shutdown"
+                );
+            }
+            if mem_reached {
+                tracing::info!(
+                    limit = limits.max_memory_per_child,
+                    "max_memory_per_child reached, initiating graceful daemon shutdown"
+                );
+            }
+            let _ = shutdown_tx.send(true);
+            break;
         }
     }
 
@@ -530,9 +648,15 @@ impl TaskQueue {
             if task.cron.is_some() { continue; }
             match task.next_fire {
                 Some(t) if t <= now => {
-                    let _ = self.enqueue(&task.id, task.priority).await;
+                    // P0 fix: surface enqueue errors instead of `let _ =`.
+                    if let Err(e) = self.enqueue(&task.id, task.priority).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "scan_retries enqueue failed");
+                        continue; // keep next_fire so we retry next tick
+                    }
                     // Clear next_fire so we don't re-enqueue the same retry multiple times.
-                    let _ = self.store.update_next_fire(&task.id, None).await;
+                    if let Err(e) = self.store.update_next_fire(&task.id, None).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "scan_retries clear next_fire failed");
+                    }
                 }
                 _ => {}
             }
@@ -698,41 +822,6 @@ async fn advance_chain_and_dispatch(
             tracing::warn!(error = %e, chain_id = chain_id, "chain advance failed");
         }
     }
-}
-
-/// Increment the worker_limits task-execution counter (C5 + C8). If either
-/// the max_tasks_per_child or max_memory_per_child limit is reached, spawn
-/// a background task that exits the daemon after a brief delay so the
-/// current state update can drain. The supervisor (systemd / supervisord /
-/// PHP `xhjob_start`) is responsible for restarting.
-fn record_worker_limits() {
-    let limits = match crate::utils::limits::worker_limits() {
-        Some(l) => l,
-        None => return,
-    };
-    let tasks_reached = limits.record_task_execution();
-    let mem_reached = limits.check_memory_limit();
-    if !tasks_reached && !mem_reached {
-        return;
-    }
-    if tasks_reached {
-        tracing::info!(
-            limit = limits.max_tasks_per_child,
-            executed = limits.tasks_executed.load(std::sync::atomic::Ordering::Relaxed),
-            "max_tasks_per_child reached, initiating daemon shutdown"
-        );
-    }
-    if mem_reached {
-        tracing::info!(
-            limit = limits.max_memory_per_child,
-            "max_memory_per_child reached, initiating daemon shutdown"
-        );
-    }
-    tokio::spawn(async {
-        // Give the current state update + IPC response a moment to flush.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        std::process::exit(0);
-    });
 }
 
 #[cfg(test)]

@@ -103,12 +103,14 @@ step(1, 'Fix 1/3: 启动 daemon (persist) 并验证稳定性', function () use (
 });
 
 // 2. Fix 3: 验证 tracing 日志输出
+// P0-15 fix: tracing now writes to a daily-rotating file via
+// tracing_appender (xhjob.<svc>.log.<date>), NOT to the stderr-redirected
+// xhjob.<svc>.log. Accept either location so the test works before and
+// after the P0-15 rotation fix.
 step(2, 'Fix 3: tracing_subscriber 日志输出', function () use ($SERVICE, $DATA_DIR) {
-    $logFile = "$DATA_DIR/xhjob.$SERVICE.log";
-    if (!file_exists($logFile)) {
-        // 日志文件可能不存在（stderr 重定向到 /dev/null），改为检查 daemon 进程是否在运行
-        // 且能正常响应 IPC（如果 tracing 初始化失败，daemon 仍能运行但日志无输出）
-        // 这里间接验证：如果 daemon 能正常处理 IPC，说明初始化没 crash
+    $candidates = glob("$DATA_DIR/xhjob.$SERVICE.log*");
+    if (empty($candidates)) {
+        // 没有任何日志文件，回退到 daemon 健康检查间接验证
         $svc = new XhjobService($SERVICE, $DATA_DIR);
         $h = $svc->healthCheck();
         if (!$h['healthy']) {
@@ -116,14 +118,22 @@ step(2, 'Fix 3: tracing_subscriber 日志输出', function () use ($SERVICE, $DA
         }
         return 'SKIP';
     }
-    $content = file_get_contents($logFile);
-    // tracing_subscriber 应该输出了至少一行日志
-    if (strlen(trim($content)) === 0) {
-        throw new Exception("日志文件为空，tracing_subscriber 可能未初始化");
+    $foundNonEmpty = false;
+    foreach ($candidates as $logFile) {
+        $content = @file_get_contents($logFile);
+        if ($content === false || strlen(trim($content)) === 0) {
+            continue;
+        }
+        // tracing_subscriber 应该输出了至少一行日志
+        // 检查是否包含 daemon starting 等关键日志
+        if (strpos($content, 'daemon') === false && strpos($content, 'xhjob') === false) {
+            continue;
+        }
+        $foundNonEmpty = true;
+        break;
     }
-    // 检查是否包含 daemon starting 等关键日志
-    if (strpos($content, 'daemon') === false && strpos($content, 'xhjob') === false) {
-        throw new Exception("日志中未找到 daemon/xhjob 关键字");
+    if (!$foundNonEmpty) {
+        throw new Exception("无有效日志输出，tracing_subscriber 可能未初始化");
     }
 });
 

@@ -178,6 +178,10 @@ pub struct TaskBuilder {
     /// Reference: Celery apply_async(countdown=N).
     #[serde(default)]
     pub countdown: Option<u64>,
+    /// Owner/tenant for multi-tenant isolation. When set at dispatch time,
+    /// only the same owner can query/modify this task. P0-17 fix.
+    #[serde(default)]
+    pub owner: String,
 }
 
 fn default_acks_on_failure_true() -> bool { true }
@@ -250,6 +254,7 @@ impl Default for TaskBuilder {
             acks_on_failure: true,
             idempotent: false,
             countdown: None,
+            owner: String::new(),
         }
     }
 }

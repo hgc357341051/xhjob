@@ -45,9 +45,33 @@ pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String {
 }
 
 /// Fallback sock directory when no explicit dir is provided (Unix only).
+/// P0 fix: changed from `/tmp` to `/run/xhjob` (or `/var/run/xhjob` on
+/// systems without `/run`). `/tmp` is world-writable and sticky-bitted,
+/// making the socket path vulnerable to symlink attacks / name squatting
+/// by other local users. `/run/xhjob` is root-owned (daemon runs as root
+/// or a dedicated user) with 0o755 perms, which combined with the
+/// per-directory 0o700 set in bind() makes the socket path non-accessible
+/// to other users. Falls back to `/tmp` only if `/run` does not exist.
 #[cfg(unix)]
 fn fallback_sock_dir() -> String {
-    "/tmp".to_string()
+    if std::path::Path::new("/run").exists() {
+        // /run is typically a tmpfs mounted by systemd; create xhjob subdir.
+        let candidate = "/run/xhjob";
+        let _ = std::fs::create_dir_all(candidate);
+        // Set 0o700 on the directory we created.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700));
+        candidate.to_string()
+    } else if std::path::Path::new("/var/run").exists() {
+        let candidate = "/var/run/xhjob";
+        let _ = std::fs::create_dir_all(candidate);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700));
+        candidate.to_string()
+    } else {
+        // Last resort: /tmp (less secure, but better than failing to start).
+        "/tmp".to_string()
+    }
 }
 
 /// Frame protocol: length-prefixed JSON.
@@ -58,6 +82,10 @@ pub struct Request {
     pub id: u64,
     pub op: String,
     pub payload: serde_json::Value,
+    /// Optional trace id for request correlation (P0-12).
+    /// Defaults to `None` when omitted by the client (backward compatible).
+    #[serde(default)]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +134,12 @@ pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r
     r.read_exact(&mut len_buf).await
         .map_err(|e| XhjobError::Ipc(format!("read len: {}", e)))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 {
-        return Err(XhjobError::Ipc(format!("frame too large: {}", len)));
+    // P0 fix: lowered from 64 MB to 8 MB. A legitimate IPC request (dispatch
+    // / chain / group / chord) is typically < 10 KB. 8 MB is generous enough
+    // for large payloads while preventing a single malicious connection from
+    // allocating 64 MB of memory per frame.
+    if len > 8 * 1024 * 1024 {
+        return Err(XhjobError::Ipc(format!("frame too large: {} (max 8MB)", len)));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await
@@ -191,6 +223,7 @@ pub async fn request(
                 id: rand_id(),
                 op: op.to_string(),
                 payload,
+                trace_id: Some(rand_trace_id()),
             };
             write_frame(&mut stream, &req).await?;
             let resp: Response = read_frame(&mut stream).await?;
@@ -210,4 +243,15 @@ fn rand_id() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     nanos
+}
+
+/// Generate a short trace id (8 hex chars derived from the current timestamp
+/// in nanoseconds) for request correlation (P0-12).
+fn rand_trace_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:08x}", (nanos & 0xffff_ffff) as u32)
 }

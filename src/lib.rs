@@ -2,6 +2,7 @@
 
 use ext_php_rs::prelude::*;
 
+pub mod config;
 pub mod daemon;
 pub mod daemon_main;
 pub mod errors;
