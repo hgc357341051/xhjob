@@ -31,6 +31,30 @@ fn new_id() -> String {
 pub fn daemon_main() {
     // Initialize the global tokio runtime.
     let rt = coroutine_pool::init_global_runtime();
+
+    // Initialize the tracing subscriber BEFORE entering the runtime so that
+    // every `tracing::info!` / `tracing::error!` / `tracing::warn!` call in
+    // the daemon (and in the runtime's own internals) actually emits output.
+    // Without this the global default subscriber is `None` and ALL tracing
+    // macros become no-ops — meaning the 77+ `tracing::*` calls sprinkled
+    // across daemon_main / queue / cron / ipc would silently drop every
+    // log line, making production debugging impossible.
+    //
+    // `try_init()` is used (not `init()`) because ext-php-rs / other PHP
+    // extension init paths may already have installed a subscriber during
+    // MINIT; we tolerate that instead of panicking.
+    //
+    // Env filter: `RUST_LOG=xhjob=info` style. Default level is `info` for
+    // the xhjob crate and `warn` for everything else so the daemon log is
+    // not flooded with hyper / reqwest noise.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("xhjob=info,warn")),
+        )
+        .try_init();
+
     rt.block_on(async {
         if let Err(e) = run_daemon().await {
             tracing::error!("daemon exited with error: {}", e);

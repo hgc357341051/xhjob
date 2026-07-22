@@ -68,6 +68,7 @@ impl SqliteStore {
                 rate_limit_count INTEGER NOT NULL DEFAULT 0,
                 rate_limit_window INTEGER NOT NULL DEFAULT 0,
                 acks_on_failure INTEGER NOT NULL DEFAULT 1,
+                idempotent INTEGER NOT NULL DEFAULT 0,
                 progress INTEGER,
                 progress_meta TEXT,
                 chord_id TEXT
@@ -141,6 +142,7 @@ impl SqliteStore {
         ensure_column(&conn, "rate_limit_count", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "rate_limit_window", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "acks_on_failure", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_column(&conn, "idempotent", "INTEGER NOT NULL DEFAULT 0")?;
         // 以下两列在 CREATE TABLE 中已存在，但早期版本的旧库可能缺失，
         // 这里补齐迁移以保证 schema 完整性。
         ensure_column(&conn, "timezone", "TEXT")?;
@@ -149,6 +151,31 @@ impl SqliteStore {
         ensure_column(&conn, "progress", "INTEGER")?;
         ensure_column(&conn, "progress_meta", "TEXT")?;
         ensure_column(&conn, "chord_id", "TEXT")?;
+        // Fix 4: harden SQLite file permissions to 0o600.
+        //
+        // `Connection::open` creates the DB file with the process umask
+        // (typically 0o644 on most Linux boxes), which means any local user
+        // can read the database — including task payloads that may contain
+        // HTTP headers, shell commands, or secrets. We explicitly chmod the
+        // main DB file plus its WAL / SHM sidecar files to 0o600 (owner
+        // read/write only) right after opening so that only the daemon user
+        // can inspect the store.
+        //
+        // Best-effort: ignore errors because the WAL/SHM files may not exist
+        // yet (they are created lazily on the first write). The main DB file
+        // always exists at this point because `Connection::open` just
+        // created or opened it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms.clone());
+            // WAL and SHM sidecar files (created lazily by SQLite in WAL mode).
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = format!("{}{}", path, suffix);
+                let _ = std::fs::set_permissions(&sidecar, perms.clone());
+            }
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
@@ -234,6 +261,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         rate_limit_count: row.get::<_, i64>("rate_limit_count").unwrap_or(0) as u32,
         rate_limit_window: row.get::<_, i64>("rate_limit_window").unwrap_or(0) as u64,
         acks_on_failure: row.get::<_, i64>("acks_on_failure").unwrap_or(1) != 0,
+        idempotent: row.get::<_, i64>("idempotent").unwrap_or(0) != 0,
         progress: row.get::<_, Option<i64>>("progress").ok().flatten().map(|v| v as u8),
         progress_meta: row.get::<_, Option<String>>("progress_meta").ok().flatten(),
         chord_id: row.get::<_, Option<String>>("chord_id").ok().flatten(),
@@ -258,8 +286,8 @@ impl TaskStore for SqliteStore {
                   interval, run_at, jitter, expires, retry_backoff, ignore_result,
                   acks_late, soft_timeout, misfire_grace_time, replace_existing,
                   tags, rate_limit_count, rate_limit_window, acks_on_failure,
-                  progress, progress_meta, chord_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)",
+                  idempotent, progress, progress_meta, chord_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48)",
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,
@@ -281,6 +309,7 @@ impl TaskStore for SqliteStore {
                     task.rate_limit_count as i64,
                     task.rate_limit_window as i64,
                     task.acks_on_failure as i64,
+                    task.idempotent as i64,
                     task.progress.map(|v| v as i64),
                     task.progress_meta,
                     task.chord_id,

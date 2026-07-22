@@ -164,6 +164,13 @@ pub struct TaskBuilder {
     /// Reference: Celery acks_on_failure.
     #[serde(default = "default_acks_on_failure_true")]
     pub acks_on_failure: bool,
+    /// idempotent: when true, declares this HTTP task safe to retry even if
+    /// it uses a non-idempotent method (POST/PUT/DELETE/PATCH). When false
+    /// (default), such methods are NOT retried on 5xx to prevent duplicate
+    /// side effects. GET/HEAD/OPTIONS are always retryable regardless.
+    /// Reference: HTTP method safety/idempotency (RFC 7231 §4.2.1-2).
+    #[serde(default)]
+    pub idempotent: bool,
     /// Countdown (Celery apply_async(countdown=N)): relative delay in
     /// seconds. Equivalent to `run_at(now + countdown)`. When both
     /// `countdown` and `run_at` are set, `run_at` takes precedence and a
@@ -241,6 +248,7 @@ impl Default for TaskBuilder {
             rate_limit_count: 0,
             rate_limit_window: 0,
             acks_on_failure: true,
+            idempotent: false,
             countdown: None,
         }
     }
@@ -595,6 +603,18 @@ impl TaskBuilder {
         self
     }
 
+    /// Declare this HTTP task as idempotent (safe to retry even with a
+    /// non-idempotent method like POST/PUT/DELETE/PATCH). When false
+    /// (default), HTTP tasks using non-idempotent methods are NOT retried
+    /// on 5xx to prevent duplicate side effects. GET/HEAD/OPTIONS are
+    /// always retryable regardless of this flag.
+    /// Exposed as `idempotent(bool $on)` in PHP.
+    /// Reference: HTTP method safety/idempotency (RFC 7231 §4.2.1-2).
+    pub fn idempotent(mut self, on: bool) -> Self {
+        self.idempotent = on;
+        self
+    }
+
     /// Countdown (Celery apply_async(countdown=N)): relative delay in seconds.
     /// Equivalent to run_at(now + countdown). When both countdown and run_at
     /// are set, run_at takes precedence and a warn is logged.
@@ -670,6 +690,7 @@ impl TaskBuilder {
         task.rate_limit_count = self.rate_limit_count;
         task.rate_limit_window = self.rate_limit_window;
         task.acks_on_failure = self.acks_on_failure;
+        task.idempotent = self.idempotent;
         // Warn when both ignore_result and result_ttl are set: they conflict
         // (one says "don't store", the other says "store then auto-clean").
         // ignore_result takes priority — no row is ever written.

@@ -51,6 +51,18 @@ impl RetryPolicy {
     /// Returns true if attempts < max_attempts AND the result indicates a
     /// retryable failure (HTTP 5xx, shell non-zero exit, or network error).
     ///
+    /// HTTP method safety (Fix 6):
+    /// - GET / HEAD / OPTIONS: always retryable on 5xx (safe methods, no side
+    ///   effects per RFC 7231 §4.2.1).
+    /// - POST / PUT / DELETE / PATCH: only retryable on 5xx if the task is
+    ///   explicitly marked `idempotent=true`. Without this flag, retrying a
+    ///   non-idempotent method risks duplicate side effects (e.g. double-
+    ///   charging a credit card, sending a duplicate email). The user must
+    ///   opt in by calling `.idempotent(true)` on the TaskBuilder.
+    /// - Network errors (status_code=None): always retryable regardless of
+    ///   method, because the request likely never reached the server (so
+    ///   no side effect was produced).
+    ///
     /// Note: comparison uses `self.max_attempts` (which may be `u32::MAX` for
     /// `acks_on_failure=false` tasks) rather than `task.retry_max`, so the
     /// caller can override the per-task retry ceiling via `RetryPolicy::new`.
@@ -61,14 +73,51 @@ impl RetryPolicy {
         }
         match task.task_type {
             TaskType::Http => match result.status_code {
-                Some(code) => Self::is_retryable_http_status(code),
-                None => true, // network error: retryable
+                Some(code) => {
+                    // Status code must be retryable (5xx).
+                    if !Self::is_retryable_http_status(code) {
+                        return false;
+                    }
+                    // Fix 6: for non-idempotent HTTP methods, only retry if
+                    // the task is explicitly marked idempotent. Safe methods
+                    // (GET/HEAD/OPTIONS) are always retryable.
+                    let retryable = Self::is_http_method_retryable(&task.payload, task.idempotent);
+                    tracing::debug!(
+                        task_id = %task.id,
+                        status_code = code,
+                        idempotent = task.idempotent,
+                        retryable,
+                        "should_retry HTTP"
+                    );
+                    retryable
+                }
+                None => true, // network error: retryable (request likely never reached server)
             },
             TaskType::Shell => match result.exit_code {
                 Some(0) => false, // success: not retryable
                 Some(code) => Self::is_retryable_shell_exit(code), // any non-zero
                 None => true, // dispatch error: retryable
             },
+        }
+    }
+
+    /// Check whether an HTTP task's method is retryable given its payload
+    /// and the `idempotent` flag.
+    ///
+    /// - Safe methods (GET/HEAD/OPTIONS): always retryable (no side effects).
+    /// - Other methods (POST/PUT/DELETE/PATCH...): retryable only if
+    ///   `idempotent=true` is set on the task.
+    /// - If the method cannot be parsed from the payload, fall back to the
+    ///   `idempotent` flag alone (conservative: don't retry unless opted in).
+    fn is_http_method_retryable(payload: &serde_json::Value, idempotent: bool) -> bool {
+        let method = payload
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        match method.as_str() {
+            "GET" | "HEAD" | "OPTIONS" => true, // safe methods per RFC 7231 §4.2.1
+            _ => idempotent, // non-idempotent methods: only if explicitly opted in
         }
     }
 
@@ -177,7 +226,8 @@ mod tests {
 
     #[test]
     fn test_should_retry() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({}));
+        // Use GET (safe method) so retry is allowed by default.
+        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"GET","url":"http://x"}));
         task.retry_max = 3;
         task.attempts = 0;
         // Use RetryPolicy::new (max_attempts=3) instead of Default (max_attempts=0).
@@ -190,7 +240,7 @@ mod tests {
         ok.status_code = Some(200);
         assert!(!p.should_retry(&task, &ok));
 
-        // HTTP 500 -> retryable
+        // HTTP 500 -> retryable (GET is a safe method)
         let mut server_err = TaskResult::default();
         server_err.status_code = Some(500);
         assert!(p.should_retry(&task, &server_err));
@@ -207,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_should_retry_http_404_not_retryable() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({}));
+        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"GET","url":"http://x"}));
         task.retry_max = 3;
         task.attempts = 0;
         let p = RetryPolicy::new(3, 1);
@@ -219,14 +269,81 @@ mod tests {
 
     #[test]
     fn test_should_retry_network_error_retryable() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({}));
+        // Network errors are always retryable regardless of method (even POST),
+        // because the request likely never reached the server.
+        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
         task.retry_max = 3;
         task.attempts = 0;
         let p = RetryPolicy::new(3, 1);
         // Network error: no status_code at all -> retryable.
         let result = TaskResult::default();
         assert!(p.should_retry(&task, &result),
-            "network error (status_code=None) should be retryable");
+            "network error (status_code=None) should be retryable even for POST");
+    }
+
+    /// Fix 6: POST without idempotent flag must NOT be retried on 5xx.
+    #[test]
+    fn test_should_retry_post_without_idempotent_not_retryable() {
+        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
+        task.retry_max = 3;
+        task.attempts = 0;
+        // idempotent defaults to false
+        let p = RetryPolicy::new(3, 1);
+        let mut result = TaskResult::default();
+        result.status_code = Some(500);
+        assert!(!p.should_retry(&task, &result),
+            "POST without idempotent=true must NOT be retried on 5xx (duplicate side effects)");
+    }
+
+    /// Fix 6: POST with idempotent=true IS retried on 5xx.
+    #[test]
+    fn test_should_retry_post_with_idempotent_retryable() {
+        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
+        task.retry_max = 3;
+        task.attempts = 0;
+        task.idempotent = true; // user opted in
+        let p = RetryPolicy::new(3, 1);
+        let mut result = TaskResult::default();
+        result.status_code = Some(500);
+        assert!(p.should_retry(&task, &result),
+            "POST with idempotent=true should be retried on 5xx");
+    }
+
+    /// Fix 6: PUT/DELETE/PATCH without idempotent flag must NOT be retried.
+    #[test]
+    fn test_should_retry_non_safe_methods_without_idempotent() {
+        let p = RetryPolicy::new(3, 1);
+        for method in &["PUT", "DELETE", "PATCH"] {
+            let mut task = Task::new(
+                TaskType::Http,
+                serde_json::json!({"method":method,"url":"http://x"}),
+            );
+            task.retry_max = 3;
+            task.attempts = 0;
+            let mut result = TaskResult::default();
+            result.status_code = Some(500);
+            assert!(!p.should_retry(&task, &result),
+                "{} without idempotent=true must NOT be retried on 5xx", method);
+        }
+    }
+
+    /// Fix 6: HEAD/OPTIONS are safe methods, always retryable on 5xx.
+    #[test]
+    fn test_should_retry_safe_methods_always_retryable() {
+        let p = RetryPolicy::new(3, 1);
+        for method in &["GET", "HEAD", "OPTIONS"] {
+            let mut task = Task::new(
+                TaskType::Http,
+                serde_json::json!({"method":method,"url":"http://x"}),
+            );
+            task.retry_max = 3;
+            task.attempts = 0;
+            // idempotent=false (default), but safe methods are always retryable
+            let mut result = TaskResult::default();
+            result.status_code = Some(500);
+            assert!(p.should_retry(&task, &result),
+                "{} is a safe method and should always be retryable on 5xx", method);
+        }
     }
 
     /// acks_on_failure (C13) override: when RetryPolicy is constructed with

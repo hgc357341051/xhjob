@@ -163,21 +163,44 @@ pub async fn connect(service_name: &str, data_dir: Option<&str>) -> Result<Box<d
 
 /// Helper: send one request and receive one response (short connection)
 /// targeting the daemon for `service_name` with optional `data_dir`.
+///
+/// The whole round-trip is wrapped in a 5-second timeout. Without this, a
+/// daemon that accepted the connection but then deadlocked / got SIGSTOP'd /
+/// crashed after accept would leave the PHP-FPM worker blocked forever in
+/// `read_exact` — `max_execution_time` does not interrupt C-level blocking
+/// calls, so the worker pool would be drained one by one until the site
+/// returns 502/504 with no self-heal.
 pub async fn request(
     op: &str,
     payload: serde_json::Value,
     service_name: &str,
     data_dir: Option<&str>,
 ) -> Result<Response> {
-    let mut stream = connect(service_name, data_dir).await?;
-    let req = Request {
-        id: rand_id(),
-        op: op.to_string(),
-        payload,
-    };
-    write_frame(&mut stream, &req).await?;
-    let resp: Response = read_frame(&mut stream).await?;
-    Ok(resp)
+    // 5s is enough for any local IPC op (SQLite write / cron scan / dispatch).
+    // Tunable via XHJOB_IPC_TIMEOUT_SECS for slow boxes or large payloads.
+    let timeout_secs = std::env::var("XHJOB_IPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(5);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        async {
+            let mut stream = connect(service_name, data_dir).await?;
+            let req = Request {
+                id: rand_id(),
+                op: op.to_string(),
+                payload,
+            };
+            write_frame(&mut stream, &req).await?;
+            let resp: Response = read_frame(&mut stream).await?;
+            Ok(resp)
+        },
+    )
+    .await
+    .map_err(|_| XhjobError::Ipc(format!(
+        "request timeout ({}s) for op={}", timeout_secs, op
+    )))?
 }
 
 fn rand_id() -> u64 {

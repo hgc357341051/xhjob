@@ -73,7 +73,37 @@ pub fn spawn_via_double_fork(
     }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    // Fix 3: redirect stderr to a log file so tracing_subscriber output
+    // is actually visible for debugging. Without this, all tracing logs
+    // (daemon startup, task dispatch, errors) go to /dev/null, making
+    // production debugging impossible.
+    // Log path follows the same pattern as sock/db: <dir>/xhjob.<name>.log
+    let log_dir = data_dir
+        .filter(|d| !d.is_empty())
+        .map(|d| d.to_string())
+        .or_else(|| std::env::var("XHJOB_DATA_DIR").ok().filter(|d| !d.is_empty()))
+        .unwrap_or_else(|| {
+            // Same fallback as ipc::fallback_sock_dir
+            std::env::var("XHJOB_SOCK_DIR").ok()
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "/tmp".to_string())
+        });
+    let log_path = std::path::PathBuf::from(&log_dir)
+        .join(format!("xhjob.{}.log", service_name));
+    // Try to open the log file for appending. If it fails (e.g. dir doesn't
+    // exist yet), fall back to /dev/null to avoid blocking daemon startup.
+    let log_stdio = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(|f| {
+            // Harden log file permissions (may contain task payloads / secrets).
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+            std::process::Stdio::from(f)
+        })
+        .unwrap_or(std::process::Stdio::null());
+    cmd.stderr(log_stdio);
 
     // Double-fork pattern via `pre_exec`: the spawned process calls setsid
     // before exec'ing, so it becomes a session leader detached from any tty.

@@ -32,7 +32,7 @@ encoding_rs = "0.8"
 rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["process", "signal", "fs"] }
+nix = { version = "0.27", features = ["process", "signal", "fs", "user"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -43,3 +43,12 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_
 [profile.release]
 opt-level = 3
 lto = true
+# Panic in `extern "C"` (ext-php-rs handler) is UB. Switch to abort so the
+# process dies cleanly instead of unwinding through C frames. This also makes
+# `catch_unwind` calls in pool/thread_pool.rs become no-ops (panics abort
+# before they can be caught), which is the desired safe-fail behavior for a
+# PHP-FPM daemon: better abort than corrupt state.
+panic = "abort"
+
+# Dev/test builds keep panic=unwind so cargo test assertions can report per-test
+# instead of aborting the whole test runner.

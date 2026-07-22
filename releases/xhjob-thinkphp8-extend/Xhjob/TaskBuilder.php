@@ -90,6 +90,7 @@ class TaskBuilder
             'rate_limit_count'    => 0,
             'rate_limit_window'   => 0,
             'acks_on_failure'     => true,
+            'idempotent'          => false,
             'countdown'           => null,
         ];
     }
@@ -128,8 +129,12 @@ class TaskBuilder
         $b->config['payload']   = [
             'method'  => strtoupper($method),
             'url'     => $url,
-            'headers' => [],
-            'body'    => '',
+            // headers must be a JSON object {}, not array [] — Rust's
+            // HttpPayload deserializes headers as HashMap<String,String>
+            // which requires {} not []. Using (object)[] ensures json_encode
+            // produces "{}" instead of "[]".
+            'headers' => (object)[],
+            'body'    => null,
             'proxy'   => null,
         ];
         return $b;
@@ -616,6 +621,23 @@ class TaskBuilder
     public function acksOnFailure(bool $on = true): self
     {
         $this->config['acks_on_failure'] = $on;
+        return $this;
+    }
+
+    /**
+     * 声明此 HTTP 任务为幂等（即使使用 POST/PUT/DELETE/PATCH 也允许重试）
+     *
+     * 当 false（默认）时，非幂等 HTTP 方法（POST/PUT/DELETE/PATCH）在 5xx
+     * 错误时不会被重试，以防止重复副作用（如重复扣款、重复发邮件）。
+     * GET/HEAD/OPTIONS 是安全方法，无论此标志如何都会重试。
+     *
+     * @param bool $on 是否声明为幂等
+     *
+     * @return self
+     */
+    public function idempotent(bool $on = true): self
+    {
+        $this->config['idempotent'] = $on;
         return $this;
     }
 

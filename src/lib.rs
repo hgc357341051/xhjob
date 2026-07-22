@@ -938,6 +938,17 @@ impl Xhjob {
         self
     }
 
+    /// Declare this HTTP task as idempotent (safe to retry even with a
+    /// non-idempotent method like POST/PUT/DELETE/PATCH). When false
+    /// (default), such methods are NOT retried on 5xx to prevent duplicate
+    /// side effects. GET/HEAD/OPTIONS are always retryable regardless.
+    /// PHP: `idempotent(bool $on): $this`
+    /// Reference: HTTP method safety/idempotency (RFC 7231 §4.2.1-2).
+    pub fn idempotent(&mut self, on: bool) -> &mut Self {
+        self.builder.idempotent = on;
+        self
+    }
+
     pub fn dispatch(&mut self) -> String {
         let rt = match pool::coroutine_pool::global_runtime() {
             Some(rt) => rt,

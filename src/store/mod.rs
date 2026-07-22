@@ -272,6 +272,17 @@ pub struct Task {
     /// `acks_late`. Reference: Celery acks_on_failure.
     #[serde(default = "default_acks_on_failure_true")]
     pub acks_on_failure: bool,
+    /// idempotent: when true, the task is declared safe to retry even if it
+    /// uses a non-idempotent HTTP method (POST/PUT/DELETE/PATCH). When false
+    /// (default), HTTP tasks using non-idempotent methods are NOT retried on
+    /// 5xx responses to prevent duplicate side effects (e.g. double-charging
+    /// a credit card). GET/HEAD/OPTIONS are always retryable regardless of
+    /// this flag because they have no side effects per HTTP spec.
+    /// Network errors (no status_code at all) are always retryable because
+    /// the request likely never reached the server.
+    /// Reference: HTTP method safety/idempotency (RFC 7231 §4.2.1-2).
+    #[serde(default)]
+    pub idempotent: bool,
     /// Progress percent (0-100). None = not reported yet.
     /// Reference: Celery update_state(state='PROGRESS', meta=...).
     #[serde(default)]
@@ -337,6 +348,7 @@ impl Task {
             rate_limit_count: 0,
             rate_limit_window: 0,
             acks_on_failure: true,
+            idempotent: false,
             progress: None,
             progress_meta: None,
             chord_id: None,
