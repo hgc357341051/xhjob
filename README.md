@@ -505,8 +505,6 @@ $id = xhjob_countdown(
 
 ## 环境变量
 
-> 优先级（高到低）：显式参数 → 细粒度 `*_DIR` → `XHJOB_DATA_DIR` → 平台默认（`/tmp`）。
-
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `XHJOB_POOL_MODE` | `async` | 任务执行池模式：`async`（默认）或 `thread`；`coroutine` 为 `async` 兼容别名 |
@@ -514,21 +512,10 @@ $id = xhjob_countdown(
 | `XHJOB_THREAD_POOL_SIZE` | `num_cpus` | thread 模式下的工作线程数 |
 | `XHJOB_DATA_DIR` | 平台默认 | 统一数据目录（PID/sock/db/log 同时落入此目录） |
 | `XHJOB_PID_DIR` / `XHJOB_SOCK_DIR` / `XHJOB_DB_DIR` / `XHJOB_LOG_DIR` | `/tmp` | 细粒度目录覆盖（优先级高于 `XHJOB_DATA_DIR`） |
-| `XHJOB_PERSIST` | `0` | 启用 SQLite 持久化。注意取值语义随 `persist` feature 而变：启用 `--features persist` 编译时默认 **true**，除 `"0"`/`"false"` 外都视作启用；未启用 feature 编译时默认 **false**，仅 `"1"`/`"true"` 视作启用。生产建议显式设为 `1`/`0`。 |
+| `XHJOB_PERSIST` | `0` | 设为 `1` 启用 SQLite 持久化 |
 | `XHJOB_MAX_TASKS_PER_CHILD` | `0` | daemon 累计执行 N 次任务后自我退出；0=不限 |
-| `XHJOB_MAX_MEMORY_PER_CHILD` | `0` | daemon RSS 超过 N **字节**（非 MB）后自我退出；0=不限 |
-| `XHJOB_SHELL_TIMEOUT` | `300` | Shell 任务默认硬超时（秒） |
-| `XHJOB_MAX_PENDING` | `10000` | 内存 pending 队列上限（背压保护，防止 OOM） |
-| `XHJOB_MAX_CRON_PER_TICK` | `500` | 每次 cron scan tick 最多触发的任务数（防 cron 风暴） |
-| `XHJOB_MAX_CONNECTIONS` | `256` | IPC 并发连接上限（Semaphore，防 fd 耗尽 DoS） |
-| `XHJOB_SHUTDOWN_DRAIN_SECS` | `30` | shutdown 时等待在途任务完成的秒数（`wait_for_idle`） |
-| `XHJOB_IPC_TIMEOUT_SECS` | `5` | 单个 IPC 请求整体超时秒数 |
-| `XHJOB_IPC_NO_PEERCRED` | 未设 | 设为 `"1"` 跳过 Unix socket `SO_PEERCRED` 身份校验（**仅测试用逃生开关**，生产禁用） |
-| `XHJOB_HTTP_CONNECT_TIMEOUT` | `10` | HTTP 任务单独的 TCP connect 超时秒数（独立于任务总超时） |
-| `XHJOB_OWNER` | 空 | 当前调用者身份，用于多租户所有权隔离。空=未标识（只能访问未归属任务）。daemon 侧通过 `XHJOB_OWNER` 环境变量传递；PHP 客户端通过 dispatch 请求体携带。 |
-| `XHJOB_SERVICE_NAME` | `default` | 当前服务名，用于多服务实例隔离。dispatch 时如未指定则使用此环境变量。 |
-| `XHJOB_CONFIG_FILE` | `/etc/xhjob/config` | KEY=VALUE 配置文件路径（`.env` 风格），启动时加载并注入进程环境。用于无环境变量注入的容器/systemd 场景。 |
-| `XHJOB_ENCRYPTION_KEY` | 未设 | 任务 payload AES-256-GCM 加密密钥（hex 编码 64 字符，即 32 字节）。未设置=明文存储。设置后所有任务 payload 字段加密落库。 |
+| `XHJOB_MAX_MEMORY_PER_CHILD` | `0` | daemon RSS 超过 N 字节后自我退出；0=不限 |
+| `XHJOB_SHELL_TIMEOUT` | `300` | Shell 任务默认超时（秒） |
 
 ## 测试
 

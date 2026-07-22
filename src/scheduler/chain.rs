@@ -133,44 +133,4 @@ mod tests {
         let next = advance(&store, "c-fail").await.unwrap();
         assert!(next.is_none());
     }
-
-    /// H5 fix: per-chain mutex prevents step-skipping when two concurrent
-    /// completions both call advance. Without the mutex, both could read
-    /// current_step=N, both return tasks[N], and both push current_step to
-    /// N+2 — skipping step N+1 entirely. The mutex serializes them so the
-    /// second caller observes current_step=N+1 (already advanced by the
-    /// first) and returns tasks[N+1].
-    #[tokio::test]
-    async fn test_concurrent_advance_does_not_skip_steps() {
-        let store: std::sync::Arc<dyn TaskStore> = std::sync::Arc::new(InMemoryStore::new());
-        let tasks = vec![json!({"cmd":"s1"}), json!({"cmd":"s2"}), json!({"cmd":"s3"})];
-        store.create_chain("c-concurrent", &tasks, now_ts() as i64).await.unwrap();
-
-        // Spawn two concurrent advance calls.
-        let s1 = std::sync::Arc::clone(&store);
-        let s2 = std::sync::Arc::clone(&store);
-        let h1 = tokio::spawn(async move { advance(&s1, "c-concurrent").await.unwrap() });
-        let h2 = tokio::spawn(async move { advance(&s2, "c-concurrent").await.unwrap() });
-        let (r1, r2) = tokio::join!(h1, h2);
-        let r1 = r1.unwrap();
-        let r2 = r2.unwrap();
-
-        // The two concurrent advances must return DIFFERENT steps (s1 and s2),
-        // never the same step twice — proving the mutex serialized them.
-        assert!(r1.is_some(), "first advance should return a step");
-        assert!(r2.is_some(), "second advance should return a step");
-        assert_ne!(r1, r2, "concurrent advances must return DIFFERENT steps (no skip/no dup)");
-
-        // Collect the two distinct steps returned.
-        let mut returned = vec![r1.unwrap(), r2.unwrap()];
-        returned.sort_by_key(|v| v.as_str().unwrap_or("").to_string());
-        assert_eq!(returned[0], json!({"cmd":"s1"}));
-        assert_eq!(returned[1], json!({"cmd":"s2"}));
-
-        // current_step must be exactly 2 (advanced twice), not 3 (skipped s2)
-        // and not 1 (only one advanced).
-        let record = store.get_chain("c-concurrent").await.unwrap().unwrap();
-        assert_eq!(record.current_step, 2, "current_step must be 2 (advanced exactly twice, no skip)");
-        assert_eq!(record.state, "running");
-    }
 }

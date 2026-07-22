@@ -606,23 +606,6 @@ impl TaskQueue {
                 limits.record_task_execution();
             }
             overlap.on_finish(&task_clone.id).await;
-            // 功能补全: persist=false 语义化 — 非周期任务进入终态后自动删除任务定义。
-            // 之前 persist 字段是"哑字段"（存储但未生效），与全局 XHJOB_PERSIST 行为冲突。
-            // 现在对一次性任务（无 cron/interval）在终态（Success/Failed/Cancelled/Expired）
-            // 后删除任务定义，实现 Celery persist=False 的 fire-and-forget-after-completion
-            // 语义，避免任务表无限增长。周期任务（cron/interval）不受影响——它们需要继续
-            // 存在以触发后续执行。run_at 一次性任务在终态后也清理。
-            if !task_clone.persist
-                && task_clone.cron.is_none()
-                && task_clone.interval.is_none()
-                && final_state.is_terminal()
-            {
-                if let Err(e) = store.delete_task(&task_clone.id).await {
-                    tracing::warn!(task_id = %task_clone.id, error = %e, "persist=false: auto-delete task failed");
-                } else {
-                    tracing::debug!(task_id = %task_clone.id, "persist=false: task auto-deleted after terminal state");
-                }
-            }
         };
 
         // Pool mode selection: async (default) or thread.
@@ -1094,10 +1077,6 @@ mod tests {
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
         task.id = "t-ignore-result".to_string();
         task.ignore_result = true;
-        // Set persist=true so the task isn't auto-deleted after completion
-        // (the persist=false auto-delete path is tested separately). This
-        // isolates the ignore_result behavior under test.
-        task.persist = true;
         task.state = TaskState::Pending;
         task.next_fire = Some(now_ts());
         store.insert_task(task).await.unwrap();
@@ -1142,9 +1121,6 @@ mod tests {
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
         task.id = "t-save-result".to_string();
         task.ignore_result = false;
-        // Set persist=true so the task isn't auto-deleted after completion.
-        // This isolates the ignore_result=false save-result behavior.
-        task.persist = true;
         task.state = TaskState::Pending;
         task.next_fire = Some(now_ts());
         store.insert_task(task).await.unwrap();
