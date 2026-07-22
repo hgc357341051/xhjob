@@ -1,0 +1,401 @@
+#!/usr/bin/env php
+<?php
+/**
+ * xhjob CLI 控制脚本
+ *
+ * 提供 daemon 生命周期管理、任务 CRUD、启停、日志查询等命令行操作。
+ * 替代 PHP-FPM 启动场景的命令行入口，适合运维脚本和部署流程使用。
+ *
+ * 用法：
+ *   xhjobctl start [--name=...] [--data-dir=...]
+ *   xhjobctl stop [--name=...] [--data-dir=...]
+ *   xhjobctl restart [--name=...] [--data-dir=...]
+ *   xhjobctl status [--name=...] [--data-dir=...]
+ *   xhjobctl health [--name=...] [--data-dir=...]
+ *
+ *   xhjobctl list [--name=...] [--data-dir=...] [--state=...] [--tag=...]
+ *   xhjobctl get --id=... [--name=...] [--data-dir=...]
+ *   xhjobctl run --id=... [--name=...] [--data-dir=...]
+ *   xhjobctl stop-task --id=... [--name=...] [--data-dir=...]
+ *   xhjobctl restart-task --id=... [--name=...] [--data-dir=...]
+ *   xhjobctl logs --id=... [--name=...] [--data-dir=...] [--tail=50]
+ *   xhjobctl dispatch --type=shell --cmd="echo hi" [--cron="..."] [--name=...] [--data-dir=...]
+ *
+ * 环境变量：
+ *   XHJOB_SERVICE   默认服务名
+ *   XHJOB_DATA_DIR   默认数据目录
+ */
+
+require_once __DIR__ . '/../framework/autoload.php';
+
+// 解析命令行参数
+$args = parseArgs($argv);
+$cmd = $args['command'] ?? null;
+$name = $args['name'] ?? (getenv('XHJOB_SERVICE') ?: 'default');
+$dataDir = $args['data-dir'] ?? (getenv('XHJOB_DATA_DIR') ?: null);
+if ($dataDir === '') {
+    $dataDir = null;
+}
+
+// 无命令或 help 时显示用法（无需加载扩展）
+if ($cmd === null || $cmd === 'help' || $cmd === '--help' || $cmd === '-h') {
+    printUsage();
+    exit(0);
+}
+
+// 检查 xhjob 扩展是否加载（仅在实际执行命令时需要）
+if (!function_exists('xhjob_dispatch')) {
+    fwrite(STDERR, "错误: xhjob 扩展未加载。请使用: php -d extension=path/to/xhjob.so " . ($argv[0] ?? 'xhjobctl') . "\n");
+    exit(1);
+}
+
+try {
+    switch ($cmd) {
+        // ===== daemon 生命周期 =====
+        case 'start':
+            $svc = new XhjobService($name, $dataDir);
+            $pid = $svc->start();
+            echo "daemon 已启动: name={$name}, pid={$pid}\n";
+            break;
+
+        case 'stop':
+            $svc = new XhjobService($name, $dataDir);
+            if ($svc->stop()) {
+                echo "daemon 已停止: name={$name}\n";
+            } else {
+                fwrite(STDERR, "停止 daemon 失败: name={$name}\n");
+                exit(1);
+            }
+            break;
+
+        case 'restart':
+            $svc = new XhjobService($name, $dataDir);
+            $pid = $svc->restart();
+            echo "daemon 已重启: name={$name}, pid={$pid}\n";
+            break;
+
+        case 'status':
+            $svc = new XhjobService($name, $dataDir);
+            $status = $svc->status();
+            echo "name={$name}\n";
+            echo "running=" . ($status['running'] ? 'true' : 'false') . "\n";
+            echo "pid=" . ($status['pid'] ?? 'null') . "\n";
+            break;
+
+        case 'health':
+            $svc = new XhjobService($name, $dataDir);
+            $health = $svc->healthCheck();
+            echo "name={$name}\n";
+            echo "healthy=" . ($health['healthy'] ? 'true' : 'false') . "\n";
+            echo "pid=" . ($health['pid'] ?? 'null') . "\n";
+            if (!empty($health['stats'])) {
+                echo "stats:\n";
+                foreach ($health['stats'] as $state => $count) {
+                    echo "  {$state}: {$count}\n";
+                }
+            }
+            break;
+
+        // ===== 任务管理 =====
+        case 'list':
+            $tm = new TaskManager($name, $dataDir);
+            $stateFilter = $args['state'] ?? null;
+            $tag = $args['tag'] ?? null;
+            $tasks = $tm->list($stateFilter, $tag);
+            if (empty($tasks)) {
+                echo "无任务。\n";
+                break;
+            }
+            $rows = [];
+            foreach ($tasks as $task) {
+                $rows[] = [
+                    $task['id'] ?? '-',
+                    $task['task_type'] ?? '-',
+                    $task['state'] ?? '-',
+                    $task['cron'] ?? '-',
+                    (string)($task['attempts'] ?? '0'),
+                    isset($task['next_fire']) ? (string)$task['next_fire'] : '-',
+                ];
+            }
+            printTable($rows, ['ID', 'TYPE', 'STATE', 'CRON', 'ATTEMPTS', 'NEXT_FIRE']);
+            break;
+
+        case 'get':
+            $id = $args['id'] ?? null;
+            if (!$id) {
+                fwrite(STDERR, "错误: 缺少 --id 参数\n");
+                exit(1);
+            }
+            $tm = new TaskManager($name, $dataDir);
+            $task = $tm->get($id);
+            if ($task === null) {
+                fwrite(STDERR, "任务不存在: {$id}\n");
+                exit(1);
+            }
+            echo json_encode($task, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+            break;
+
+        case 'run':
+            // requeue + restart（立即触发执行）
+            $id = $args['id'] ?? null;
+            if (!$id) {
+                fwrite(STDERR, "错误: 缺少 --id 参数\n");
+                exit(1);
+            }
+            $tm = new TaskManager($name, $dataDir);
+            if ($tm->restart($id)) {
+                echo "任务已重新入队: {$id}\n";
+            } else {
+                fwrite(STDERR, "重新入队失败: {$id}\n");
+                exit(1);
+            }
+            break;
+
+        case 'stop-task':
+            $id = $args['id'] ?? null;
+            if (!$id) {
+                fwrite(STDERR, "错误: 缺少 --id 参数\n");
+                exit(1);
+            }
+            $tm = new TaskManager($name, $dataDir);
+            if ($tm->stop($id)) {
+                echo "任务已停止: {$id}\n";
+            } else {
+                fwrite(STDERR, "停止任务失败: {$id}\n");
+                exit(1);
+            }
+            break;
+
+        case 'restart-task':
+            // requeue（重新入队）
+            $id = $args['id'] ?? null;
+            if (!$id) {
+                fwrite(STDERR, "错误: 缺少 --id 参数\n");
+                exit(1);
+            }
+            $tm = new TaskManager($name, $dataDir);
+            if ($tm->restart($id)) {
+                echo "任务已重启: {$id}\n";
+            } else {
+                fwrite(STDERR, "重启任务失败: {$id}\n");
+                exit(1);
+            }
+            break;
+
+        case 'logs':
+            $id = $args['id'] ?? null;
+            if (!$id) {
+                fwrite(STDERR, "错误: 缺少 --id 参数\n");
+                exit(1);
+            }
+            $tm = new TaskManager($name, $dataDir);
+            $events = $tm->logs($id, 0);
+            // 应用 --tail 限制
+            if (isset($args['tail'])) {
+                $tail = (int)$args['tail'];
+                if ($tail > 0 && count($events) > $tail) {
+                    $events = array_slice($events, -$tail);
+                }
+            }
+            if (empty($events)) {
+                echo "无事件记录: {$id}\n";
+                break;
+            }
+            foreach ($events as $event) {
+                $ts = $event['ts'] ?? 0;
+                $date = date('Y-m-d H:i:s', (int)$ts);
+                $type = $event['event_type'] ?? 'UNKNOWN';
+                $payload = '';
+                if (isset($event['payload']) && $event['payload'] !== null) {
+                    $payload = '  ' . json_encode(
+                        $event['payload'],
+                        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+                    );
+                }
+                echo "[{$date}] {$type}{$payload}\n";
+            }
+            break;
+
+        case 'dispatch':
+            $type = $args['type'] ?? 'shell';
+            $tm = new TaskManager($name, $dataDir);
+            if ($type === 'shell') {
+                $cmdStr = $args['cmd'] ?? null;
+                if (!$cmdStr) {
+                    fwrite(STDERR, "错误: shell 任务需要 --cmd 参数\n");
+                    exit(1);
+                }
+                $b = TaskBuilder::shell($cmdStr);
+            } elseif ($type === 'http') {
+                $httpMethod = $args['method'] ?? 'GET';
+                $url = $args['url'] ?? null;
+                if (!$url) {
+                    fwrite(STDERR, "错误: http 任务需要 --url 参数\n");
+                    exit(1);
+                }
+                $b = TaskBuilder::http($httpMethod, $url);
+                if (isset($args['body'])) {
+                    $b->withBody($args['body']);
+                }
+            } else {
+                fwrite(STDERR, "错误: 未知任务类型: {$type}（支持: shell, http）\n");
+                exit(1);
+            }
+            // 可选 cron 表达式
+            if (isset($args['cron'])) {
+                $b->cron($args['cron']);
+            }
+            $taskId = $tm->create($b);
+            echo "已派发: task_id={$taskId}\n";
+            break;
+
+        default:
+            fwrite(STDERR, "未知命令: {$cmd}\n\n");
+            printUsage();
+            exit(1);
+    }
+} catch (XhjobFrameworkException $e) {
+    fwrite(STDERR, "错误: " . $e->getMessage() . "\n");
+    exit(1);
+} catch (Throwable $e) {
+    fwrite(STDERR, "错误: " . $e->getMessage() . "\n");
+    exit(1);
+}
+
+
+// =====================================================================
+// 辅助函数
+// =====================================================================
+
+/**
+ * 解析命令行参数
+ *
+ * 支持两种格式：
+ *   --key=value   键值对
+ *   --key value   空格分隔的键值对（value 不以 -- 开头时）
+ *   --flag        布尔标志（值为 true）
+ *
+ * 第一个非 -- 参数作为 command。
+ *
+ * @param array $argv $argv 数组
+ * @return array 包含 command 和各参数的关联数组
+ */
+function parseArgs(array $argv): array
+{
+    $result = [];
+    if (count($argv) < 2) {
+        return $result;
+    }
+
+    // 第一个参数作为子命令
+    $first = $argv[1];
+    if (strpos($first, '--') !== 0) {
+        $result['command'] = $first;
+        $start = 2;
+    } else {
+        $start = 1;
+    }
+
+    for ($i = $start; $i < count($argv); $i++) {
+        $arg = $argv[$i];
+
+        if (strpos($arg, '--') === 0) {
+            // 去除 -- 前缀
+            $arg = substr($arg, 2);
+
+            // --key=value 格式
+            if (strpos($arg, '=') !== false) {
+                $parts = explode('=', $arg, 2);
+                $result[$parts[0]] = $parts[1];
+                continue;
+            }
+
+            // --key value 或 --flag 格式
+            if (isset($argv[$i + 1]) && strpos($argv[$i + 1], '--') !== 0) {
+                $result[$arg] = $argv[$i + 1];
+                $i++;
+            } else {
+                $result[$arg] = true;
+            }
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * 打印对齐的表格
+ *
+ * 自动计算每列宽度并左对齐填充。
+ *
+ * @param array $rows    数据行（每行为值数组）
+ * @param array $headers 列标题数组
+ * @return void
+ */
+function printTable(array $rows, array $headers): void
+{
+    $colCount = count($headers);
+    $widths = array_fill(0, $colCount, 0);
+
+    // 计算每列最大宽度（含表头）
+    foreach ($headers as $i => $h) {
+        $widths[$i] = strlen($h);
+    }
+    foreach ($rows as $row) {
+        // 确保行有足够的列
+        $row = array_pad($row, $colCount, '');
+        for ($i = 0; $i < $colCount; $i++) {
+            $len = strlen((string)$row[$i]);
+            if ($len > $widths[$i]) {
+                $widths[$i] = $len;
+            }
+        }
+    }
+
+    // 打印表头
+    $line = '';
+    for ($i = 0; $i < $colCount; $i++) {
+        $line .= str_pad((string)$headers[$i], $widths[$i] + 2);
+    }
+    echo rtrim($line) . "\n";
+
+    // 打印数据行
+    foreach ($rows as $row) {
+        $row = array_pad($row, $colCount, '');
+        $line = '';
+        for ($i = 0; $i < $colCount; $i++) {
+            $line .= str_pad((string)$row[$i], $widths[$i] + 2);
+        }
+        echo rtrim($line) . "\n";
+    }
+}
+
+/**
+ * 打印用法说明
+ *
+ * @return void
+ */
+function printUsage(): void
+{
+    echo "用法: xhjobctl <command> [options]\n\n";
+    echo "服务命令:\n";
+    echo "  start           启动 daemon\n";
+    echo "  stop            停止 daemon\n";
+    echo "  restart         重启 daemon\n";
+    echo "  status          查看 daemon 状态\n";
+    echo "  health          健康检查\n\n";
+    echo "任务命令:\n";
+    echo "  list            列出任务 (--state=, --tag=)\n";
+    echo "  get             查看任务详情 (--id=)\n";
+    echo "  run             运行/重新入队任务 (--id=)\n";
+    echo "  stop-task       停止/取消任务 (--id=)\n";
+    echo "  restart-task    重启任务 (--id=)\n";
+    echo "  logs            查看任务日志 (--id=, --tail=)\n";
+    echo "  dispatch        派发新任务 (--type=shell, --cmd=, --cron=)\n\n";
+    echo "全局选项:\n";
+    echo "  --name=         服务名 (默认: default)\n";
+    echo "  --data-dir=     数据目录\n\n";
+    echo "环境变量:\n";
+    echo "  XHJOB_SERVICE   默认服务名\n";
+    echo "  XHJOB_DATA_DIR   默认数据目录\n";
+}
