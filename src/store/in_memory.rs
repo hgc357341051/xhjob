@@ -174,6 +174,10 @@ impl TaskStore for InMemoryStore {
                 TaskState::Pending => {
                     task.state = TaskState::Cancelled;
                     task.finished_at = Some(crate::store::now_ts());
+                    // H5 fix: record a Cancelled event so the audit log is
+                    // complete for directly-cancelled pending tasks.
+                    drop(guard);
+                    let _ = self.record_event(&id, super::EventType::Cancelled, None, crate::store::now_ts() as i64).await;
                 }
                 TaskState::Running => {
                     task.cancel_requested = true;
@@ -294,7 +298,15 @@ impl TaskStore for InMemoryStore {
             let now = crate::store::now_ts();
             let mut reset = 0u64;
             for task in guard.values_mut() {
-                if task.state == TaskState::Running && task.acks_late {
+                if task.state == TaskState::Running {
+                    // P0 fix (C1): reset ALL running tasks on startup, not
+                    // just acks_late ones. A daemon crash leaves Running tasks
+                    // with no worker executing them — without this reset they
+                    // stay Running forever and are never re-enqueued (scan
+                    // only picks up Pending). The old code only reset
+                    // acks_late=true tasks, meaning the majority of tasks
+                    // (acks_late defaults to false) were silently orphaned
+                    // on every unclean restart.
                     task.state = TaskState::Pending;
                     task.next_fire = Some(now);
                     // Clear started_at / finished_at so the next execution

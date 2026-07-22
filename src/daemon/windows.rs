@@ -59,7 +59,18 @@ pub fn spawn_via_create_process(
     }
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    // H8 fix: redirect stderr to the log file instead of null, so panic
+    // traces and tracing output are preserved on Windows (mirroring the
+    // Unix daemon path). Without this, production debugging on Windows
+    // is impossible — all stderr output is permanently lost.
+    let log_path = super::log_file_path(&service_name, data_dir);
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(std::process::Stdio::from)
+        .unwrap_or(std::process::Stdio::null());
+    cmd.stderr(stderr);
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 
     cmd.spawn().map_err(XhjobError::Io)?;

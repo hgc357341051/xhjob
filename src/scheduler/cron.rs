@@ -108,6 +108,55 @@ impl CronScheduler {
         Self { store }
     }
 
+    /// H4 fix: re-arm `run_at` one-shot tasks that got stuck by a daemon crash.
+    ///
+    /// When a `run_at` task fires, `scan_once` sets `next_fire = u64::MAX`
+    /// (sentinel) and enqueues the task; `process_one` is then expected to
+    /// transition it to Success terminal. If the daemon crashes between the
+    /// sentinel write and `process_one` running, the task is left with
+    /// `state = Pending && next_fire = u64::MAX` — `scan_once` will never
+    /// re-fire it (`u64::MAX <= now` is false forever), so the task is
+    /// permanently stuck.
+    ///
+    /// This method is called once at daemon startup (after
+    /// `reset_running_to_pending`) to detect such stuck tasks and reset
+    /// `next_fire = now`, so the next scan tick re-fires them.
+    ///
+    /// Returns the number of tasks re-armed.
+    pub async fn rearm_stuck_run_at_tasks(&self) -> Result<u64> {
+        let now = now_ts();
+        let active = self.store.load_active_tasks().await?;
+        let mut rearmed: u64 = 0;
+        for task in active {
+            if task.run_at.is_some()
+                && task.state == TaskState::Pending
+                && task.next_fire == Some(u64::MAX)
+            {
+                if let Err(e) = self.store.update_next_fire(&task.id, Some(now)).await {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "rearm_stuck_run_at_tasks: update_next_fire failed"
+                    );
+                    continue;
+                }
+                rearmed += 1;
+                tracing::info!(
+                    task_id = %task.id,
+                    run_at = task.run_at.unwrap(),
+                    "rearm_stuck_run_at_tasks: re-armed stuck run_at task (was next_fire=u64::MAX, Pending)"
+                );
+            }
+        }
+        if rearmed > 0 {
+            tracing::info!(
+                rearmed,
+                "H4: re-armed stuck run_at one-shot tasks on daemon startup"
+            );
+        }
+        Ok(rearmed)
+    }
+
     /// Scan active cron tasks once and return the list of task IDs that should fire now.
     pub async fn scan_once(&self) -> Result<Vec<String>> {
         let now = now_ts();
@@ -673,6 +722,71 @@ mod tests {
         // A second scan should NOT re-fire (next_fire is far future).
         let due2 = sched.scan_once().await.unwrap();
         assert!(due2.is_empty(), "expected no re-fire for runAt task with sentinel next_fire, got {:?}", due2);
+    }
+
+    /// H4 fix: a `run_at` one-shot task left stuck by a daemon crash
+    /// (state=Pending + next_fire=u64::MAX sentinel) must be re-armed by
+    /// `rearm_stuck_run_at_tasks()` at daemon startup so the next scan tick
+    /// re-fires it. Without this recovery, the task is permanently stuck
+    /// because `u64::MAX <= now` is always false.
+    /// Reference: APScheduler DateTrigger misfire recovery.
+    #[tokio::test]
+    async fn test_rearm_stuck_run_at_tasks() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let now = now_ts();
+        // Simulate a crashed runAt task: fired once (next_fire=u64::MAX
+        // sentinel) but daemon died before process_one transitioned it to
+        // Success. It's stuck Pending + sentinel forever.
+        let mut stuck = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo s"}));
+        stuck.id = "t-stuck".to_string();
+        stuck.run_at = Some((now - 60) as i64);
+        stuck.state = TaskState::Pending;
+        stuck.next_fire = Some(u64::MAX); // sentinel from prior scan_once
+        store.insert_task(stuck).await.unwrap();
+
+        // A normal scan should NOT re-fire the stuck task (sentinel is far future).
+        let sched = CronScheduler::new(Arc::clone(&store));
+        let due = sched.scan_once().await.unwrap();
+        assert!(due.is_empty(), "stuck runAt task with sentinel should not fire");
+
+        // rearm_stuck_run_at_tasks should re-arm it (reset next_fire = now).
+        let rearmed = sched.rearm_stuck_run_at_tasks().await.unwrap();
+        assert_eq!(rearmed, 1, "one stuck task should be re-armed");
+
+        // Now next scan should fire it.
+        let due2 = sched.scan_once().await.unwrap();
+        assert_eq!(due2, vec!["t-stuck".to_string()], "re-armed task should fire on next scan");
+
+        // Simulate process_one completing the task (transition to terminal),
+        // so it's no longer stuck on the next rearm call. In the real daemon
+        // flow, this is done by process_one after the executor runs.
+        store.update_state("t-stuck", TaskState::Success, None, Some(now_ts())).await.unwrap();
+
+        // Tasks that are NOT stuck must be left alone:
+        // - runAt task that has NOT fired yet (next_fire = run_at, state=Pending)
+        let mut fresh = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo f"}));
+        fresh.id = "t-fresh".to_string();
+        fresh.run_at = Some((now + 100) as i64);
+        fresh.state = TaskState::Pending;
+        fresh.next_fire = Some((now + 100) as u64);
+        store.insert_task(fresh).await.unwrap();
+        // - cron task with sentinel next_fire (should not match run_at filter)
+        let mut cron_sentinel = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo c"}));
+        cron_sentinel.id = "t-cron-sentinel".to_string();
+        cron_sentinel.cron = Some("0 * * * * *".to_string());
+        cron_sentinel.state = TaskState::Pending;
+        cron_sentinel.next_fire = Some(u64::MAX); // weird but defensive
+        store.insert_task(cron_sentinel).await.unwrap();
+        // - terminal runAt task (already Success) with sentinel — should not re-arm
+        let mut done = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo d"}));
+        done.id = "t-done".to_string();
+        done.run_at = Some((now - 120) as i64);
+        done.state = TaskState::Success;
+        done.next_fire = Some(u64::MAX);
+        store.insert_task(done).await.unwrap();
+
+        let rearmed2 = sched.rearm_stuck_run_at_tasks().await.unwrap();
+        assert_eq!(rearmed2, 0, "non-stuck tasks (fresh/future, cron, terminal) should not be re-armed");
     }
 
     /// Jitter (A9): when set on an interval task, scan_once advances

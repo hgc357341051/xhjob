@@ -1391,7 +1391,9 @@ mod tests {
     /// acksLate (C10): `reset_running_to_pending` only resets Running tasks
     /// with `acks_late=true` to Pending + next_fire=now. Running tasks with
     /// `acks_late=false` are left untouched (Celery "ack early" semantics).
-    /// Reference: Celery acks_late.
+    /// Reference: Celery acks_late. P0 fix (C1): now ALL running tasks are
+    /// reset on startup, not just acks_late ones. A daemon crash leaves
+    /// Running tasks with no worker — without reset they're orphaned forever.
     #[tokio::test]
     async fn test_reset_running_to_pending_only_acks_late() {
         let store = InMemoryStore::new();
@@ -1404,7 +1406,7 @@ mod tests {
         t_late.started_at = Some(now_ts().saturating_sub(10));
         store.insert_task(t_late).await.unwrap();
 
-        // acks_late=false Running task — should NOT be reset.
+        // acks_late=false Running task — P0 fix (C1): now ALSO reset.
         let mut t_early = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo early"}));
         t_early.id = "t-running-early".to_string();
         t_early.state = TaskState::Running;
@@ -1413,7 +1415,7 @@ mod tests {
         store.insert_task(t_early).await.unwrap();
 
         let reset = store.reset_running_to_pending().await.unwrap();
-        assert_eq!(reset, 1, "only the acks_late=true Running task should be reset");
+        assert_eq!(reset, 2, "ALL running tasks should be reset on startup (C1 fix)");
 
         let loaded_late = store.load_task("t-running-late").await.unwrap().unwrap();
         assert_eq!(loaded_late.state, TaskState::Pending,
@@ -1426,10 +1428,10 @@ mod tests {
             "acks_late=true Running task should have finished_at cleared");
 
         let loaded_early = store.load_task("t-running-early").await.unwrap().unwrap();
-        assert_eq!(loaded_early.state, TaskState::Running,
-            "acks_late=false Running task should stay Running (ack early semantics)");
-        assert!(loaded_early.started_at.is_some(),
-            "acks_late=false Running task should keep its started_at");
+        assert_eq!(loaded_early.state, TaskState::Pending,
+            "acks_late=false Running task should ALSO be reset (C1 fix: orphan recovery)");
+        assert!(loaded_early.started_at.is_none(),
+            "acks_late=false Running task should have started_at cleared");
     }
 
     /// acksLate (C10): `reset_running_to_pending` does not affect Pending or

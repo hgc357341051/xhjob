@@ -330,6 +330,10 @@ fn build_command(cmd: &str) -> tokio::process::Command {
         // kill_on_drop: orphan-safety net for panic / early-return paths.
         c.kill_on_drop(true);
         // env_clear + minimal env: avoid leaking daemon env into user tasks.
+        // L3 fix: re-inject XHJOB_OWNER so shell tasks can perform owner-
+        // scoped actions (logging, audit). Other XHJOB_* daemon-internal
+        // vars (XHJOB_DAEMON_MODE, XHJOB_DATA_DIR, etc.) are intentionally
+        // NOT passed — they are daemon bookkeeping, not task context.
         c.env_clear();
         if let Ok(path) = std::env::var("PATH") {
             c.env("PATH", path);
@@ -339,6 +343,11 @@ fn build_command(cmd: &str) -> tokio::process::Command {
         if let Ok(home) = std::env::var("HOME") {
             if !home.is_empty() {
                 c.env("HOME", home);
+            }
+        }
+        if let Ok(owner) = std::env::var("XHJOB_OWNER") {
+            if !owner.is_empty() {
+                c.env("XHJOB_OWNER", owner);
             }
         }
         c

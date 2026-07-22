@@ -1,5 +1,7 @@
 //! HTTP executor based on reqwest.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use crate::errors::{Result, XhjobError};
 use crate::store::{Task, TaskResult, HttpPayload};
@@ -143,6 +145,9 @@ impl Executor for HttpExecutor {
                 "DELETE" => reqwest::Method::DELETE,
                 "PATCH" => reqwest::Method::PATCH,
                 "HEAD" => reqwest::Method::HEAD,
+                // H4 fix: OPTIONS is a valid HTTP method (CORS preflight,
+                // health probes, REST discovery). Previously rejected.
+                "OPTIONS" => reqwest::Method::OPTIONS,
                 other => return Err(XhjobError::exec(format!("unsupported method: {}", other))),
             };
 
@@ -202,6 +207,38 @@ impl Executor for HttpExecutor {
                 stderr: None,
                 exit_code: None,
             })
+        })
+    }
+
+    /// H3 fix: HTTP executor with cancel support. Wraps the request future in
+    /// `tokio::select!` against the cancel flag. When cancel is requested,
+    /// the reqwest future is dropped (aborting the in-flight TCP connection),
+    /// and we return a "cancelled" error so the queue can record the event
+    /// and not retry (cancel_requested is checked upstream).
+    fn execute_with_cancel<'a>(&'a self, task: &'a Task, cancel_flag: Option<Arc<AtomicBool>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(XhjobError::exec("cancelled before start"));
+                }
+                // Race the execution against a cancel watcher. We poll the
+                // flag every 200ms while the HTTP request is in flight.
+                let exec_fut = self.execute(task);
+                tokio::pin!(exec_fut);
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut exec_fut => return result,
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                return Err(XhjobError::exec("cancelled during http request"));
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.execute(task).await
+            }
         })
     }
 }

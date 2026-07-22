@@ -192,6 +192,22 @@ async fn run_daemon() -> Result<()> {
     let queue = Arc::new(TaskQueue::new(Arc::clone(&store), Arc::clone(&overlap)));
     let cron = Arc::new(CronScheduler::new(Arc::clone(&store)));
 
+    // H4 fix: re-arm `run_at` one-shot tasks that got stuck by a daemon crash
+    // (state=Pending + next_fire=u64::MAX sentinel). Must run AFTER
+    // `reset_running_to_pending` and BEFORE the cron scan loop starts so the
+    // re-armed tasks are picked up by the next scan tick. Safe to call on the
+    // in-memory store (no-op when there are no tasks). Reference: APScheduler
+    // DateTrigger misfire recovery.
+    match cron.rearm_stuck_run_at_tasks().await {
+        Ok(n) if n > 0 => {
+            tracing::info!(rearmed = n, "H4: re-armed stuck run_at tasks on startup");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "rearm_stuck_run_at_tasks failed on startup");
+        }
+    }
+
     // Install worker_limits singleton (C5 + C8). Done before the queue
     // starts so queue.rs can poll the counters after each task completion.
     let _worker_limits = init_worker_limits();

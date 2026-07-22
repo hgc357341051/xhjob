@@ -612,10 +612,18 @@ impl TaskStore for SqliteStore {
                 ).map_err(|e| XhjobError::store(format!("cancel_task query: {}", e)))?;
                 // 大小写无关比较，兼容历史的大写存储与新的小写存储。
                 if state_str.eq_ignore_ascii_case("PENDING") {
+                    let now_ts = crate::store::now_ts() as i64;
                     conn.execute(
                         "UPDATE tasks SET state = 'cancelled', cancel_requested = 1, finished_at = ?1 WHERE id = ?2",
-                        params![crate::store::now_ts() as i64, id],
+                        params![now_ts, id],
                     ).map_err(|e| XhjobError::store(format!("cancel_task update: {}", e)))?;
+                    // H5 fix: record a Cancelled event so the audit log is complete.
+                    // Previously Pending→Cancelled recorded no event, breaking
+                    // xhjob_events dashboards for directly-cancelled tasks.
+                    let _ = conn.execute(
+                        "INSERT INTO events (task_id, event_type, payload, ts) VALUES (?1, ?2, ?3, ?4)",
+                        params![id, "cancelled", "", now_ts],
+                    );
                 } else if state_str.eq_ignore_ascii_case("RUNNING") {
                     conn.execute(
                         "UPDATE tasks SET cancel_requested = 1 WHERE id = ?1",
@@ -793,16 +801,19 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 let now = crate::store::now_ts();
-                // Reset Running tasks with acks_late=1 to Pending + next_fire=now.
-                // Clear started_at / finished_at so the next execution records
-                // fresh timestamps.
+                // P0 fix (C1): reset ALL running tasks on startup, not just
+                // acks_late ones. A daemon crash leaves Running tasks with no
+                // worker executing them — without this reset they stay Running
+                // forever and are never re-enqueued (scan only picks up Pending).
+                // The old code only reset acks_late=1 tasks, meaning the majority
+                // (acks_late defaults to false) were silently orphaned.
                 let changed = conn.execute(
                     "UPDATE tasks
                      SET state = 'pending',
                          next_fire = ?1,
                          started_at = NULL,
                          finished_at = NULL
-                     WHERE state IN ('running', 'RUNNING') AND acks_late = 1",
+                     WHERE state IN ('running', 'RUNNING')",
                     params![now],
                 ).map_err(|e| XhjobError::store(format!("reset_running_to_pending update: {}", e)))?;
                 Ok(changed as u64)
