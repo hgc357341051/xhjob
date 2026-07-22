@@ -27,6 +27,7 @@ use think\Facade;
  * @method static string create(TaskBuilder $b)
  * @method static string createChain(array $builders)
  * @method static string createGroup(array $builders)
+ * @method static string createChord(array $headerBuilders, TaskBuilder $callback)
  * @method static string update(string $id, TaskBuilder $b)
  * @method static array|null get(string $id)
  * @method static array list(?string $stateFilter = null, ?string $tag = null)
@@ -41,6 +42,7 @@ use think\Facade;
  * @method static bool reschedule(string $id, string $cron)
  * @method static array|null chainState(string $chainId)
  * @method static array|null groupState(string $groupId)
+ * @method static array|null chordState(string $chordId)
  * @method static bool waitForState(string $id, string $expectedState, int $timeoutSec = 30)
  * @method static array|null waitForResult(string $id, int $timeoutSec = 30)
  */

@@ -272,6 +272,19 @@ pub struct Task {
     /// `acks_late`. Reference: Celery acks_on_failure.
     #[serde(default = "default_acks_on_failure_true")]
     pub acks_on_failure: bool,
+    /// Progress percent (0-100). None = not reported yet.
+    /// Reference: Celery update_state(state='PROGRESS', meta=...).
+    #[serde(default)]
+    pub progress: Option<u8>,
+    /// Arbitrary JSON metadata accompanying the latest progress report.
+    /// Reference: Celery update_state meta.
+    #[serde(default)]
+    pub progress_meta: Option<String>,
+    /// Optional chord callback correlation id. When set, this task is part
+    /// of a chord and the callback should fire after the chord completes.
+    /// Reference: Celery chord.
+    #[serde(default)]
+    pub chord_id: Option<String>,
 }
 
 fn default_acks_on_failure_true() -> bool { true }
@@ -324,6 +337,9 @@ impl Task {
             rate_limit_count: 0,
             rate_limit_window: 0,
             acks_on_failure: true,
+            progress: None,
+            progress_meta: None,
+            chord_id: None,
         }
     }
 }
@@ -359,6 +375,10 @@ pub struct TaskSummary {
     pub finished_at: Option<u64>,
     /// Tags (A15): user-supplied labels for grouping / filtering.
     pub tags: Vec<String>,
+    /// Progress percent (0-100). None = not reported yet.
+    pub progress: Option<u8>,
+    /// Optional chord callback correlation id.
+    pub chord_id: Option<String>,
 }
 
 impl From<&Task> for TaskSummary {
@@ -380,8 +400,28 @@ impl From<&Task> for TaskSummary {
             created_at: t.created_at,
             finished_at: t.finished_at,
             tags: t.tags.clone(),
+            progress: t.progress,
+            chord_id: t.chord_id.clone(),
         }
     }
+}
+
+/// Aggregate worker / queue statistics. Returned by `worker_stats()`.
+/// Reference: Celery inspect stats.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerStats {
+    /// Total number of tasks tracked by the store.
+    pub total: u32,
+    /// Tasks in Pending state.
+    pub pending: u32,
+    /// Tasks in Running state.
+    pub running: u32,
+    /// Tasks in Success terminal state.
+    pub success: u32,
+    /// Tasks in Failed terminal state.
+    pub failed: u32,
+    /// Number of tasks with a future `next_fire` (queue depth).
+    pub queue_depth: u32,
 }
 
 /// Event types emitted during task lifecycle (A17).
@@ -465,6 +505,24 @@ pub struct GroupRecord {
     pub tasks: Vec<serde_json::Value>,
     /// "pending" / "running" / "success" / "partial_failed" / "failed"
     /// （"success"/"failed" 与 TaskState::as_str() 一致）。
+    pub state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Chord record (C16+). A chord = header (parallel tasks) + body (callback).
+/// When all header tasks succeed, the body is dispatched with meta carrying
+/// all header results. If any header fails, chord -> partial_failed.
+/// Reference: Celery chord.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChordRecord {
+    pub id: String,
+    /// Header task ids (the parallel tasks).
+    pub header_task_ids: Vec<String>,
+    /// The callback TaskBuilder JSON (serialized). Dispatched when all headers succeed.
+    pub callback_json: String,
+    /// Dispatched callback task id (None until body is dispatched).
+    pub callback_task_id: Option<String>,
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -582,6 +640,46 @@ pub trait TaskStore: Send + Sync {
 
     /// List groups by state (for daemon restart recovery).
     fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>>;
+
+    // ----- Task chord (C16+) -----
+
+    /// Create a new chord record. The header task ids and the serialized
+    /// callback TaskBuilder JSON are persisted. The chord starts in the
+    /// "pending" state and transitions to "running" / "success" /
+    /// "partial_failed" as header tasks complete.
+    /// Reference: Celery chord.
+    fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// Load a chord record by id.
+    fn get_chord(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>>;
+
+    /// Update chord state and (optionally) record the dispatched callback
+    /// task id. Pass `callback_task_id = None` to leave it unchanged; pass
+    /// `Some(id)` when the body has just been dispatched.
+    fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    // ----- Progress / inspect (Task 1-5) -----
+
+    /// Update progress (0-100) and optional meta JSON for a task.
+    /// Reference: Celery update_state(state='PROGRESS', meta=...).
+    fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// List summaries of all currently running tasks.
+    /// Reference: Celery inspect active.
+    fn list_active_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+
+    /// List summaries of all registered (cron / interval) tasks.
+    /// Reference: Celery inspect registered.
+    fn list_registered_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+
+    /// List summaries of all tasks scheduled to fire after `now`
+    /// (next_fire.is_some() && next_fire > now).
+    /// Reference: Celery inspect scheduled.
+    fn list_scheduled_summary(&self, now: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+
+    /// Aggregate worker / queue statistics.
+    /// Reference: Celery inspect stats.
+    fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>>;
 }
 
 /// Choose store backend based on persist flag.

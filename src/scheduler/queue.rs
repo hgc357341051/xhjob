@@ -544,6 +544,12 @@ fn extract_meta_id(task: &crate::store::Task, key: &str) -> Option<String> {
 ///
 /// Group (C16): refresh the group state from the live task states
 /// regardless of which terminal state this task reached.
+///
+/// Chord (C16+): if the task carries a `chord_id`, refresh the chord
+/// state. When all header tasks have succeeded the chord dispatches the
+/// callback (inserted into the store by `refresh_state`) and returns its
+/// task id here for enqueuing. If any header failed, the chord flips to
+/// `partial_failed` and the callback is not dispatched.
 async fn notify_chain_and_group(
     queue: &Arc<TaskQueue>,
     store: &Arc<dyn TaskStore>,
@@ -566,6 +572,48 @@ async fn notify_chain_and_group(
     if let Some(group_id) = extract_meta_id(task, "xhjob_group_id") {
         if let Err(e) = crate::scheduler::group::refresh_state(store, &group_id).await {
             tracing::warn!(error = %e, group_id = %group_id, "group refresh_state failed");
+        }
+    }
+    // Chord (C16+): refresh chord state on every header-task terminal
+    // transition (success or failure — a failure flips the chord to
+    // partial_failed so the body is never dispatched).
+    if let Some(ref chord_id) = task.chord_id {
+        match crate::scheduler::chord::refresh_state(store, chord_id).await {
+            Ok(result) => {
+                if let Some(callback_id) = result.callback_task_id {
+                    // The callback task was already inserted into the store
+                    // by refresh_state; load it to recover its priority and
+                    // enqueue it on the in-memory queue.
+                    match store.load_task(&callback_id).await {
+                        Ok(Some(t)) => {
+                            if let Err(e) = queue.enqueue(&callback_id, t.priority).await {
+                                tracing::warn!(
+                                    error = %e, chord_id = %chord_id,
+                                    callback_id = %callback_id,
+                                    "chord callback enqueue failed"
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                chord_id = %chord_id,
+                                callback_id = %callback_id,
+                                "chord callback task not found after refresh_state"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e, chord_id = %chord_id,
+                                callback_id = %callback_id,
+                                "chord callback load failed"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, chord_id = %chord_id, "chord refresh_state failed");
+            }
         }
     }
 }

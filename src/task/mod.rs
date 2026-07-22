@@ -164,6 +164,13 @@ pub struct TaskBuilder {
     /// Reference: Celery acks_on_failure.
     #[serde(default = "default_acks_on_failure_true")]
     pub acks_on_failure: bool,
+    /// Countdown (Celery apply_async(countdown=N)): relative delay in
+    /// seconds. Equivalent to `run_at(now + countdown)`. When both
+    /// `countdown` and `run_at` are set, `run_at` takes precedence and a
+    /// warn is logged. None = no countdown.
+    /// Reference: Celery apply_async(countdown=N).
+    #[serde(default)]
+    pub countdown: Option<u64>,
 }
 
 fn default_acks_on_failure_true() -> bool { true }
@@ -234,6 +241,7 @@ impl Default for TaskBuilder {
             rate_limit_count: 0,
             rate_limit_window: 0,
             acks_on_failure: true,
+            countdown: None,
         }
     }
 }
@@ -587,6 +595,16 @@ impl TaskBuilder {
         self
     }
 
+    /// Countdown (Celery apply_async(countdown=N)): relative delay in seconds.
+    /// Equivalent to run_at(now + countdown). When both countdown and run_at
+    /// are set, run_at takes precedence and a warn is logged.
+    /// Exposed as `countdown(int $secs)` in PHP.
+    /// Reference: Celery apply_async(countdown=N).
+    pub fn countdown(mut self, secs: u64) -> Self {
+        self.countdown = Some(secs);
+        self
+    }
+
     /// Build the final Task struct (without dispatching).
     pub fn build(self) -> Result<Task> {
         let task_type = self.task_type.ok_or_else(|| XhjobError::InvalidTask(
@@ -629,6 +647,20 @@ impl TaskBuilder {
         if task.start_date == Some(0) { task.start_date = None; }
         if task.end_date == Some(0) { task.end_date = None; }
         if task.soft_timeout == Some(0) { task.soft_timeout = None; }
+        // countdown 归一化：countdown 与 run_at 同时设置时 run_at 优先。
+        // countdown==0 视为未设置（无延迟）。当 run_at 未设置但 countdown
+        // 已设置时，转换为 run_at = now + countdown，复用既有 DateTrigger 路径。
+        if self.countdown == Some(0) {
+            // 0 延迟无意义，等同于不设置。
+        } else if let Some(cd) = self.countdown {
+            if task.run_at.is_none() {
+                task.run_at = Some(now_ts() as i64 + cd as i64);
+            } else {
+                tracing::warn!(
+                    "both countdown and run_at set; run_at takes precedence"
+                );
+            }
+        }
         // A14: explicit id — if set, override the auto-generated UUID.
         if let Some(id) = self.id {
             task.id = id;

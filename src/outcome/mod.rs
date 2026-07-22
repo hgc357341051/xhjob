@@ -69,6 +69,14 @@ pub struct StateInfo {
     pub timezone: Option<String>,
     /// coalesce (A18): whether to collapse missed triggers into one fire.
     pub coalesce: bool,
+    /// Progress percent (0-100). None = not reported yet.
+    /// Reference: Celery update_state(state='PROGRESS', meta=...).
+    #[serde(default)]
+    pub progress: Option<u8>,
+    /// Arbitrary JSON metadata accompanying the latest progress report.
+    /// Reference: Celery update_state meta.
+    #[serde(default)]
+    pub progress_meta: Option<String>,
 }
 
 impl StateInfo {
@@ -102,6 +110,8 @@ impl StateInfo {
             acks_on_failure: task.acks_on_failure,
             timezone: task.timezone.clone(),
             coalesce: task.coalesce,
+            progress: task.progress,
+            progress_meta: task.progress_meta.clone(),
         }
     }
 }

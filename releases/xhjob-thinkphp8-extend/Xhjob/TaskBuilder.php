@@ -27,6 +27,7 @@ use Xhjob\Exception\InvalidTaskConfigException;
  *   - http($method, $url)     构建 http 任务
  *   - chain(array $builders)  构建任务链（dispatch 时调用 xhjob_chain）
  *   - group(array $builders)  构建任务组（dispatch 时调用 xhjob_group）
+ *   - chord(array $headers, self $callback)  构建 chord（dispatch 时调用 xhjob_chord）
  *   - fromJson($json)         从 JSON 字符串反序列化
  */
 class TaskBuilder
@@ -39,6 +40,12 @@ class TaskBuilder
 
     /** @var array|null group 模式下的子 builder 列表 */
     protected $groupBuilders = null;
+
+    /** @var array|null chord 模式下的 header builder 列表 */
+    protected $chordHeaderBuilders = null;
+
+    /** @var self|null chord 模式下的回调 builder */
+    protected $chordCallbackBuilder = null;
 
     /**
      * 内部构造方法（请使用静态工厂 shell / http / chain / group / fromJson）
@@ -83,6 +90,7 @@ class TaskBuilder
             'rate_limit_count'    => 0,
             'rate_limit_window'   => 0,
             'acks_on_failure'     => true,
+            'countdown'           => null,
         ];
     }
 
@@ -161,6 +169,27 @@ class TaskBuilder
     }
 
     /**
+     * 创建 chord（header + body 回调）
+     *
+     * dispatch 时调用 xhjob_chord，并行执行所有 header 任务，
+     * 全部成功后执行 callback 任务，callback 的 meta 携带所有 header 结果。
+     * 任一 header 失败时 chord 转 partial_failed 终态，不派发 callback。
+     * 参考 Celery chord。
+     *
+     * @param array $headerBuilders TaskBuilder 实例数组（header）
+     * @param self  $callback       回调 TaskBuilder（body）
+     *
+     * @return self
+     */
+    public static function chord(array $headerBuilders, self $callback): self
+    {
+        $b = new static();
+        $b->chordHeaderBuilders = array_values($headerBuilders);
+        $b->chordCallbackBuilder = $callback;
+        return $b;
+    }
+
+    /**
      * 从 JSON 字符串反序列化构建器
      *
      * @param string $json TaskBuilder JSON 字符串
@@ -215,6 +244,22 @@ class TaskBuilder
     public function runAt(int $ts): self
     {
         $this->config['run_at'] = $ts;
+        return $this;
+    }
+
+    /**
+     * 设置倒计时延迟（秒）
+     *
+     * 等价于 runAt(time() + $secs)。与 runAt 同时设置时 runAt 优先。
+     * 参考 Celery apply_async(countdown=N)。
+     *
+     * @param int $secs 延迟秒数
+     *
+     * @return self
+     */
+    public function countdown(int $secs): self
+    {
+        $this->config['countdown'] = $secs;
         return $this;
     }
 
@@ -624,11 +669,12 @@ class TaskBuilder
      *   - 普通 builder：xhjob_dispatch
      *   - chain builder：xhjob_chain
      *   - group builder：xhjob_group
+     *   - chord builder：xhjob_chord
      *
      * @param string|null $service  服务名（null 表示使用默认）
      * @param string|null $dataDir  数据目录（null 表示使用默认）
      *
-     * @return string task_id / chain_id / group_id
+     * @return string task_id / chain_id / group_id / chord_id
      *
      * @throws InvalidTaskConfigException 当 daemon 返回 "error: ..." 时
      */
@@ -644,6 +690,14 @@ class TaskBuilder
                 return $b->toArray();
             }, $this->groupBuilders));
             $result = xhjob_group($tasksJson, $service, $dataDir);
+        } elseif ($this->chordHeaderBuilders !== null) {
+            $headerJson = json_encode(array_map(function (TaskBuilder $b) {
+                return $b->toArray();
+            }, $this->chordHeaderBuilders));
+            $callbackJson = $this->chordCallbackBuilder !== null
+                ? $this->chordCallbackBuilder->toJson()
+                : '{}';
+            $result = xhjob_chord($headerJson, $callbackJson, $service, $dataDir);
         } else {
             $result = xhjob_dispatch($this->toJson(), $service, $dataDir);
         }

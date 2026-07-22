@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use crate::errors::{Result, XhjobError};
-use super::{Task, TaskResult, TaskState, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord};
+use super::{Task, TaskResult, TaskState, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord, ChordRecord, WorkerStats};
 
 pub struct InMemoryStore {
     tasks: RwLock<HashMap<String, Task>>,
@@ -11,6 +11,7 @@ pub struct InMemoryStore {
     events: RwLock<Vec<TaskEvent>>,
     chains: RwLock<HashMap<String, ChainRecord>>,
     groups: RwLock<HashMap<String, GroupRecord>>,
+    chords: RwLock<HashMap<String, ChordRecord>>,
 }
 
 impl InMemoryStore {
@@ -21,6 +22,7 @@ impl InMemoryStore {
             events: RwLock::new(Vec::new()),
             chains: RwLock::new(HashMap::new()),
             groups: RwLock::new(HashMap::new()),
+            chords: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -450,6 +452,130 @@ impl TaskStore for InMemoryStore {
                 .collect();
             out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
             Ok(out)
+        })
+    }
+
+    // ----- Task chord (C16+) -----
+
+    fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        let header_task_ids = header_task_ids.to_vec();
+        let callback_json = callback_json.to_string();
+        Box::pin(async move {
+            let mut guard = self.chords.write().await;
+            guard.insert(id.clone(), ChordRecord {
+                id,
+                header_task_ids,
+                callback_json,
+                callback_task_id: None,
+                state: "pending".to_string(),
+                created_at,
+                updated_at: created_at,
+            });
+            Ok(())
+        })
+    }
+
+    fn get_chord(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let guard = self.chords.read().await;
+            Ok(guard.get(&id).cloned())
+        })
+    }
+
+    fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let mut guard = self.chords.write().await;
+            if let Some(c) = guard.get_mut(&id) {
+                c.state = state;
+                if let Some(cid) = callback_task_id {
+                    c.callback_task_id = Some(cid);
+                }
+                c.updated_at = updated_at;
+            }
+            Ok(())
+        })
+    }
+
+    // ----- Progress / inspect (Task 1-5) -----
+
+    fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let mut guard = self.tasks.write().await;
+            let task = guard.get_mut(&id)
+                .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
+            task.progress = Some(percent);
+            task.progress_meta = meta;
+            Ok(())
+        })
+    }
+
+    fn list_active_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.tasks.read().await;
+            let mut out: Vec<TaskSummary> = guard.values()
+                .filter(|t| t.state == TaskState::Running)
+                .map(TaskSummary::from)
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(out)
+        })
+    }
+
+    fn list_registered_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.tasks.read().await;
+            let mut out: Vec<TaskSummary> = guard.values()
+                .filter(|t| t.cron.is_some() || t.interval.is_some())
+                .map(TaskSummary::from)
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(out)
+        })
+    }
+
+    fn list_scheduled_summary(&self, now: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.tasks.read().await;
+            let mut out: Vec<TaskSummary> = guard.values()
+                .filter(|t| t.next_fire.map(|nf| nf > now).unwrap_or(false))
+                .map(TaskSummary::from)
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(out)
+        })
+    }
+
+    fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>> {
+        Box::pin(async move {
+            let guard = self.tasks.read().await;
+            let mut stats = WorkerStats {
+                total: 0,
+                pending: 0,
+                running: 0,
+                success: 0,
+                failed: 0,
+                queue_depth: 0,
+            };
+            let now = crate::store::now_ts();
+            for t in guard.values() {
+                stats.total += 1;
+                match t.state {
+                    TaskState::Pending => stats.pending += 1,
+                    TaskState::Running => stats.running += 1,
+                    TaskState::Success => stats.success += 1,
+                    TaskState::Failed => stats.failed += 1,
+                    _ => {}
+                }
+                if t.next_fire.map(|nf| nf > now).unwrap_or(false) {
+                    stats.queue_depth += 1;
+                }
+            }
+            Ok(stats)
         })
     }
 }

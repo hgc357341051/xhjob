@@ -268,6 +268,11 @@ async fn handle_connection(
         "chain_state" => handle_chain_state_op(&store, req.payload).await,
         "group" => handle_group_op(&store, &queue, req.payload).await,
         "group_state" => handle_group_state_op(&store, req.payload).await,
+        "chord" => handle_chord_op(&store, &queue, req.payload).await,
+        "chord_state" => handle_chord_state_op(&store, req.payload).await,
+        "report_progress" => handle_report_progress_op(&store, req.payload).await,
+        "pull_events" => handle_pull_events_op(&store, req.payload).await,
+        "inspect" => handle_inspect_op(&store, req.payload).await,
         "stats" => handle_stats_op(req.payload).await,
         "ping" => Ok(Response::success(req.id, serde_json::json!({"pong": true}))),
         other => Ok(Response::error(req.id, format!("unknown op: {}", other))),
@@ -313,8 +318,24 @@ async fn handle_dispatch(
             task.id
         )));
     }
+    // DateTrigger / countdown delay: when a task is a pure one-shot DateTrigger
+    // (run_at set, no cron, no interval) and next_fire lies in the future,
+    // do NOT enqueue immediately — let scan_once pick it up at next_fire time.
+    // This matches APScheduler DateTrigger and Celery countdown/eta semantics.
+    // cron/interval tasks are always enqueued immediately: process_one's
+    // next_fire check will skip premature execution and re-enqueue via the
+    // deferred-start_date path. Immediate (one-shot, no trigger) tasks have
+    // next_fire=None and are enqueued right away.
+    let now = store::now_ts();
+    let is_pure_date_trigger = task.run_at.is_some()
+        && task.cron.is_none()
+        && task.interval.is_none();
+    let should_defer = is_pure_date_trigger
+        && task.next_fire.map(|nf| nf > now).unwrap_or(false);
     store.insert_task(task).await?;
-    queue.enqueue(&task_id, priority).await?;
+    if !should_defer {
+        queue.enqueue(&task_id, priority).await?;
+    }
     Ok(Response::success(0, serde_json::json!({"task_id": task_id})))
 }
 
@@ -662,6 +683,171 @@ async fn handle_group_state_op(
         }
         None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
     }
+}
+
+/// Handler for `chord` op (C16+): create a chord (header + callback).
+///
+/// Payload:
+///   { "header": [<TaskBuilder JSON>, ...], "callback": <TaskBuilder JSON> }
+///
+/// Dispatches all header tasks concurrently (each tagged with the chord_id
+/// on its `chord_id` field so queue.rs can refresh the chord state on
+/// completion), then persists a ChordRecord carrying the serialized
+/// callback TaskBuilder. When all header tasks succeed, the chord's
+/// `refresh_state` builds the callback task (with `meta` set to the
+/// aggregated header results) and returns its id for the queue to enqueue.
+///
+/// Reference: Celery `chord(header, body)`.
+async fn handle_chord_op(
+    store: &Arc<dyn TaskStore>,
+    queue: &Arc<TaskQueue>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let header_arr = payload.get("header")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| XhjobError::Ipc("missing or invalid header array".to_string()))?;
+    if header_arr.is_empty() {
+        return Err(XhjobError::Ipc("chord requires at least one header task".to_string()));
+    }
+    let callback_json = payload.get("callback")
+        .ok_or_else(|| XhjobError::Ipc("missing callback".to_string()))?;
+    // Validate the callback config parses as a TaskBuilder up front so we
+    // can fail the IPC call before dispatching any header tasks.
+    let callback_str = serde_json::to_string(callback_json)
+        .map_err(|e| XhjobError::Ipc(format!("serialize callback: {}", e)))?;
+    if let Err(e) = TaskBuilder::from_json(&callback_str) {
+        return Err(XhjobError::Ipc(format!("invalid callback builder: {}", e)));
+    }
+
+    let chord_id = new_id();
+    let now = store::now_ts() as i64;
+    let mut header_ids: Vec<String> = Vec::with_capacity(header_arr.len());
+    for cfg in header_arr {
+        let builder = TaskBuilder::from_json(&cfg.to_string())?;
+        let mut task = builder.build()?;
+        // Tag the task with the chord_id so queue.rs can refresh the chord
+        // state on completion. Uses the dedicated `chord_id` field (no
+        // need to mash it into `meta`).
+        task.chord_id = Some(chord_id.clone());
+        let task_id = task.id.clone();
+        let priority = task.priority;
+        store.insert_task(task).await?;
+        queue.enqueue(&task_id, priority).await?;
+        header_ids.push(task_id);
+    }
+    store.create_chord(&chord_id, &header_ids, &callback_str, now).await?;
+    Ok(Response::success(0, serde_json::json!({"chord_id": chord_id})))
+}
+
+/// Handler for `chord_state` op (C16+): inspect a chord record by id.
+/// Returns `{"ok": true, "data": <chord_record>}` or
+/// `{"ok": false, "error": "not found"}`.
+/// Reference: Celery chord inspection.
+async fn handle_chord_state_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let chord_id = payload.get("chord_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing chord_id".to_string()))?;
+    match store.get_chord(chord_id).await? {
+        Some(record) => {
+            let data = serde_json::to_value(&record)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+            Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
+        }
+        None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
+    }
+}
+
+/// Handler for `report_progress` op: update a task's progress percent and
+/// optional meta JSON. Returns `{"updated": true}` on success.
+/// Reference: Celery update_state(state='PROGRESS', meta=...).
+async fn handle_report_progress_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+    let percent = payload.get("percent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u8;
+    if percent > 100 {
+        return Ok(Response::error(0, "percent must be 0-100".to_string()));
+    }
+    let meta = payload.get("meta")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    store.update_progress(id, percent, meta).await?;
+    Ok(Response::success(0, serde_json::json!({"updated": true})))
+}
+
+/// Handler for `pull_events` op: list task events since `since_ts` (Unix
+/// seconds), optionally filtered by `event_type` (A17). Returns
+/// `{"events": [...]}`.
+/// Reference: APScheduler EVENT_JOB_*.
+async fn handle_pull_events_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let since_ts = payload.get("since_ts")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let event_type_filter: Option<String> = payload.get("event_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let events = store.list_events(since_ts, None).await?;
+    let arr: Vec<serde_json::Value> = events.iter()
+        .filter(|e| match &event_type_filter {
+            Some(f) => e.event_type.as_str() == f.as_str(),
+            None => true,
+        })
+        .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
+        .collect();
+    Ok(Response::success(0, serde_json::json!({"events": arr})))
+}
+
+/// Handler for `inspect` op: aggregate query for daemon state.
+/// `mode` selects the query:
+///   - `"active"`     — currently running tasks (TaskSummary list)
+///   - `"registered"` — cron / interval tasks (TaskSummary list)
+///   - `"scheduled"`  — tasks with a future `next_fire` (TaskSummary list)
+///   - `"stats"`      — aggregate WorkerStats (default)
+/// Returns `{"data": <array_or_object>}`.
+/// Reference: Celery inspect active / registered / scheduled / stats.
+async fn handle_inspect_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let mode = payload.get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stats");
+    let data = match mode {
+        "active" => {
+            let tasks = store.list_active_summary().await?;
+            serde_json::to_value(&tasks)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+        }
+        "registered" => {
+            let tasks = store.list_registered_summary().await?;
+            serde_json::to_value(&tasks)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+        }
+        "scheduled" => {
+            let now = crate::store::now_ts();
+            let tasks = store.list_scheduled_summary(now).await?;
+            serde_json::to_value(&tasks)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+        }
+        _ => {
+            let stats = store.worker_stats().await?;
+            serde_json::to_value(&stats)
+                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+        }
+    };
+    Ok(Response::success(0, serde_json::json!({"data": data})))
 }
 
 /// Handler for `stats` op: snapshot daemon worker stats (C5 + C8).

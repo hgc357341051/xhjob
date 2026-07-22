@@ -253,6 +253,30 @@ mod tests {
         fn list_groups_by_state(&self, state: &str) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::GroupRecord>>> + Send + '_>> {
             self.inner.list_groups_by_state(state)
         }
+        fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.create_chord(id, header_task_ids, callback_json, created_at)
+        }
+        fn get_chord(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::ChordRecord>>> + Send + '_>> {
+            self.inner.get_chord(id)
+        }
+        fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.update_chord_state(id, state, callback_task_id, updated_at)
+        }
+        fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            self.inner.update_progress(id, percent, meta)
+        }
+        fn list_active_summary(&self) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
+            self.inner.list_active_summary()
+        }
+        fn list_registered_summary(&self) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
+            self.inner.list_registered_summary()
+        }
+        fn list_scheduled_summary(&self, now: u64) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
+            self.inner.list_scheduled_summary(now)
+        }
+        fn worker_stats(&self) -> Pin<Box<dyn Future<Output = Result<crate::store::WorkerStats>> + Send + '_>> {
+            self.inner.worker_stats()
+        }
     }
 
     /// A10: with `max_instances=2`, the controller should allow up to 2 concurrent

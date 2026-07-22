@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use rusqlite::{Connection, params, OptionalExtension};
 use crate::errors::{Result, XhjobError};
-use super::{Task, TaskType, TaskState, TaskResult, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord};
+use super::{Task, TaskType, TaskState, TaskResult, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord, ChordRecord, WorkerStats};
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -67,7 +67,10 @@ impl SqliteStore {
                 tags TEXT NOT NULL DEFAULT '[]',
                 rate_limit_count INTEGER NOT NULL DEFAULT 0,
                 rate_limit_window INTEGER NOT NULL DEFAULT 0,
-                acks_on_failure INTEGER NOT NULL DEFAULT 1
+                acks_on_failure INTEGER NOT NULL DEFAULT 1,
+                progress INTEGER,
+                progress_meta TEXT,
+                chord_id TEXT
             );
             CREATE TABLE IF NOT EXISTS results (
                 task_id      TEXT PRIMARY KEY,
@@ -102,6 +105,15 @@ impl SqliteStore {
                 created_at  INTEGER NOT NULL,
                 updated_at  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS chords (
+                id                TEXT PRIMARY KEY,
+                header_task_ids   TEXT NOT NULL,
+                callback_json     TEXT NOT NULL,
+                callback_task_id  TEXT,
+                state             TEXT NOT NULL DEFAULT 'pending',
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
             CREATE INDEX IF NOT EXISTS idx_tasks_next_fire ON tasks(next_fire);
             "#,
@@ -133,6 +145,10 @@ impl SqliteStore {
         // 这里补齐迁移以保证 schema 完整性。
         ensure_column(&conn, "timezone", "TEXT")?;
         ensure_column(&conn, "coalesce", "INTEGER NOT NULL DEFAULT 1")?;
+        // Task 1-5: progress / progress_meta / chord_id columns.
+        ensure_column(&conn, "progress", "INTEGER")?;
+        ensure_column(&conn, "progress_meta", "TEXT")?;
+        ensure_column(&conn, "chord_id", "TEXT")?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 }
@@ -218,6 +234,9 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         rate_limit_count: row.get::<_, i64>("rate_limit_count").unwrap_or(0) as u32,
         rate_limit_window: row.get::<_, i64>("rate_limit_window").unwrap_or(0) as u64,
         acks_on_failure: row.get::<_, i64>("acks_on_failure").unwrap_or(1) != 0,
+        progress: row.get::<_, Option<i64>>("progress").ok().flatten().map(|v| v as u8),
+        progress_meta: row.get::<_, Option<String>>("progress_meta").ok().flatten(),
+        chord_id: row.get::<_, Option<String>>("chord_id").ok().flatten(),
     })
 }
 
@@ -238,8 +257,9 @@ impl TaskStore for SqliteStore {
                   paused, cancel_requested, start_date, end_date, result_ttl, meta,
                   interval, run_at, jitter, expires, retry_backoff, ignore_result,
                   acks_late, soft_timeout, misfire_grace_time, replace_existing,
-                  tags, rate_limit_count, rate_limit_window, acks_on_failure)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
+                  tags, rate_limit_count, rate_limit_window, acks_on_failure,
+                  progress, progress_meta, chord_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)",
                 params![
                     task.id, type_str, payload_str, task.cron,
                     task.retry_max, task.retry_delay, task.timeout, task.priority,
@@ -261,6 +281,9 @@ impl TaskStore for SqliteStore {
                     task.rate_limit_count as i64,
                     task.rate_limit_window as i64,
                     task.acks_on_failure as i64,
+                    task.progress.map(|v| v as i64),
+                    task.progress_meta,
+                    task.chord_id,
                 ],
             ).map_err(|e| XhjobError::Store(format!("insert: {}", e)))?;
             Ok(())
@@ -865,6 +888,174 @@ impl TaskStore for SqliteStore {
                 if let Ok(g) = r { out.push(g); }
             }
             Ok(out)
+        })
+    }
+
+    // ----- Task chord (C16+) -----
+
+    fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        let header_task_ids = header_task_ids.to_vec();
+        let callback_json = callback_json.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let header_str = serde_json::to_string(&header_task_ids)
+                .unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "INSERT OR REPLACE INTO chords (id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, 'pending', ?4, ?4)",
+                params![id, header_str, callback_json, created_at],
+            ).map_err(|e| XhjobError::Store(format!("create_chord: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn get_chord(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at FROM chords WHERE id = ?1"
+            ).map_err(|e| XhjobError::Store(format!("get_chord prepare: {}", e)))?;
+            let mut rows = stmt.query_map(params![id], |row| {
+                let header_str: String = row.get(1)?;
+                let header_task_ids: Vec<String> = serde_json::from_str(&header_str).unwrap_or_default();
+                Ok(ChordRecord {
+                    id: row.get(0)?,
+                    header_task_ids,
+                    callback_json: row.get(2)?,
+                    callback_task_id: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            }).map_err(|e| XhjobError::Store(format!("get_chord query: {}", e)))?;
+            if let Some(row) = rows.next() {
+                if let Ok(c) = row { return Ok(Some(c)); }
+            }
+            Ok(None)
+        })
+    }
+
+    fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        let state = state.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            // Only overwrite callback_task_id when a new value is supplied
+            // (None means "leave unchanged" — the body id is set once when
+            // the callback is dispatched).
+            if let Some(cid) = callback_task_id {
+                conn.execute(
+                    "UPDATE chords SET state = ?1, callback_task_id = ?2, updated_at = ?3 WHERE id = ?4",
+                    params![state, cid, updated_at, id],
+                ).map_err(|e| XhjobError::Store(format!("update_chord_state: {}", e)))?;
+            } else {
+                conn.execute(
+                    "UPDATE chords SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![state, updated_at, id],
+                ).map_err(|e| XhjobError::Store(format!("update_chord_state: {}", e)))?;
+            }
+            Ok(())
+        })
+    }
+
+    // ----- Progress / inspect (Task 1-5) -----
+
+    fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let affected = conn.execute(
+                "UPDATE tasks SET progress = ?1, progress_meta = ?2 WHERE id = ?3",
+                params![percent as i64, meta, id],
+            ).map_err(|e| XhjobError::Store(format!("update_progress: {}", e)))?;
+            if affected == 0 {
+                return Err(XhjobError::TaskNotFound(id));
+            }
+            Ok(())
+        })
+    }
+
+    fn list_active_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM tasks WHERE state IN ('running', 'RUNNING') ORDER BY created_at ASC"
+            ).map_err(|e| XhjobError::Store(format!("list_active_summary prepare: {}", e)))?;
+            let rows = stmt.query_map([], task_from_row)
+                .map_err(|e| XhjobError::Store(format!("list_active_summary query: {}", e)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
+            }
+            Ok(out)
+        })
+    }
+
+    fn list_registered_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM tasks WHERE cron IS NOT NULL OR interval IS NOT NULL ORDER BY created_at ASC"
+            ).map_err(|e| XhjobError::Store(format!("list_registered_summary prepare: {}", e)))?;
+            let rows = stmt.query_map([], task_from_row)
+                .map_err(|e| XhjobError::Store(format!("list_registered_summary query: {}", e)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
+            }
+            Ok(out)
+        })
+    }
+
+    fn list_scheduled_summary(&self, now: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT * FROM tasks WHERE next_fire IS NOT NULL AND next_fire > ?1 ORDER BY created_at ASC"
+            ).map_err(|e| XhjobError::Store(format!("list_scheduled_summary prepare: {}", e)))?;
+            let rows = stmt.query_map(params![now], task_from_row)
+                .map_err(|e| XhjobError::Store(format!("list_scheduled_summary query: {}", e)))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
+            }
+            Ok(out)
+        })
+    }
+
+    fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks", [], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats total: {}", e)))?;
+            let pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state IN ('pending', 'PENDING')", [], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats pending: {}", e)))?;
+            let running: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state IN ('running', 'RUNNING')", [], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats running: {}", e)))?;
+            let success: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state IN ('success', 'SUCCESS')", [], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats success: {}", e)))?;
+            let failed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE state IN ('failed', 'FAILED')", [], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats failed: {}", e)))?;
+            let now = crate::store::now_ts();
+            let queue_depth: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE next_fire IS NOT NULL AND next_fire > ?1",
+                params![now], |row| row.get(0),
+            ).map_err(|e| XhjobError::Store(format!("worker_stats queue_depth: {}", e)))?;
+            Ok(WorkerStats {
+                total: total as u32,
+                pending: pending as u32,
+                running: running as u32,
+                success: success as u32,
+                failed: failed as u32,
+                queue_depth: queue_depth as u32,
+            })
         })
     }
 }

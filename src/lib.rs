@@ -206,6 +206,8 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
         out.push(("acks_on_failure".to_string(), info.acks_on_failure.to_string()));
         out.push(("timezone".to_string(), info.timezone.clone().unwrap_or_default()));
         out.push(("coalesce".to_string(), info.coalesce.to_string()));
+        out.push(("progress".to_string(), info.progress.map(|p| p.to_string()).unwrap_or_default()));
+        out.push(("progress_meta".to_string(), info.progress_meta.clone().unwrap_or_default()));
     } else {
         out.push(("state".to_string(), "UNKNOWN".to_string()));
         out.push(("error".to_string(), "task not found or daemon not running".to_string()));
@@ -993,6 +995,133 @@ pub fn xhjob_events(
     })
 }
 
+/// Report task progress (percent + optional meta JSON). The percent must be
+/// in the range 0-100; out-of-range values return `false` without contacting
+/// the daemon. Reference: Celery update_state(state='PROGRESS', meta=...).
+///
+/// PHP: `xhjob_report_progress(string $id, int $percent, ?string $meta_json = null, ?string $name = "default", ?string $data_dir = null): bool`
+#[php_function]
+pub fn xhjob_report_progress(
+    id: String,
+    percent: i64,
+    meta_json: Option<String>,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> bool {
+    if percent < 0 || percent > 100 {
+        return false;
+    }
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_report_progress invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({
+            "id": id,
+            "percent": percent,
+            "meta": meta_json,
+        });
+        match ipc::request("report_progress", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => resp.ok,
+            Err(e) => {
+                tracing::error!("xhjob_report_progress ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
+/// Pull task events since `since_ts` (Unix seconds), optionally filtered by
+/// `event_type` (A17). Returns a JSON array of `{task_id, event_type, payload,
+/// ts}` objects, or `"error: ..."` on failure.
+///
+/// Reference: APScheduler EVENT_JOB_*.
+/// PHP: `xhjob_pull_events(int $since_ts, ?string $event_type = null, ?string $name = "default", ?string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_pull_events(
+    since_ts: i64,
+    event_type: Option<String>,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({
+            "since_ts": since_ts,
+            "event_type": event_type,
+        });
+        match ipc::request("pull_events", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("events")
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "[]".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Inspect daemon state. `mode` selects the query:
+///   - `"active"`     — currently running tasks
+///   - `"registered"` — cron / interval tasks
+///   - `"scheduled"`  — tasks with a future `next_fire`
+///   - `"stats"`      — aggregate WorkerStats (default)
+///
+/// Returns a JSON string (array for active/registered/scheduled, object for
+/// stats), or `"error: ..."` on failure.
+///
+/// Reference: Celery inspect active / registered / scheduled / stats.
+/// PHP: `xhjob_inspect(string $mode, ?string $name = "default", ?string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_inspect(
+    mode: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "mode": mode });
+        match ipc::request("inspect", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("data")
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
 /// Create a chain of tasks (C15). Sequential pipeline: each task's stdout is
 /// fed into the next task's input. The chain record is persisted with the
 /// ordered list of task configs and the daemon dispatches them one at a
@@ -1169,6 +1298,100 @@ pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Optio
     })
 }
 
+/// Create a chord (C16+). A chord = header (parallel tasks) + body
+/// (callback). All header tasks are dispatched concurrently. When every
+/// header task succeeds, the body is dispatched with its `meta` set to a
+/// JSON array of `{ id, result }` objects carrying each header task's
+/// result. If any header task fails, the chord flips to `partial_failed`
+/// and the body is NOT dispatched.
+///
+/// `header_json` is a JSON array of TaskBuilder config objects.
+/// `callback_json` is a single TaskBuilder config object (the body).
+///
+/// Returns the chord_id on success, or `"error: ..."` on failure.
+///
+/// Reference: Celery `chord(header, body)`.
+/// PHP: `xhjob_chord(string $header_json, string $callback_json, string $name = "default", string $data_dir = null): string`
+#[php_function]
+pub fn xhjob_chord(header_json: String, callback_json: String, name: Option<String>, data_dir: Option<String>) -> String {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => return format!("error: {}", e),
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let header: serde_json::Value = match serde_json::from_str(&header_json) {
+            Ok(v) => v,
+            Err(e) => return format!("error: invalid header json: {}", e),
+        };
+        let callback: serde_json::Value = match serde_json::from_str(&callback_json) {
+            Ok(v) => v,
+            Err(e) => return format!("error: invalid callback json: {}", e),
+        };
+        let payload = serde_json::json!({ "header": header, "callback": callback });
+        match ipc::request("chord", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                }
+                resp.data.get("chord_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "error: missing chord_id".to_string())
+            }
+            Err(e) => format!("error: {}", e),
+        }
+    })
+}
+
+/// Get the chord state (C16+). Returns the full ChordRecord JSON
+/// (`{id, header_task_ids, callback_json, callback_task_id, state,
+/// created_at, updated_at}`) or `null` if the chord does not exist /
+/// daemon unreachable.
+///
+/// Reference: Celery chord inspection.
+/// PHP: `xhjob_chord_state(string $chord_id, string $name = "default", string $data_dir = null): ?string`
+#[php_function]
+pub fn xhjob_chord_state(chord_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_chord_state invalid service name: {}", e);
+            return None;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "chord_id": chord_id });
+        match ipc::request("chord_state", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return None;
+                }
+                let ok = resp.data.get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    return None;
+                }
+                resp.data.get("data").map(|d| d.to_string())
+            }
+            Err(e) => {
+                tracing::error!("xhjob_chord_state ipc: {}", e);
+                None
+            }
+        }
+    })
+}
+
 // =========================================================================
 // Module entry
 // =========================================================================
@@ -1198,4 +1421,9 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(xhjob_chain_state))
         .function(wrap_function!(xhjob_group))
         .function(wrap_function!(xhjob_group_state))
+        .function(wrap_function!(xhjob_chord))
+        .function(wrap_function!(xhjob_chord_state))
+        .function(wrap_function!(xhjob_report_progress))
+        .function(wrap_function!(xhjob_pull_events))
+        .function(wrap_function!(xhjob_inspect))
 }

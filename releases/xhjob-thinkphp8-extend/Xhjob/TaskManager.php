@@ -18,10 +18,10 @@ use Xhjob\Exception\TaskNotFoundException;
  * 任务管理门面
  *
  * 封装任务相关 xhjob 函数，提供高层 API：
- *   - create / createChain / createGroup：创建任务
+ *   - create / createChain / createGroup / createChord：创建任务
  *   - get / list / state / result / logs：查询任务
  *   - stop / restart / pause / resume / remove / reschedule：控制任务
- *   - chainState / groupState：查询链 / 组状态
+ *   - chainState / groupState / chordState：查询链 / 组 / chord 状态
  *   - waitForState / waitForResult：轮询等待
  *
  * 用法：
@@ -123,6 +123,31 @@ class TaskManager
         }, $builders));
         $result = xhjob_group($tasksJson, $this->name, $this->dataDir);
         return $this->parseResponse($result, 'group');
+    }
+
+    /**
+     * 创建 chord（header + body 回调）
+     *
+     * dispatch 时调用 xhjob_chord，并行执行所有 header 任务，
+     * 全部成功后执行 callback 任务，callback 的 meta 携带所有 header 结果。
+     * 任一 header 失败时 chord 转 partial_failed 终态，不派发 callback。
+     * 参考 Celery chord。
+     *
+     * @param array       $headerBuilders TaskBuilder 实例数组（header）
+     * @param TaskBuilder $callback       回调 TaskBuilder（body）
+     *
+     * @return string chord_id
+     *
+     * @throws InvalidTaskConfigException
+     */
+    public function createChord(array $headerBuilders, TaskBuilder $callback): string
+    {
+        $headerJson = json_encode(array_map(function (TaskBuilder $b) {
+            return $b->toArray();
+        }, $headerBuilders));
+        $callbackJson = $callback->toJson();
+        $result = xhjob_chord($headerJson, $callbackJson, $this->name, $this->dataDir);
+        return $this->parseResponse($result, 'chord');
     }
 
     /**
@@ -374,6 +399,83 @@ class TaskManager
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : null;
+    }
+
+    /**
+     * 查询 chord 状态
+     *
+     * 返回 ChordRecord 关联数组，包含 id / header_task_ids /
+     * callback_json / callback_task_id / state / created_at /
+     * updated_at 字段。chord 不存在或 daemon 不可达时返回 null。
+     *
+     * @param string $chordId chord ID
+     *
+     * @return array|null
+     */
+    public function chordState(string $chordId): ?array
+    {
+        $json = xhjob_chord_state($chordId, $this->name, $this->dataDir);
+        if ($json === null || $json === '') {
+            return null;
+        }
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : null;
+    }
+
+    // -----------------------------------------------------------------
+    // 进度上报 / 事件拉取 / 聚合检查
+    // -----------------------------------------------------------------
+
+    /**
+     * 上报任务进度
+     *
+     * 参考 Celery update_state(state='PROGRESS', meta=...)。
+     *
+     * @param string      $id      任务 ID
+     * @param int         $percent 进度百分比 0-100
+     * @param string|null $meta    任意 JSON 元数据
+     *
+     * @return bool
+     */
+    public function reportProgress(string $id, int $percent, ?string $meta = null): bool
+    {
+        $result = xhjob_report_progress($id, $percent, $meta, $this->name, $this->dataDir);
+        return is_bool($result) ? $result : (bool) $result;
+    }
+
+    /**
+     * 拉取任务事件
+     *
+     * @param int         $sinceTs   起始时间戳（Unix 秒），默认 0 = 全部
+     * @param string|null $eventType 事件类型过滤（started/succeeded/failed/...）
+     *
+     * @return array 事件数组
+     */
+    public function pullEvents(int $sinceTs = 0, ?string $eventType = null): array
+    {
+        $json = xhjob_pull_events($sinceTs, $eventType, $this->name, $this->dataDir);
+        if (strncmp($json, 'error:', 6) === 0) {
+            return [];
+        }
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : [];
+    }
+
+    /**
+     * 聚合检查 daemon 状态
+     *
+     * @param string $mode 查询模式：active / registered / scheduled / stats（默认）
+     *
+     * @return array
+     */
+    public function inspect(string $mode = 'stats'): array
+    {
+        $json = xhjob_inspect($mode, $this->name, $this->dataDir);
+        if (strncmp($json, 'error:', 6) === 0) {
+            return [];
+        }
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : [];
     }
 
     // -----------------------------------------------------------------
