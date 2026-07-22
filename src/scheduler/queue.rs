@@ -6,11 +6,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::errors::Result;
 use crate::store::{TaskState, TaskStore, now_ts};
 use crate::executor::dispatch as dispatch_task;
 use crate::pool::coroutine_pool;
+use crate::scheduler::RateLimiter;
 use super::overlap::OverlapController;
 
 pub struct TaskQueue {
@@ -22,6 +24,10 @@ pub struct TaskQueue {
     /// `signal_cancel` 设置对应标志，executor 在执行循环中轮询检测以终止子进程。
     /// 任务派发前注册，派发完成后注销。
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-task rate limiter (C12). Sliding-window counter shared between
+    /// scan_once (cron/interval triggers) and process_one (dispatch path).
+    /// Reference: Celery rate_limit.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl TaskQueue {
@@ -31,6 +37,7 @@ impl TaskQueue {
             overlap,
             pending: Mutex::new(Vec::new()),
             cancel_flags: Mutex::new(HashMap::new()),
+            rate_limiter: Arc::new(RateLimiter::new()),
         }
     }
 
@@ -126,8 +133,47 @@ impl TaskQueue {
         // Reference: APScheduler start_date.
         if let Some(start_ts) = task.start_date {
             if (now as i64) < start_ts {
+                // 未到 start_date：延迟重新入队，等 start_date 到达后再派发。
+                // 这对"仅设置 start_date 而无 cron/interval/run_at"的一次性
+                // 任务至关重要——否则任务被 drain_next 消费后永远不会被
+                // scan_once 重新 enqueue（无 trigger）。
+                let delay = (start_ts as u64).saturating_sub(now);
+                let q = Arc::clone(&self);
+                let tid = task.id.clone();
+                let pri = task.priority;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    let _ = q.enqueue(&tid, pri).await;
+                });
                 return Ok(());
             }
+        }
+
+        // rate_limit 检查（C12）：滑动窗口限流。超限时记录 RateLimited
+        // 事件，推进 next_fire（避免 scan_once 重复 enqueue），并延迟
+        // window 秒后重新入队。对一次性任务也生效（确保限流期间不丢失）。
+        // Reference: Celery rate_limit.
+        if !self.rate_limiter.check_and_record(&task, now).await {
+            let _ = self.store.record_event(
+                &task.id,
+                crate::store::EventType::RateLimited,
+                None,
+                now as i64,
+            ).await;
+            // 推进 next_fire 到 window 后（cron/interval 任务避免 scan_once 重复 enqueue）
+            let window = task.rate_limit_window;
+            if task.cron.is_some() || task.interval.is_some() {
+                let _ = self.store.update_next_fire(&task.id, Some(now + window)).await;
+            }
+            // 延迟重新入队
+            let q = Arc::clone(&self);
+            let tid = task.id.clone();
+            let pri = task.priority;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(window)).await;
+                let _ = q.enqueue(&tid, pri).await;
+            });
+            return Ok(());
         }
 
         // Overlap check

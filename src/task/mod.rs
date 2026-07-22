@@ -619,6 +619,16 @@ impl TaskBuilder {
         task.acks_late = self.acks_late;
         task.soft_timeout = self.soft_timeout;
         task.misfire_grace_time = self.misfire_grace_time;
+        // 防御性归一化：客户端（特别是 PHP TaskBuilder）可能把 Option 字段
+        // 输出为 0 而不是 null，导致 Rust 反序列化为 Some(0)。Some(0) 会让
+        // interval / runAt / start_date / end_date / soft_timeout 被误判为
+        // 已设置，进而触发 DateTrigger / SoftTimeout 等错误路径。
+        // 这里把所有 Option 时间戳字段中的 Some(0) 视为 None。
+        if task.interval == Some(0) { task.interval = None; }
+        if task.run_at == Some(0) { task.run_at = None; }
+        if task.start_date == Some(0) { task.start_date = None; }
+        if task.end_date == Some(0) { task.end_date = None; }
+        if task.soft_timeout == Some(0) { task.soft_timeout = None; }
         // A14: explicit id — if set, override the auto-generated UUID.
         if let Some(id) = self.id {
             task.id = id;

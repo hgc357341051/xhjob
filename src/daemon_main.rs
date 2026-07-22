@@ -59,8 +59,23 @@ async fn run_daemon() -> Result<()> {
         "xhjob daemon starting"
     );
 
-    // Choose store
-    let use_persist = std::env::var("XHJOB_PERSIST").map(|v| v == "1" || v == "true").unwrap_or(false);
+    // Choose store.
+    //
+    // When the `persist` cargo feature is enabled, the daemon defaults to
+    // SQLite-backed storage so that per-task `persist=true` works out of the
+    // box (TaskBuilder.persist field is honored without extra env config).
+    // Set XHJOB_PERSIST=0 to explicitly disable (fall back to InMemoryStore).
+    //
+    // When the feature is NOT compiled in, the binary has no SqliteStore at
+    // all, so InMemoryStore is always used regardless of the env var.
+    #[cfg(feature = "persist")]
+    let use_persist = std::env::var("XHJOB_PERSIST")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    #[cfg(not(feature = "persist"))]
+    let use_persist = std::env::var("XHJOB_PERSIST")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let store: Arc<dyn TaskStore> = if use_persist {
         #[cfg(feature = "persist")]
         {

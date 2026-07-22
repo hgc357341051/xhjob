@@ -46,12 +46,16 @@ class TaskBuilder
     protected function __construct()
     {
         // 默认配置与 xhjob TaskBuilder 默认值对齐
+        // 注意：Rust 端 TaskBuilder 中 Option<u64>/Option<i64> 字段
+        // （interval / run_at / start_date / end_date / soft_timeout）
+        // 必须输出 null，否则 JSON 中的 0 会被反序列化为 Some(0)，
+        // 导致 interval 任务被误判为 DateTrigger 立即转 Success 终态。
         $this->config = [
             'task_type'           => 'shell',
             'payload'             => ['cmd' => ''],
             'cron'                => null,
-            'interval'            => 0,
-            'run_at'              => 0,
+            'interval'            => null,
+            'run_at'              => null,
             'retry_max'           => 0,
             'retry_delay'         => 1,
             'timeout'             => 30,
@@ -61,8 +65,8 @@ class TaskBuilder
             'coalesce'            => true,
             'persist'             => false,
             'allow_overlap'       => false,
-            'start_date'          => 0,
-            'end_date'            => 0,
+            'start_date'          => null,
+            'end_date'            => null,
             'result_ttl'          => 0,
             'meta'                => null,
             'tags'                => [],
@@ -71,7 +75,7 @@ class TaskBuilder
             'retry_backoff'       => false,
             'ignore_result'       => false,
             'acks_late'           => false,
-            'soft_timeout'        => 0,
+            'soft_timeout'        => null,
             'misfire_grace_time'  => 0,
             'timezone'            => null,
             'id'                  => null,
