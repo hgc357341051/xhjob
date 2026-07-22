@@ -26,19 +26,21 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
         .ok_or_else(|| XhjobError::Store("encryption key not set".to_string()))?;
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
-    // Generate a random 12-byte nonce from timestamp + counter
+    // P0-22 fix: generate the 12-byte nonce from the OS CSPRNG (OsRng)
+    // instead of timestamp+counter. For AES-GCM, nonce reuse under the
+    // same key is catastrophic (leaks the plaintext via XOR and lets an
+    // attacker forge messages). The previous timestamp+counter scheme was
+    // unique within a single process, but if multiple daemons share the
+    // same XHJOB_ENCRYPTION_KEY and start near-simultaneously (counter
+    // resets to 0), the nonces can collide. OsRng pulls from
+    // /dev/urandom (Linux) / getentropy (macOS) / BCryptGenRandom
+    // (Windows), giving a 96-bit nonce space with negligible collision
+    // probability even across processes/machines.
     let nonce_bytes = {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let ctr = COUNTER.fetch_add(1, Ordering::Relaxed);
+        use rand::rngs::OsRng;
+        use rand::RngCore;
         let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&ts.to_le_bytes());
-        let ctr_bytes = (ctr as u32).to_le_bytes();
-        nonce[8..12].copy_from_slice(&ctr_bytes);
+        OsRng.fill_bytes(&mut nonce);
         nonce
     };
     let nonce = Nonce::from_slice(&nonce_bytes);

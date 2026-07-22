@@ -399,6 +399,9 @@ pub struct TaskSummary {
     pub progress: Option<u8>,
     /// Optional chord callback correlation id.
     pub chord_id: Option<String>,
+    /// P0-17: owner for multi-tenant filtering on list/inspect queries.
+    /// Empty = legacy/unowned (visible to all callers, backward compat).
+    pub owner: String,
 }
 
 impl From<&Task> for TaskSummary {
@@ -422,6 +425,7 @@ impl From<&Task> for TaskSummary {
             tags: t.tags.clone(),
             progress: t.progress,
             chord_id: t.chord_id.clone(),
+            owner: t.owner.clone(),
         }
     }
 }

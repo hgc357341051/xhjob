@@ -446,6 +446,60 @@ fn ownership_check(task: &crate::store::Task) -> std::result::Result<(), Respons
     Ok(())
 }
 
+/// P0-17 fix: filter a list of TaskSummary by caller ownership.
+///
+/// Returns a new Vec containing only the summaries the caller may see.
+/// The rule mirrors `ownership_check`:
+/// - Unowned summaries (legacy rows, owner == "") are always visible
+///   (backward compat — single-tenant deployments see everything).
+/// - Owned summaries are visible only to a caller whose XHJOB_OWNER
+///   matches. If the caller did not set XHJOB_OWNER (empty), all owned
+///   summaries are hidden (default-deny).
+fn filter_summaries_by_owner(summaries: Vec<crate::store::TaskSummary>) -> Vec<crate::store::TaskSummary> {
+    let caller = std::env::var("XHJOB_OWNER").unwrap_or_default();
+    summaries.into_iter().filter(|s| {
+        // Unowned = visible to anyone (legacy compat).
+        if s.owner.is_empty() {
+            return true;
+        }
+        // Owned = visible only to matching caller. Empty caller hides it.
+        !caller.is_empty() && s.owner == caller
+    }).collect()
+}
+
+/// P0-17 fix: filter a list of TaskEvent by the owner of the task each
+/// event belongs to. Events don't carry an owner field directly, so we
+/// look up each distinct task_id's owner and apply the same default-deny
+/// rule as `filter_summaries_by_owner`. Events for unowned tasks (legacy)
+/// stay visible; events for owned tasks are visible only to the matching
+/// caller. Failed lookups (task already deleted) are treated as unowned
+/// (visible) so historical event streams remain queryable.
+async fn filter_events_by_owner(
+    store: &Arc<dyn TaskStore>,
+    events: Vec<crate::store::TaskEvent>,
+) -> Vec<crate::store::TaskEvent> {
+    let caller = std::env::var("XHJOB_OWNER").unwrap_or_default();
+    // Build a distinct set of task_ids and look up each owner once.
+    let mut owner_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for e in &events {
+        if owner_cache.contains_key(&e.task_id) {
+            continue;
+        }
+        let owner = match store.load_task(&e.task_id).await {
+            Ok(Some(t)) => t.owner,
+            _ => String::new(), // deleted / not found → treat as unowned
+        };
+        owner_cache.insert(e.task_id.clone(), owner);
+    }
+    events.into_iter().filter(|e| {
+        let task_owner = owner_cache.get(&e.task_id).map(|s| s.as_str()).unwrap_or("");
+        if task_owner.is_empty() {
+            return true; // legacy / unowned — visible to anyone
+        }
+        !caller.is_empty() && task_owner == caller
+    }).collect()
+}
+
 async fn handle_dispatch(
     store: &Arc<dyn TaskStore>,
     queue: &Arc<TaskQueue>,
@@ -638,6 +692,8 @@ async fn handle_list_op(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let summaries = store.list_tasks(state_filter, tag_filter.as_deref()).await?;
+    // P0-17: filter out tasks owned by other tenants before returning.
+    let summaries = filter_summaries_by_owner(summaries);
     let arr: Vec<serde_json::Value> = summaries.iter()
         .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
         .collect();
@@ -745,6 +801,15 @@ async fn handle_events_op(
         }
     }
     let events = store.list_events(since_ts, task_id_filter.as_deref()).await?;
+    // P0-17: when no task_id filter is set, filter events by owner so a
+    // tenant cannot see another tenant's task events. When a task_id
+    // filter IS set, the per-task ownership check above already enforced
+    // access, so we skip the cross-event filter (avoids redundant lookups).
+    let events = if task_id_filter.is_some() {
+        events
+    } else {
+        filter_events_by_owner(store, events).await
+    };
     let arr: Vec<serde_json::Value> = events.iter()
         .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
         .collect();
@@ -1035,6 +1100,8 @@ async fn handle_pull_events_op(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let events = store.list_events(since_ts, None).await?;
+    // P0-17: filter out events whose task is owned by another tenant.
+    let events = filter_events_by_owner(store, events).await;
     let arr: Vec<serde_json::Value> = events.iter()
         .filter(|e| match &event_type_filter {
             Some(f) => e.event_type.as_str() == f.as_str(),
@@ -1063,17 +1130,23 @@ async fn handle_inspect_op(
     let data = match mode {
         "active" => {
             let tasks = store.list_active_summary().await?;
+            // P0-17: filter out tasks owned by other tenants.
+            let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
                 .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
         }
         "registered" => {
             let tasks = store.list_registered_summary().await?;
+            // P0-17: filter out tasks owned by other tenants.
+            let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
                 .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
         }
         "scheduled" => {
             let now = crate::store::now_ts();
             let tasks = store.list_scheduled_summary(now).await?;
+            // P0-17: filter out tasks owned by other tenants.
+            let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
                 .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
         }
