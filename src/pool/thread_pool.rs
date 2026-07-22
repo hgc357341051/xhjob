@@ -1,10 +1,14 @@
-//! 线程池模块（保留为未来 CPU 密集型任务执行器扩展）。
+//! 线程池模块（多线程池模式）。
 //!
-//! 当前协程池（coroutine pool）已覆盖 IO 密集任务；未来若需 CPU 密集任务
-//! （如图像处理、压缩），可启用此模块。
+//! 当 `XHJOB_POOL_MODE=thread` 时，daemon 使用此线程池执行任务。每个任务
+//! 在独立的工作线程中运行（通过 `block_on` 执行 async future），适合
+//! CPU 密集型或需要严格并发控制的场景。并发度由线程数控制（默认=CPU 核数，
+//! 可通过 `XHJOB_THREAD_POOL_SIZE` 覆盖）。
 //!
-//! Built on top of `std::thread` + `crossbeam-channel`. The default pool size
-//! equals the number of CPU cores; it can be overridden via `XHJOB_THREAD_POOL_SIZE`.
+//! 默认模式 `XHJOB_POOL_MODE=coroutine` 使用协程池（tokio async runtime），
+//! 适合 IO 密集型任务，最大并发 1024（可通过 `XHJOB_COROUTINE_POOL_SIZE` 覆盖）。
+//!
+//! Built on top of `std::thread` + `crossbeam-channel`.
 
 use std::sync::Arc;
 use std::thread;
@@ -13,21 +17,18 @@ use once_cell::sync::OnceCell;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-#[allow(dead_code)]
 struct PoolInner {
     sender: Sender<Job>,
     shutdown: Sender<()>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
 pub struct ThreadPool {
     inner: Arc<PoolInner>,
 }
 
 static GLOBAL: OnceCell<ThreadPool> = OnceCell::new();
 
-#[allow(dead_code)]
 impl ThreadPool {
     /// Create a new fixed-size thread pool.
     pub fn new(size: usize) -> Self {
@@ -101,7 +102,6 @@ impl Drop for ThreadPool {
 }
 
 /// Get the configured pool size (from env or CPU count).
-#[allow(dead_code)]
 pub fn configured_size() -> usize {
     if let Ok(s) = std::env::var("XHJOB_THREAD_POOL_SIZE") {
         if let Ok(n) = s.parse::<usize>() {
@@ -112,7 +112,6 @@ pub fn configured_size() -> usize {
 }
 
 /// Get the global thread pool (lazily initialized).
-#[allow(dead_code)]
 pub fn global() -> &'static ThreadPool {
     GLOBAL.get_or_init(|| ThreadPool::new(configured_size()))
 }

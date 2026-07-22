@@ -197,12 +197,15 @@ impl TaskQueue {
             now_ts() as i64,
         ).await;
 
-        // Dispatch via coroutine pool
+        // Dispatch via pool (coroutine by default, thread when XHJOB_POOL_MODE=thread).
+        // Thread mode: each task runs in a dedicated worker thread via block_on,
+        // concurrency is bounded by thread count (default=num_cpus).
+        // Coroutine mode (default): async tasks on tokio runtime, max concurrency 1024.
         let store = Arc::clone(&self.store);
         let overlap = Arc::clone(&self.overlap);
         let queue_arc = Arc::clone(&self);
         let task_clone = task.clone();
-        coroutine_pool::global().spawn(async move {
+        let task_future = async move {
             // 创建 cancel 标志并注册到 queue，使 handle_cancel_op 能够
             // 通过 signal_cancel 通知 executor 终止子进程。
             let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -464,7 +467,22 @@ impl TaskQueue {
             }
             record_worker_limits();
             overlap.on_finish(&task_clone.id).await;
-        });
+        };
+
+        // Pool mode selection: coroutine (default) or thread.
+        // XHJOB_POOL_MODE=thread → ThreadPool (std::thread + block_on, bounded by thread count)
+        // XHJOB_POOL_MODE=coroutine (default) → CoroutinePool (tokio async, max 1024)
+        let pool_mode = std::env::var("XHJOB_POOL_MODE")
+            .unwrap_or_else(|_| "coroutine".to_string());
+        if pool_mode == "thread" {
+            crate::pool::thread_pool::global().submit(move || {
+                if let Some(rt) = coroutine_pool::global_runtime() {
+                    rt.block_on(task_future);
+                }
+            });
+        } else {
+            let _ = coroutine_pool::global().spawn(task_future);
+        }
 
         Ok(())
     }
