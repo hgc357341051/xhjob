@@ -378,6 +378,12 @@ impl Task {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskResult {
     pub body: Option<String>,
+    /// Base64-encoded body for non-UTF-8 (binary) HTTP responses.
+    /// When set, `body` is None and callers must base64-decode this field
+    /// to recover the original bytes. Prevents `from_utf8_lossy` corruption
+    /// of binary payloads (images, files, msgpack, etc.).
+    #[serde(default)]
+    pub body_b64: Option<String>,
     pub status_code: Option<i32>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,

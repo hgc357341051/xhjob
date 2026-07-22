@@ -2,7 +2,7 @@
 
 > 基于 Rust（ext-php-rs 0.15）内核的 PHP 扩展，为 ThinkPHP 8 提供**单机异步任务调度**能力，零外部依赖（不依赖 Redis / RabbitMQ / Swoole / Supervisor），支持**两种任务执行池模式**（async task 池 / 1:1 线程池）按场景切换。
 
-本集成包以 `extend/` 第三方库形态接入 ThinkPHP 8，封装 24 个 PHP 扩展函数与 38+ 个链式构建方法，覆盖触发器、重试、超时、并发控制、任务编排（chain / group / chord）、持久化恢复、可观测性等完整能力，是 APScheduler / Celery 在单机 PHP 场景下的等价替代方案。
+本集成包以 `extend/` 第三方库形态接入 ThinkPHP 8，封装 25 个 PHP 扩展函数与 38+ 个链式构建方法，覆盖触发器、重试、超时、并发控制、任务编排（chain / group / chord）、持久化恢复、可观测性等完整能力，是 APScheduler / Celery 在单机 PHP 场景下的等价替代方案。
 
 ---
 
@@ -37,7 +37,7 @@
 - **可观测性**：inspect（active / registered / scheduled / stats）/ pull_events / report_progress。
 - **多实例与隔离**：named services（同时运行多个独立 daemon）/ data_dir（自定义数据目录）。
 - **HTTP / Shell 双模式 + 增强**：HTTP 代理（http / https / socks5 / socks5h + Basic Auth）/ Shell 编码转换（GBK / Big5 / auto）/ timezone。
-- **PHP 扩展函数（24 个）**：`xhjob_start/stop/restart/status/dispatch/state/result/remove/pause/resume/cancel/list/requeue/reschedule/get/events/chain/chain_state/group/group_state/chord/chord_state/report_progress/pull_events/inspect`。
+- **PHP 扩展函数（25 个）**：`xhjob_start/stop/restart/status/dispatch/state/result/remove/pause/resume/cancel/list/requeue/reschedule/get/events/chain/chain_state/group/group_state/chord/chord_state/report_progress/pull_events/inspect`。
 - **TaskBuilder 链式方法（38+ 个）**：覆盖任务类型、触发器、重试、超时、并发、持久化、编排、事件、代理、编码、时区等全维度。
 
 ---

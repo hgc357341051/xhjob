@@ -208,10 +208,31 @@ impl Executor for HttpExecutor {
                     MAX_BODY_BYTES
                 )));
             }
-            let body = String::from_utf8_lossy(&body_buf).to_string();
+            // CRITICAL fix: detect whether the response body is valid UTF-8.
+            // - Valid UTF-8 (text/JSON/XML/HTML): store as-is in `body`.
+            // - Invalid UTF-8 (binary: images, files, msgpack, etc.):
+            //   base64-encode into `body_b64` and leave `body` = None.
+            //   Previously `from_utf8_lossy` silently replaced invalid bytes
+            //   with U+FFFD, permanently corrupting binary payloads.
+            let (body, body_b64) = match String::from_utf8(body_buf) {
+                Ok(text) => (Some(text), None),
+                Err(e) => {
+                    let bytes = e.into_bytes();
+                    use base64::Engine;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    tracing::debug!(
+                        status,
+                        bytes = bytes.len(),
+                        b64_len = encoded.len(),
+                        "binary HTTP response (non-UTF-8): stored as body_b64"
+                    );
+                    (None, Some(encoded))
+                }
+            };
 
             Ok(TaskResult {
-                body: Some(body),
+                body,
+                body_b64,
                 status_code: Some(status),
                 stdout: None,
                 stderr: None,

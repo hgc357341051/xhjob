@@ -258,7 +258,9 @@ class TaskManager
      * @return array 包含 stdout / stderr / exit_code 字段；
      *               当结果不存在时（ignoreResult=true 或任务未产出输出），
      *               返回带 'error' 键的数组，调用方可通过 isset($r['error']) 判断。
-     *               使用 state() 检查 daemon 可达性（其会抛异常）。
+     *               对于 HTTP 二进制响应（非 UTF-8），结果中包含 'body_b64' 键
+     *               （base64 编码），调用方可通过 base64_decode($r['body_b64'])
+     *               恢复原始字节。使用 state() 检查 daemon 可达性（其会抛异常）。
      */
     public function result(string $id): array
     {

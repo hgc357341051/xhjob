@@ -236,12 +236,38 @@ impl Executor for ShellExecutor {
                     (stdout_text, stderr_text, code)
                 }
                 Err(e) => {
+                    // MEDIUM fix: on timeout / cancel / soft_timeout kill, the
+                    // child may have already produced partial stdout/stderr
+                    // before being killed. Decode and log them so operators
+                    // can diagnose why the task timed out (instead of the
+                    // previous behavior of silently dropping all captured
+                    // output). Best-effort: ignore decode errors here since
+                    // we're already in an error path.
+                    if !stdout_buf.is_empty() || !stderr_buf.is_empty() {
+                        let stdout_partial = decode_output(&stdout_buf, encoding.as_ref())
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&stdout_buf).to_string());
+                        let stderr_partial = decode_output(&stderr_buf, encoding.as_ref())
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&stderr_buf).to_string());
+                        tracing::warn!(
+                            error = %e,
+                            stdout_len = stdout_partial.len(),
+                            stderr_len = stderr_partial.len(),
+                            "task ended with error; partial output captured (logged for diagnostics)"
+                        );
+                        if !stdout_partial.is_empty() {
+                            tracing::info!(target: "xhjob_shell_partial", "PARTIAL STDOUT:\n{}", stdout_partial);
+                        }
+                        if !stderr_partial.is_empty() {
+                            tracing::info!(target: "xhjob_shell_partial", "PARTIAL STDERR:\n{}", stderr_partial);
+                        }
+                    }
                     return Err(e);
                 }
             };
 
             Ok(TaskResult {
                 body: None,
+                body_b64: None,
                 status_code: None,
                 stdout: Some(stdout_text),
                 stderr: Some(stderr_text),

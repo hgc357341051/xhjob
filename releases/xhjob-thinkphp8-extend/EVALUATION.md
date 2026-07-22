@@ -32,7 +32,7 @@ xhjob 的定位是为 PHP 单机应用提供"开箱即用"的异步任务调度�
 
 ### 1.3 xhjob 已实现能力概览
 
-- **PHP 函数（21 个）**：`xhjob_start/stop/restart/status/dispatch/state/result/remove/pause/resume/cancel/list/requeue/reschedule/get/events/chain/chain_state/group/group_state`
+- **PHP 函数（25 个）**：`xhjob_start/stop/restart/status/dispatch/state/result/remove/pause/resume/cancel/list/requeue/reschedule/get/events/chain/chain_state/group/group_state/chord/chord_state/report_progress/pull_events/inspect`
 - **TaskBuilder 链式方法（36 个）**：覆盖触发器、重试、超时、并发控制、持久化、编排、事件、代理、编码等。
 - **Triggers**：cron(5/6 段)、interval、date(run_at)、start_date、end_date
 - **重试**：retry_max + retry_delay + retry_backoff（指数退避）

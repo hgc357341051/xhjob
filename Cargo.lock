@@ -2955,6 +2955,7 @@ name = "xhjob"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64",
  "bincode",
  "chrono",
  "chrono-tz",

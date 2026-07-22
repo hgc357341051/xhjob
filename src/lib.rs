@@ -277,6 +277,7 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(r) = result {
         if let Some(b) = r.body { out.push(("body".to_string(), b)); }
+        if let Some(b) = r.body_b64 { out.push(("body_b64".to_string(), b)); }
         if let Some(c) = r.status_code { out.push(("status_code".to_string(), c.to_string())); }
         if let Some(o) = r.stdout { out.push(("stdout".to_string(), o)); }
         if let Some(e) = r.stderr { out.push(("stderr".to_string(), e)); }

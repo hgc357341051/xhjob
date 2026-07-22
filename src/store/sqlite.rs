@@ -106,6 +106,7 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS results (
                 task_id      TEXT PRIMARY KEY,
                 body         TEXT,
+                body_b64     TEXT,
                 status_code  INTEGER,
                 stdout       TEXT,
                 stderr       TEXT,
@@ -183,6 +184,9 @@ impl SqliteStore {
         ensure_column(&conn, "chord_id", "TEXT")?;
         // P0-17: owner column for multi-tenant isolation.
         ensure_column(&conn, "owner", "TEXT NOT NULL DEFAULT ''")?;
+        // Binary HTTP response support: body_b64 column on results table
+        // for base64-encoded non-UTF-8 bodies (images, files, etc.).
+        ensure_column_in_table(&conn, "results", "body_b64", "TEXT")?;
         // Fix 4: harden SQLite file permissions to 0o600.
         //
         // `Connection::open` creates the DB file with the process umask
@@ -215,7 +219,14 @@ impl SqliteStore {
 /// Add a column to the `tasks` table if it does not already exist. Used to
 /// migrate older databases that predate a schema change.
 fn ensure_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(tasks)")
+    ensure_column_in_table(conn, "tasks", name, sql_type)
+}
+
+/// Like `ensure_column` but for an arbitrary table. Used to migrate columns
+/// on the `results` / `events` / etc. tables that were created in earlier
+/// schema versions without the new column.
+fn ensure_column_in_table(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))
         .map_err(|e| XhjobError::store(format!("pragma table_info: {}", e)))?;
     let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))
         .map_err(|e| XhjobError::store(format!("pragma query_map: {}", e)))?
@@ -223,7 +234,7 @@ fn ensure_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
         .collect();
     if !cols.iter().any(|c| c == name) {
         conn.execute(
-            &format!("ALTER TABLE tasks ADD COLUMN {} {}", name, sql_type),
+            &format!("ALTER TABLE {} ADD COLUMN {} {}", table, name, sql_type),
             [],
         ).map_err(|e| XhjobError::store(format!("alter table add {}: {}", name, e)))?;
     }
@@ -388,9 +399,9 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 conn.execute(
-                    "INSERT OR REPLACE INTO results (task_id, body, status_code, stdout, stderr, exit_code)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![task_id, result.body, result.status_code, result.stdout, result.stderr, result.exit_code],
+                    "INSERT OR REPLACE INTO results (task_id, body, body_b64, status_code, stdout, stderr, exit_code)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![task_id, result.body, result.body_b64, result.status_code, result.stdout, result.stderr, result.exit_code],
                 ).map_err(|e| XhjobError::store(format!("save_result: {}", e)))?;
                 Ok(())
             })
@@ -447,15 +458,16 @@ impl TaskStore for SqliteStore {
             let conn = Arc::clone(&self.conn);
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
-                let mut stmt = conn.prepare("SELECT body, status_code, stdout, stderr, exit_code FROM results WHERE task_id = ?1")
+                let mut stmt = conn.prepare("SELECT body, body_b64, status_code, stdout, stderr, exit_code FROM results WHERE task_id = ?1")
                     .map_err(|e| XhjobError::store(format!("prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![id], |row| {
                     Ok(TaskResult {
                         body: row.get(0)?,
-                        status_code: row.get(1)?,
-                        stdout: row.get(2)?,
-                        stderr: row.get(3)?,
-                        exit_code: row.get(4)?,
+                        body_b64: row.get(1)?,
+                        status_code: row.get(2)?,
+                        stdout: row.get(3)?,
+                        stderr: row.get(4)?,
+                        exit_code: row.get(5)?,
                     })
                 }).map_err(|e| XhjobError::store(format!("query: {}", e)))?;
                 if let Some(row) = rows.next() {
