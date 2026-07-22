@@ -85,7 +85,7 @@ impl TaskState {
             "interrupted" | "INTERRUPTED" => Ok(TaskState::Interrupted),
             "cancelled" | "CANCELLED" => Ok(TaskState::Cancelled),
             "expired" | "EXPIRED" => Ok(TaskState::Expired),
-            other => Err(XhjobError::Store(format!("unknown state: {}", other))),
+            other => Err(XhjobError::store(format!("unknown state: {}", other))),
         }
     }
     pub fn is_terminal(&self) -> bool {
@@ -492,7 +492,7 @@ impl EventType {
             "expired" => Ok(EventType::Expired),
             "max_instances_reached" => Ok(EventType::MaxInstancesReached),
             "rate_limited" => Ok(EventType::RateLimited),
-            other => Err(XhjobError::Store(format!("unknown event type: {}", other))),
+            other => Err(XhjobError::store(format!("unknown event type: {}", other))),
         }
     }
 }

@@ -171,9 +171,9 @@ pub async fn refresh_state(
         // All header tasks succeeded — dispatch the callback.
         // The per-chord mutex guarantees we only get here once.
         let mut callback: TaskBuilder = serde_json::from_str(&record.callback_json)
-            .map_err(|e| crate::errors::XhjobError::Store(format!("chord callback parse: {}", e)))?;
+            .map_err(|e| crate::errors::XhjobError::store(format!("chord callback parse: {}", e)))?;
         let meta_json = serde_json::to_string(&results)
-            .map_err(|e| crate::errors::XhjobError::Store(format!("chord meta encode: {}", e)))?;
+            .map_err(|e| crate::errors::XhjobError::store(format!("chord meta encode: {}", e)))?;
         callback = callback.meta(meta_json);
         let mut task = callback.build()?;
         // P0-17: propagate owner to the chord callback task so subsequent

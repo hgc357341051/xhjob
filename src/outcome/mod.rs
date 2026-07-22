@@ -140,10 +140,10 @@ pub async fn query_state(
     let payload = serde_json::json!({ "task_id": task_id });
     let resp = ipc_request("state", payload, service_name, data_dir).await?;
     if !resp.ok {
-        return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
+        return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }
     let info: StateInfo = serde_json::from_value(resp.data)
-        .map_err(|e| XhjobError::Ipc(format!("deserialize state: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("deserialize state: {}", e)))?;
     Ok(info)
 }
 
@@ -157,9 +157,9 @@ pub async fn query_result(
     let payload = serde_json::json!({ "task_id": task_id });
     let resp = ipc_request("result", payload, service_name, data_dir).await?;
     if !resp.ok {
-        return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
+        return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }
     let result: TaskResult = serde_json::from_value(resp.data)
-        .map_err(|e| XhjobError::Ipc(format!("deserialize result: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("deserialize result: {}", e)))?;
     Ok(result)
 }

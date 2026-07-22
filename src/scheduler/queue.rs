@@ -15,6 +15,17 @@ use crate::pool::coroutine_pool;
 use crate::scheduler::RateLimiter;
 use super::overlap::OverlapController;
 
+/// RAII guard that decrements the in-flight counter on drop.
+/// Ensures the counter is balanced even if the task future panics
+/// or returns early. (P1 fix for graceful shutdown drain.)
+struct InFlightGuard(Arc<std::sync::atomic::AtomicU64>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct TaskQueue {
     store: Arc<dyn TaskStore>,
     overlap: Arc<OverlapController>,
@@ -28,6 +39,12 @@ pub struct TaskQueue {
     /// scan_once (cron/interval triggers) and process_one (dispatch path).
     /// Reference: Celery rate_limit.
     rate_limiter: Arc<RateLimiter>,
+    /// P1 fix: count of currently in-flight task futures. Incremented when
+    /// a task future is spawned, decremented when it completes (success /
+    /// failure / panic). Used by `wait_for_idle` during daemon shutdown so
+    /// we actually drain running tasks instead of unconditionally sleeping
+    /// a fixed 200ms and abandoning anything still executing.
+    in_flight: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TaskQueue {
@@ -38,6 +55,28 @@ impl TaskQueue {
             pending: Mutex::new(Vec::new()),
             cancel_flags: Mutex::new(HashMap::new()),
             rate_limiter: Arc::new(RateLimiter::new()),
+            in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Current number of in-flight task futures (P1 fix for graceful shutdown).
+    pub fn in_flight_count(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for all in-flight tasks to finish, up to `max_wait`. Returns the
+    /// number of tasks still running when the deadline expired (0 = fully
+    /// drained). Called from daemon shutdown to actually drain running tasks
+    /// instead of abandoning them after a fixed sleep.
+    pub async fn wait_for_idle(&self, max_wait: std::time::Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let n = self.in_flight_count();
+            if n == 0 { return 0; }
+            if tokio::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -87,7 +126,7 @@ impl TaskQueue {
         // will log a warning and the task remains in the store as Pending;
         // scan_retries will re-enqueue it on the next tick.
         if g.len() >= max_pending {
-            return Err(crate::errors::XhjobError::Store(format!(
+            return Err(crate::errors::XhjobError::store(format!(
                 "pending queue full ({} >= {}); task {} will be retried on next scan",
                 g.len(), max_pending, task_id
             )));
@@ -576,15 +615,27 @@ impl TaskQueue {
         //   → async task pool (M:N tokio scheduling, max 1024; recommended for IO-bound)
         let pool_mode = std::env::var("XHJOB_POOL_MODE")
             .unwrap_or_else(|_| "async".to_string());
+        // P1 fix: wrap task_future with an in-flight counter so daemon
+        // shutdown can actually wait for running tasks to drain instead
+        // of sleeping a fixed 200ms. Increment before dispatch, decrement
+        // in a finally-style guard (RAII) so panics / early returns still
+        // decrement. The guard struct's Drop runs when the future completes.
+        let in_flight_counter = Arc::clone(&self.in_flight);
+        let counted_future = async move {
+            in_flight_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // RAII guard: decrements on drop (success, error, panic, cancel).
+            let _guard = InFlightGuard(Arc::clone(&in_flight_counter));
+            task_future.await
+        };
         if pool_mode == "thread" {
             crate::pool::thread_pool::global().submit(move || {
                 if let Some(rt) = coroutine_pool::global_runtime() {
-                    rt.block_on(task_future);
+                    rt.block_on(counted_future);
                 }
             });
         } else {
             // `async` (recommended) and `coroutine` (legacy alias) both route here.
-            let _ = coroutine_pool::global().spawn(task_future);
+            let _ = coroutine_pool::global().spawn(counted_future);
         }
 
         Ok(())

@@ -392,7 +392,12 @@ class TaskBuilder
         if ($this->config['task_type'] !== 'http') {
             throw new InvalidTaskConfigException('withHeaders 仅适用于 http 任务');
         }
-        $this->config['payload']['headers'] = $h;
+        // P0 fix: cast empty array to object so json_encode produces `{}`
+        // (matching Rust HttpPayload.headers: HashMap<String,String>) instead
+        // of `[]` (which serde would reject as "invalid type: sequence,
+        // expected struct Map"). http() factory default already does this;
+        // this guards the withHeaders([]) explicit-empty edge case.
+        $this->config['payload']['headers'] = empty($h) ? (object)[] : $h;
         return $this;
     }
 

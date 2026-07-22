@@ -824,12 +824,12 @@ impl TaskBuilder {
             .map_err(|e| XhjobError::InvalidTask(format!("serialize: {}", e)))?;
         let resp = ipc_request("dispatch", json, &self.service_name, self.data_dir.as_deref()).await?;
         if !resp.ok {
-            return Err(XhjobError::Ipc(resp.err.unwrap_or_else(|| "unknown error".to_string())));
+            return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown error".to_string())));
         }
         // Expect data = {"task_id": "..."}
         let task_id = resp.data.get("task_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| XhjobError::Ipc("missing task_id in response".to_string()))?
+            .ok_or_else(|| XhjobError::ipc("missing task_id in response".to_string()))?
             .to_string();
         Ok(task_id)
     }

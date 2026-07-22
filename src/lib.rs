@@ -62,7 +62,7 @@ async fn ipc_request(
     .await
     {
         Ok(inner) => inner,
-        Err(_) => Err(errors::XhjobError::Ipc(format!(
+        Err(_) => Err(errors::XhjobError::ipc(format!(
             "request timeout ({}s) for op={}",
             timeout_secs, op
         ))),

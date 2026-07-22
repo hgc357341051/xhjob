@@ -36,19 +36,19 @@ impl SqliteStore {
     /// Open or create the SQLite database at `path`.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)
-            .map_err(|e| XhjobError::Store(format!("open {}: {}", path, e)))?;
+            .map_err(|e| XhjobError::store(format!("open {}: {}", path, e)))?;
         // Enable WAL mode
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| XhjobError::Store(format!("set WAL: {}", e)))?;
+            .map_err(|e| XhjobError::store(format!("set WAL: {}", e)))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| XhjobError::Store(format!("set synchronous: {}", e)))?;
+            .map_err(|e| XhjobError::store(format!("set synchronous: {}", e)))?;
         // P0-6: busy_timeout=5000ms. Without this, concurrent writes from
         // multiple PHP-FPM workers immediately hit SQLITE_BUSY instead of
         // waiting for the lock holder to release. 5s is the SQLite
         // recommended default and aligns with libsqlite3's own default
         // for many higher-level wrappers.
         conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(|e| XhjobError::Store(format!("set busy_timeout: {}", e)))?;
+            .map_err(|e| XhjobError::store(format!("set busy_timeout: {}", e)))?;
         // Schema
         conn.execute_batch(
             r#"
@@ -148,7 +148,7 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
             CREATE INDEX IF NOT EXISTS idx_tasks_next_fire ON tasks(next_fire);
             "#,
-        ).map_err(|e| XhjobError::Store(format!("create schema: {}", e)))?;
+        ).map_err(|e| XhjobError::store(format!("create schema: {}", e)))?;
         // Legacy DB migration: add new columns if missing.
         ensure_column(&conn, "max_executions", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "execution_count", "INTEGER NOT NULL DEFAULT 0")?;
@@ -216,16 +216,16 @@ impl SqliteStore {
 /// migrate older databases that predate a schema change.
 fn ensure_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")
-        .map_err(|e| XhjobError::Store(format!("pragma table_info: {}", e)))?;
+        .map_err(|e| XhjobError::store(format!("pragma table_info: {}", e)))?;
     let cols: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| XhjobError::Store(format!("pragma query_map: {}", e)))?
+        .map_err(|e| XhjobError::store(format!("pragma query_map: {}", e)))?
         .filter_map(|r| r.ok())
         .collect();
     if !cols.iter().any(|c| c == name) {
         conn.execute(
             &format!("ALTER TABLE tasks ADD COLUMN {} {}", name, sql_type),
             [],
-        ).map_err(|e| XhjobError::Store(format!("alter table add {}: {}", name, e)))?;
+        ).map_err(|e| XhjobError::store(format!("alter table add {}: {}", name, e)))?;
     }
     Ok(())
 }
@@ -356,11 +356,11 @@ impl TaskStore for SqliteStore {
                         task.chord_id,
                         task.owner,
                     ],
-                ).map_err(|e| XhjobError::Store(format!("insert: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("insert: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -373,11 +373,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE tasks SET state = ?1, started_at = COALESCE(?2, started_at), finished_at = COALESCE(?3, finished_at) WHERE id = ?4",
                     params![state.as_str(), started_at, finished_at, id],
-                ).map_err(|e| XhjobError::Store(format!("update_state: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("update_state: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -391,11 +391,11 @@ impl TaskStore for SqliteStore {
                     "INSERT OR REPLACE INTO results (task_id, body, status_code, stdout, stderr, exit_code)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![task_id, result.body, result.status_code, result.stdout, result.stderr, result.exit_code],
-                ).map_err(|e| XhjobError::Store(format!("save_result: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("save_result: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -407,9 +407,9 @@ impl TaskStore for SqliteStore {
                 let mut stmt = conn.prepare(
                     // 同时匹配新的小写与历史的大写存储，保证旧库数据仍可被恢复。
                     "SELECT * FROM tasks WHERE state IN ('pending', 'running', 'interrupted', 'PENDING', 'RUNNING', 'INTERRUPTED')"
-                ).map_err(|e| XhjobError::Store(format!("prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("prepare: {}", e)))?;
                 let rows = stmt.query_map([], task_from_row)
-                    .map_err(|e| XhjobError::Store(format!("query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("query: {}", e)))?;
                 let mut tasks = Vec::new();
                 for row in rows {
                     if let Ok(t) = row { tasks.push(t); }
@@ -417,7 +417,7 @@ impl TaskStore for SqliteStore {
                 Ok(tasks)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -428,16 +428,16 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare("SELECT * FROM tasks WHERE id = ?1")
-                    .map_err(|e| XhjobError::Store(format!("prepare: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![id], task_from_row)
-                    .map_err(|e| XhjobError::Store(format!("query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("query: {}", e)))?;
                 if let Some(row) = rows.next() {
                     if let Ok(t) = row { return Ok(Some(t)); }
                 }
                 Ok(None)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -448,7 +448,7 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare("SELECT body, status_code, stdout, stderr, exit_code FROM results WHERE task_id = ?1")
-                    .map_err(|e| XhjobError::Store(format!("prepare: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![id], |row| {
                     Ok(TaskResult {
                         body: row.get(0)?,
@@ -457,14 +457,14 @@ impl TaskStore for SqliteStore {
                         stderr: row.get(3)?,
                         exit_code: row.get(4)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("query: {}", e)))?;
                 if let Some(row) = rows.next() {
                     if let Ok(r) = row { return Ok(Some(r)); }
                 }
                 Ok(None)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -478,11 +478,11 @@ impl TaskStore for SqliteStore {
                     "SELECT COUNT(*) FROM tasks WHERE id = ?1 AND state IN ('running', 'RUNNING')",
                     params![id],
                     |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("count: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("count: {}", e)))?;
                 Ok(count as u32)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -495,11 +495,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE tasks SET next_fire = ?1 WHERE id = ?2",
                     params![next_fire, id],
-                ).map_err(|e| XhjobError::Store(format!("update_next_fire: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("update_next_fire: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -512,11 +512,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE tasks SET attempts = ?1, last_error = ?2 WHERE id = ?3",
                     params![attempts, last_error, id],
-                ).map_err(|e| XhjobError::Store(format!("set_attempts: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("set_attempts: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -527,13 +527,13 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 conn.execute("DELETE FROM results WHERE task_id = ?1", params![id])
-                    .map_err(|e| XhjobError::Store(format!("delete result: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("delete result: {}", e)))?;
                 conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])
-                    .map_err(|e| XhjobError::Store(format!("delete task: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("delete task: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -546,16 +546,16 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE tasks SET execution_count = execution_count + 1 WHERE id = ?1",
                     params![id],
-                ).map_err(|e| XhjobError::Store(format!("increment_execution_count update: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("increment_execution_count update: {}", e)))?;
                 let new_count: i64 = conn.query_row(
                     "SELECT execution_count FROM tasks WHERE id = ?1",
                     params![id],
                     |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("increment_execution_count select: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("increment_execution_count select: {}", e)))?;
                 Ok(new_count as u32)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -566,16 +566,16 @@ impl TaskStore for SqliteStore {
             tokio::task::spawn_blocking(move || {
                 let conn = conn.lock().unwrap();
                 let affected = conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])
-                    .map_err(|e| XhjobError::Store(format!("remove_task: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("remove_task: {}", e)))?;
                 if affected == 0 {
                     return Err(XhjobError::TaskNotFound(id));
                 }
                 conn.execute("DELETE FROM results WHERE task_id = ?1", params![id])
-                    .map_err(|e| XhjobError::Store(format!("remove_task results: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("remove_task results: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -588,14 +588,14 @@ impl TaskStore for SqliteStore {
                 let affected = conn.execute(
                     "UPDATE tasks SET paused = ?1 WHERE id = ?2",
                     params![paused as i64, id],
-                ).map_err(|e| XhjobError::Store(format!("set_paused: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("set_paused: {}", e)))?;
                 if affected == 0 {
                     return Err(XhjobError::TaskNotFound(id));
                 }
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -609,18 +609,18 @@ impl TaskStore for SqliteStore {
                     "SELECT state FROM tasks WHERE id = ?1",
                     params![id],
                     |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("cancel_task query: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("cancel_task query: {}", e)))?;
                 // 大小写无关比较，兼容历史的大写存储与新的小写存储。
                 if state_str.eq_ignore_ascii_case("PENDING") {
                     conn.execute(
                         "UPDATE tasks SET state = 'cancelled', cancel_requested = 1, finished_at = ?1 WHERE id = ?2",
                         params![crate::store::now_ts() as i64, id],
-                    ).map_err(|e| XhjobError::Store(format!("cancel_task update: {}", e)))?;
+                    ).map_err(|e| XhjobError::store(format!("cancel_task update: {}", e)))?;
                 } else if state_str.eq_ignore_ascii_case("RUNNING") {
                     conn.execute(
                         "UPDATE tasks SET cancel_requested = 1 WHERE id = ?1",
                         params![id],
-                    ).map_err(|e| XhjobError::Store(format!("cancel_task update: {}", e)))?;
+                    ).map_err(|e| XhjobError::store(format!("cancel_task update: {}", e)))?;
                 } else {
                     return Err(XhjobError::InvalidTask(format!(
                         "task {} already in terminal state: {}",
@@ -630,7 +630,7 @@ impl TaskStore for SqliteStore {
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -648,11 +648,11 @@ impl TaskStore for SqliteStore {
                           AND (?1 - finished_at) > result_ttl
                     )",
                     params![now],
-                ).map_err(|e| XhjobError::Store(format!("cleanup_expired_results: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("cleanup_expired_results: {}", e)))?;
                 Ok(deleted as u64)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -667,11 +667,11 @@ impl TaskStore for SqliteStore {
                     Some(state) => {
                         let mut stmt = conn.prepare(
                             "SELECT * FROM tasks WHERE state = ?1 ORDER BY created_at ASC"
-                        ).map_err(|e| XhjobError::Store(format!("list_tasks prepare: {}", e)))?;
+                        ).map_err(|e| XhjobError::store(format!("list_tasks prepare: {}", e)))?;
                         let rows = stmt.query_map(params![state.as_str()], task_from_row)
-                            .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
+                            .map_err(|e| XhjobError::store(format!("list_tasks query: {}", e)))?;
                         for row in rows {
-                            let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                            let task = row.map_err(|e| XhjobError::store(format!("list_tasks row: {}", e)))?;
                             if let Some(tag) = &tag_filter {
                                 if !task.tags.iter().any(|t| t == tag) { continue; }
                             }
@@ -681,11 +681,11 @@ impl TaskStore for SqliteStore {
                     None => {
                         let mut stmt = conn.prepare(
                             "SELECT * FROM tasks ORDER BY created_at ASC"
-                        ).map_err(|e| XhjobError::Store(format!("list_tasks prepare: {}", e)))?;
+                        ).map_err(|e| XhjobError::store(format!("list_tasks prepare: {}", e)))?;
                         let rows = stmt.query_map([], task_from_row)
-                            .map_err(|e| XhjobError::Store(format!("list_tasks query: {}", e)))?;
+                            .map_err(|e| XhjobError::store(format!("list_tasks query: {}", e)))?;
                         for row in rows {
-                            let task = row.map_err(|e| XhjobError::Store(format!("list_tasks row: {}", e)))?;
+                            let task = row.map_err(|e| XhjobError::store(format!("list_tasks row: {}", e)))?;
                             if let Some(tag) = &tag_filter {
                                 if !task.tags.iter().any(|t| t == tag) { continue; }
                             }
@@ -696,7 +696,7 @@ impl TaskStore for SqliteStore {
                 Ok(result)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -711,7 +711,7 @@ impl TaskStore for SqliteStore {
                     params![id],
                     |row| row.get(0),
                 ).optional()
-                    .map_err(|e| XhjobError::Store(format!("requeue_task query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("requeue_task query: {}", e)))?;
                 let state_str = match state_str {
                     Some(s) => s,
                     None => return Ok(false), // task does not exist
@@ -729,11 +729,11 @@ impl TaskStore for SqliteStore {
                      started_at = NULL, finished_at = NULL, cancel_requested = 0, \
                      next_fire = ?1 WHERE id = ?2",
                     params![now, id],
-                ).map_err(|e| XhjobError::Store(format!("requeue_task update: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("requeue_task update: {}", e)))?;
                 Ok(true)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -755,7 +755,7 @@ impl TaskStore for SqliteStore {
                         Ok((cron, state, tz))
                     },
                 ).optional()
-                    .map_err(|e| XhjobError::Store(format!("reschedule_task query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("reschedule_task query: {}", e)))?;
                 let (cron_opt, state_str, tz_opt) = match row_opt {
                     Some(r) => r,
                     None => return Ok(false), // task not found
@@ -778,12 +778,12 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE tasks SET cron = ?1, next_fire = ?2 WHERE id = ?3",
                     params![new_cron, new_next, id],
-                ).map_err(|e| XhjobError::Store(format!("reschedule_task update: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("reschedule_task update: {}", e)))?;
                 // state / execution_count / attempts / meta preserved (untouched by UPDATE).
                 Ok(true)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -804,11 +804,11 @@ impl TaskStore for SqliteStore {
                          finished_at = NULL
                      WHERE state IN ('running', 'RUNNING') AND acks_late = 1",
                     params![now],
-                ).map_err(|e| XhjobError::Store(format!("reset_running_to_pending update: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("reset_running_to_pending update: {}", e)))?;
                 Ok(changed as u64)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -824,11 +824,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "INSERT INTO events (task_id, event_type, payload, ts) VALUES (?1, ?2, ?3, ?4)",
                     params![task_id, event_type.as_str(), payload, ts],
-                ).map_err(|e| XhjobError::Store(format!("record_event: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("record_event: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -844,7 +844,7 @@ impl TaskStore for SqliteStore {
                         let mut stmt = conn.prepare(
                             "SELECT task_id, event_type, payload, ts FROM events
                              WHERE ts >= ?1 AND task_id = ?2 ORDER BY ts ASC"
-                        ).map_err(|e| XhjobError::Store(format!("list_events prepare: {}", e)))?;
+                        ).map_err(|e| XhjobError::store(format!("list_events prepare: {}", e)))?;
                         let rows = stmt.query_map(params![since_ts, tid], |row| {
                             let event_type_str: String = row.get(1)?;
                             let event_type = super::EventType::from_str(&event_type_str)
@@ -855,7 +855,7 @@ impl TaskStore for SqliteStore {
                                 payload: row.get(2)?,
                                 ts: row.get(3)?,
                             })
-                        }).map_err(|e| XhjobError::Store(format!("list_events query: {}", e)))?;
+                        }).map_err(|e| XhjobError::store(format!("list_events query: {}", e)))?;
                         for r in rows {
                             if let Ok(e) = r { out.push(e); }
                         }
@@ -864,7 +864,7 @@ impl TaskStore for SqliteStore {
                         let mut stmt = conn.prepare(
                             "SELECT task_id, event_type, payload, ts FROM events
                              WHERE ts >= ?1 ORDER BY ts ASC"
-                        ).map_err(|e| XhjobError::Store(format!("list_events prepare: {}", e)))?;
+                        ).map_err(|e| XhjobError::store(format!("list_events prepare: {}", e)))?;
                         let rows = stmt.query_map(params![since_ts], |row| {
                             let event_type_str: String = row.get(1)?;
                             let event_type = super::EventType::from_str(&event_type_str)
@@ -875,7 +875,7 @@ impl TaskStore for SqliteStore {
                                 payload: row.get(2)?,
                                 ts: row.get(3)?,
                             })
-                        }).map_err(|e| XhjobError::Store(format!("list_events query: {}", e)))?;
+                        }).map_err(|e| XhjobError::store(format!("list_events query: {}", e)))?;
                         for r in rows {
                             if let Ok(e) = r { out.push(e); }
                         }
@@ -884,7 +884,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -898,11 +898,11 @@ impl TaskStore for SqliteStore {
                 let deleted = conn.execute(
                     "DELETE FROM events WHERE ts < ?1",
                     params![cutoff],
-                ).map_err(|e| XhjobError::Store(format!("cleanup_expired_events: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("cleanup_expired_events: {}", e)))?;
                 Ok(deleted as u64)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -920,11 +920,11 @@ impl TaskStore for SqliteStore {
                     "INSERT OR REPLACE INTO chains (chain_id, tasks, current_step, state, created_at, updated_at)
                      VALUES (?1, ?2, 0, 'pending', ?3, ?3)",
                     params![chain_id, tasks_str, created_at],
-                ).map_err(|e| XhjobError::Store(format!("create_chain: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("create_chain: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -936,7 +936,7 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT chain_id, tasks, current_step, state, created_at, updated_at FROM chains WHERE chain_id = ?1"
-                ).map_err(|e| XhjobError::Store(format!("get_chain prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("get_chain prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![chain_id], |row| {
                     let tasks_str: String = row.get(1)?;
                     let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
@@ -948,14 +948,14 @@ impl TaskStore for SqliteStore {
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("get_chain query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("get_chain query: {}", e)))?;
                 if let Some(row) = rows.next() {
                     if let Ok(c) = row { return Ok(Some(c)); }
                 }
                 Ok(None)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -969,11 +969,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE chains SET current_step = ?1, state = ?2, updated_at = ?3 WHERE chain_id = ?4",
                     params![current_step as i64, state, updated_at, chain_id],
-                ).map_err(|e| XhjobError::Store(format!("update_chain_step: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("update_chain_step: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -985,7 +985,7 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT chain_id, tasks, current_step, state, created_at, updated_at FROM chains WHERE state = ?1 ORDER BY created_at ASC"
-                ).map_err(|e| XhjobError::Store(format!("list_chains_by_state prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("list_chains_by_state prepare: {}", e)))?;
                 let rows = stmt.query_map(params![state], |row| {
                     let tasks_str: String = row.get(1)?;
                     let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
@@ -997,7 +997,7 @@ impl TaskStore for SqliteStore {
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("list_chains_by_state query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("list_chains_by_state query: {}", e)))?;
                 let mut out = Vec::new();
                 for r in rows {
                     if let Ok(c) = r { out.push(c); }
@@ -1005,7 +1005,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1023,11 +1023,11 @@ impl TaskStore for SqliteStore {
                     "INSERT OR REPLACE INTO groups (group_id, tasks, state, created_at, updated_at)
                      VALUES (?1, ?2, 'pending', ?3, ?3)",
                     params![group_id, tasks_str, created_at],
-                ).map_err(|e| XhjobError::Store(format!("create_group: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("create_group: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1039,7 +1039,7 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT group_id, tasks, state, created_at, updated_at FROM groups WHERE group_id = ?1"
-                ).map_err(|e| XhjobError::Store(format!("get_group prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("get_group prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![group_id], |row| {
                     let tasks_str: String = row.get(1)?;
                     let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
@@ -1050,14 +1050,14 @@ impl TaskStore for SqliteStore {
                         created_at: row.get(3)?,
                         updated_at: row.get(4)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("get_group query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("get_group query: {}", e)))?;
                 if let Some(row) = rows.next() {
                     if let Ok(g) = row { return Ok(Some(g)); }
                 }
                 Ok(None)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1071,11 +1071,11 @@ impl TaskStore for SqliteStore {
                 conn.execute(
                     "UPDATE groups SET state = ?1, updated_at = ?2 WHERE group_id = ?3",
                     params![state, updated_at, group_id],
-                ).map_err(|e| XhjobError::Store(format!("update_group_state: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("update_group_state: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1087,7 +1087,7 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT group_id, tasks, state, created_at, updated_at FROM groups WHERE state = ?1 ORDER BY created_at ASC"
-                ).map_err(|e| XhjobError::Store(format!("list_groups_by_state prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("list_groups_by_state prepare: {}", e)))?;
                 let rows = stmt.query_map(params![state], |row| {
                     let tasks_str: String = row.get(1)?;
                     let tasks: Vec<serde_json::Value> = serde_json::from_str(&tasks_str).unwrap_or_default();
@@ -1098,7 +1098,7 @@ impl TaskStore for SqliteStore {
                         created_at: row.get(3)?,
                         updated_at: row.get(4)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("list_groups_by_state query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("list_groups_by_state query: {}", e)))?;
                 let mut out = Vec::new();
                 for r in rows {
                     if let Ok(g) = r { out.push(g); }
@@ -1106,7 +1106,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1126,11 +1126,11 @@ impl TaskStore for SqliteStore {
                     "INSERT OR REPLACE INTO chords (id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at)
                      VALUES (?1, ?2, ?3, NULL, 'pending', ?4, ?4)",
                     params![id, header_str, callback_json, created_at],
-                ).map_err(|e| XhjobError::Store(format!("create_chord: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("create_chord: {}", e)))?;
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1142,7 +1142,7 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at FROM chords WHERE id = ?1"
-                ).map_err(|e| XhjobError::Store(format!("get_chord prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("get_chord prepare: {}", e)))?;
                 let mut rows = stmt.query_map(params![id], |row| {
                     let header_str: String = row.get(1)?;
                     let header_task_ids: Vec<String> = serde_json::from_str(&header_str).unwrap_or_default();
@@ -1155,14 +1155,14 @@ impl TaskStore for SqliteStore {
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })
-                }).map_err(|e| XhjobError::Store(format!("get_chord query: {}", e)))?;
+                }).map_err(|e| XhjobError::store(format!("get_chord query: {}", e)))?;
                 if let Some(row) = rows.next() {
                     if let Ok(c) = row { return Ok(Some(c)); }
                 }
                 Ok(None)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1180,17 +1180,17 @@ impl TaskStore for SqliteStore {
                     conn.execute(
                         "UPDATE chords SET state = ?1, callback_task_id = ?2, updated_at = ?3 WHERE id = ?4",
                         params![state, cid, updated_at, id],
-                    ).map_err(|e| XhjobError::Store(format!("update_chord_state: {}", e)))?;
+                    ).map_err(|e| XhjobError::store(format!("update_chord_state: {}", e)))?;
                 } else {
                     conn.execute(
                         "UPDATE chords SET state = ?1, updated_at = ?2 WHERE id = ?3",
                         params![state, updated_at, id],
-                    ).map_err(|e| XhjobError::Store(format!("update_chord_state: {}", e)))?;
+                    ).map_err(|e| XhjobError::store(format!("update_chord_state: {}", e)))?;
                 }
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1205,14 +1205,14 @@ impl TaskStore for SqliteStore {
                 let affected = conn.execute(
                     "UPDATE tasks SET progress = ?1, progress_meta = ?2 WHERE id = ?3",
                     params![percent as i64, meta, id],
-                ).map_err(|e| XhjobError::Store(format!("update_progress: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("update_progress: {}", e)))?;
                 if affected == 0 {
                     return Err(XhjobError::TaskNotFound(id));
                 }
                 Ok(())
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1223,9 +1223,9 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT * FROM tasks WHERE state IN ('running', 'RUNNING') ORDER BY created_at ASC"
-                ).map_err(|e| XhjobError::Store(format!("list_active_summary prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("list_active_summary prepare: {}", e)))?;
                 let rows = stmt.query_map([], task_from_row)
-                    .map_err(|e| XhjobError::Store(format!("list_active_summary query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("list_active_summary query: {}", e)))?;
                 let mut out = Vec::new();
                 for r in rows {
                     if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
@@ -1233,7 +1233,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1244,9 +1244,9 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT * FROM tasks WHERE cron IS NOT NULL OR interval IS NOT NULL ORDER BY created_at ASC"
-                ).map_err(|e| XhjobError::Store(format!("list_registered_summary prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("list_registered_summary prepare: {}", e)))?;
                 let rows = stmt.query_map([], task_from_row)
-                    .map_err(|e| XhjobError::Store(format!("list_registered_summary query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("list_registered_summary query: {}", e)))?;
                 let mut out = Vec::new();
                 for r in rows {
                     if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
@@ -1254,7 +1254,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1265,9 +1265,9 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let mut stmt = conn.prepare(
                     "SELECT * FROM tasks WHERE next_fire IS NOT NULL AND next_fire > ?1 ORDER BY created_at ASC"
-                ).map_err(|e| XhjobError::Store(format!("list_scheduled_summary prepare: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("list_scheduled_summary prepare: {}", e)))?;
                 let rows = stmt.query_map(params![now], task_from_row)
-                    .map_err(|e| XhjobError::Store(format!("list_scheduled_summary query: {}", e)))?;
+                    .map_err(|e| XhjobError::store(format!("list_scheduled_summary query: {}", e)))?;
                 let mut out = Vec::new();
                 for r in rows {
                     if let Ok(t) = r { out.push(TaskSummary::from(&t)); }
@@ -1275,7 +1275,7 @@ impl TaskStore for SqliteStore {
                 Ok(out)
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 
@@ -1286,24 +1286,24 @@ impl TaskStore for SqliteStore {
                 let conn = conn.lock().unwrap();
                 let total: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks", [], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats total: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats total: {}", e)))?;
                 let pending: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE state IN ('pending', 'PENDING')", [], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats pending: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats pending: {}", e)))?;
                 let running: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE state IN ('running', 'RUNNING')", [], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats running: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats running: {}", e)))?;
                 let success: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE state IN ('success', 'SUCCESS')", [], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats success: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats success: {}", e)))?;
                 let failed: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE state IN ('failed', 'FAILED')", [], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats failed: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats failed: {}", e)))?;
                 let now = crate::store::now_ts();
                 let queue_depth: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE next_fire IS NOT NULL AND next_fire > ?1",
                     params![now], |row| row.get(0),
-                ).map_err(|e| XhjobError::Store(format!("worker_stats queue_depth: {}", e)))?;
+                ).map_err(|e| XhjobError::store(format!("worker_stats queue_depth: {}", e)))?;
                 Ok(WorkerStats {
                     total: total as u32,
                     pending: pending as u32,
@@ -1314,7 +1314,7 @@ impl TaskStore for SqliteStore {
                 })
             })
             .await
-            .map_err(|e| XhjobError::Store(format!("spawn_blocking join: {}", e)))?
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
         })
     }
 }

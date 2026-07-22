@@ -28,7 +28,7 @@ pub struct CronEntry {
 pub fn validate_timezone(tz_str: &str) -> Result<()> {
     tz_str.parse::<Tz>()
         .map(|_| ())
-        .map_err(|_| XhjobError::Config(format!("invalid timezone: {}", tz_str)))
+        .map_err(|_| XhjobError::config(format!("invalid timezone: {}", tz_str)))
 }
 
 /// Compute the next fire time for a cron expression.
@@ -59,7 +59,7 @@ pub fn next_fire(
     let next_ts: i64 = match timezone {
         Some(tz_str) => {
             let tz: Tz = tz_str.parse()
-                .map_err(|_| XhjobError::Config(format!("invalid timezone: {}", tz_str)))?;
+                .map_err(|_| XhjobError::config(format!("invalid timezone: {}", tz_str)))?;
             let from_dt = tz.timestamp_opt(from_ts as i64, 0).single()
                 .ok_or_else(|| XhjobError::CronParse(format!("invalid from_ts: {}", from_ts)))?;
             schedule.after(&from_dt).next()
@@ -575,7 +575,7 @@ mod tests {
         let now = now_ts();
         let res = next_fire("0 9 * * *", now, Some("Invalid/Zone"));
         match res {
-            Err(XhjobError::Config(msg)) => {
+            Err(XhjobError::Config { context: msg, .. }) => {
                 assert!(msg.contains("invalid timezone"), "unexpected message: {}", msg);
                 assert!(msg.contains("Invalid/Zone"), "message should mention the bad zone: {}", msg);
             }

@@ -117,14 +117,14 @@ pub struct Event {
 /// Write a length-prefixed JSON frame.
 pub async fn write_frame<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
     let json = serde_json::to_vec(msg)
-        .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
     let len = json.len() as u32;
     w.write_all(&len.to_be_bytes()).await
-        .map_err(|e| XhjobError::Ipc(format!("write len: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("write len: {}", e)))?;
     w.write_all(&json).await
-        .map_err(|e| XhjobError::Ipc(format!("write body: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("write body: {}", e)))?;
     w.flush().await
-        .map_err(|e| XhjobError::Ipc(format!("flush: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("flush: {}", e)))?;
     Ok(())
 }
 
@@ -132,20 +132,20 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg:
 pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await
-        .map_err(|e| XhjobError::Ipc(format!("read len: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("read len: {}", e)))?;
     let len = u32::from_be_bytes(len_buf) as usize;
     // P0 fix: lowered from 64 MB to 8 MB. A legitimate IPC request (dispatch
     // / chain / group / chord) is typically < 10 KB. 8 MB is generous enough
     // for large payloads while preventing a single malicious connection from
     // allocating 64 MB of memory per frame.
     if len > 8 * 1024 * 1024 {
-        return Err(XhjobError::Ipc(format!("frame too large: {} (max 8MB)", len)));
+        return Err(XhjobError::ipc(format!("frame too large: {} (max 8MB)", len)));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await
-        .map_err(|e| XhjobError::Ipc(format!("read body: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("read body: {}", e)))?;
     serde_json::from_slice(&buf)
-        .map_err(|e| XhjobError::Ipc(format!("deserialize: {}", e)))
+        .map_err(|e| XhjobError::ipc(format!("deserialize: {}", e)))
 }
 
 /// Server-side listener abstraction.

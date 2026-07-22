@@ -23,7 +23,7 @@ pub fn encryption_key() -> Option<[u8; 32]> {
 /// a random 12-byte nonce prepended. Format: base64(nonce || ciphertext).
 pub fn encrypt(plaintext: &str) -> Result<String> {
     let key_bytes = encryption_key()
-        .ok_or_else(|| XhjobError::Store("encryption key not set".to_string()))?;
+        .ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     // P0-22 fix: generate the 12-byte nonce from the OS CSPRNG (OsRng)
@@ -45,7 +45,7 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
     };
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| XhjobError::Store(format!("encrypt: {}", e)))?;
+        .map_err(|e| XhjobError::store(format!("encrypt: {}", e)))?;
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
     Ok(base64_encode(&combined))
@@ -54,20 +54,20 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
 /// Decrypt a base64-encoded ciphertext (nonce || ciphertext).
 pub fn decrypt(b64: &str) -> Result<String> {
     let key_bytes = encryption_key()
-        .ok_or_else(|| XhjobError::Store("encryption key not set".to_string()))?;
+        .ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
     let combined = base64_decode(b64)
-        .map_err(|e| XhjobError::Store(format!("decrypt base64: {}", e)))?;
+        .map_err(|e| XhjobError::store(format!("decrypt base64: {}", e)))?;
     if combined.len() < 12 {
-        return Err(XhjobError::Store("decrypt: ciphertext too short".to_string()));
+        return Err(XhjobError::store("decrypt: ciphertext too short".to_string()));
     }
     let (nonce_bytes, ciphertext) = combined.split_at(12);
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| XhjobError::Store(format!("decrypt: {}", e)))?;
+        .map_err(|e| XhjobError::store(format!("decrypt: {}", e)))?;
     String::from_utf8(plaintext)
-        .map_err(|e| XhjobError::Store(format!("decrypt utf8: {}", e)))
+        .map_err(|e| XhjobError::store(format!("decrypt utf8: {}", e)))
 }
 
 fn base64_encode(data: &[u8]) -> String {

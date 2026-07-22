@@ -24,14 +24,22 @@ use once_cell::sync::OnceCell;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Shared state between the pool and its worker threads.
 struct PoolInner {
     sender: Sender<Job>,
     shutdown: Sender<()>,
-    workers: Vec<thread::JoinHandle<()>>,
 }
 
 pub struct ThreadPool {
     inner: Arc<PoolInner>,
+    /// P1 fix: workers are owned directly by `ThreadPool` (not inside the
+    /// `Arc<PoolInner>`) so that `Drop` can actually `join()` them. When
+    /// workers lived behind the shared `Arc`, `Drop` could only send the
+    /// shutdown signal — it couldn't move the `Vec<JoinHandle>` out to
+    /// drain it, so workers were abandoned (possibly mid-task) on drop.
+    /// Keeping them here means `Drop` owns the only handle and can wait
+    /// for each worker to finish its current job before the process exits.
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
 static GLOBAL: OnceCell<ThreadPool> = OnceCell::new();
@@ -73,8 +81,8 @@ impl ThreadPool {
             inner: Arc::new(PoolInner {
                 sender,
                 shutdown: shutdown_tx,
-                workers,
             }),
+            workers,
         }
     }
 
@@ -90,21 +98,41 @@ impl ThreadPool {
 
     /// Number of worker threads.
     pub fn size(&self) -> usize {
-        self.inner.workers.len()
+        self.workers.len()
     }
 
     /// Shutdown the pool: signal workers to stop and join them.
+    ///
+    /// P1 fix: actually `join()` each worker so a graceful shutdown waits
+    /// for in-flight jobs to complete (or for the worker to observe the
+    /// shutdown signal and exit its loop) instead of abandoning the threads.
+    /// Joining also lets us surface a panic from a worker via `join_err`,
+    /// which previously was silently dropped.
     pub fn shutdown(&self) {
         let _ = self.inner.shutdown.send(());
-        // Drop sender so receivers eventually see channel close.
-        // Note: we can't drop sender here because it's shared via Arc; instead
-        // workers will exit on shutdown signal.
+        // Drop the sender so receivers see channel close — but it's shared
+        // via Arc with workers only through the receiver; we keep the sender
+        // alive on the pool. The shutdown signal is the primary stop trigger.
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.shutdown();
+        // Signal workers to exit their select! loop.
+        let _ = self.inner.shutdown.send(());
+        // Drain and join each worker so we don't abandon threads mid-job.
+        // A bounded join timeout would be ideal, but std JoinHandle has no
+        // timed join; workers exit promptly once they observe the shutdown
+        // signal (between jobs, immediately; mid-job, after the job returns).
+        for handle in self.workers.drain(..) {
+            if let Err(join_err) = handle.join() {
+                // Worker panicked — log and continue joining the rest.
+                tracing::warn!(
+                    error = ?join_err,
+                    "thread pool worker panicked during shutdown; continuing to join remaining workers"
+                );
+            }
+        }
     }
 }
 

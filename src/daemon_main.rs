@@ -268,7 +268,9 @@ async fn run_daemon() -> Result<()> {
                         .ok().flatten()
                         .map(|t| t.priority)
                         .unwrap_or(0);
-                    let _ = queue.enqueue(&task_id, priority).await;
+                    if let Err(e) = queue.enqueue(&task_id, priority).await {
+                        tracing::warn!(task_id = %task_id, error = %e, "cron callback enqueue failed");
+                    }
                 }
             });
         }, cron_shutdown_rx).await;
@@ -360,8 +362,28 @@ async fn run_daemon() -> Result<()> {
 
     // Cleanup
     let _ = shutdown_tx.send(true);
-    // give workers a moment to drain
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // P1 fix: actually drain in-flight tasks instead of a fixed 200ms sleep.
+    // The queue tracks in-flight task futures via an AtomicU64 counter
+    // (incremented on dispatch, decremented via RAII guard on completion).
+    // We wait up to XHJOB_SHUTDOWN_DRAIN_SECS (default 30s) for that counter
+    // to reach 0; if tasks are still running at the deadline we log how many
+    // were abandoned (they'll be killed when the runtime drops) and proceed.
+    // This prevents long-running tasks from being silently truncated by the
+    // old fixed 200ms sleep while still bounding shutdown latency.
+    let drain_secs = std::env::var("XHJOB_SHUTDOWN_DRAIN_SECS")
+        .ok().and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    let remaining = queue.wait_for_idle(std::time::Duration::from_secs(drain_secs)).await;
+    if remaining > 0 {
+        tracing::warn!(
+            remaining = remaining,
+            drain_secs = drain_secs,
+            "shutdown drain deadline reached; abandoning still-running tasks"
+        );
+    } else {
+        tracing::info!("all in-flight tasks drained during shutdown");
+    }
     #[cfg(unix)]
     crate::daemon::unix::daemon_stopping();
     #[cfg(windows)]
@@ -376,7 +398,20 @@ async fn handle_connection(
     queue: Arc<TaskQueue>,
 ) -> Result<()> {
     let req: Request = read_frame(&mut stream).await?;
-    tracing::debug!(op = %req.op, id = req.id, trace_id = ?req.trace_id, "request");
+    // P0 fix: enter an info_span! keyed by op + trace_id so every downstream
+    // tracing! line in the handler (and the queue / store / executor it calls)
+    // automatically carries the trace_id for cross-process request correlation.
+    // Previously we only logged one debug! line with the trace_id at the entry,
+    // so any error/warn emitted by a deeper frame lost the correlation.
+    let trace_id = req.trace_id.clone().unwrap_or_else(|| "-".to_string());
+    let span = tracing::info_span!(
+        "ipc",
+        op = %req.op,
+        id = req.id,
+        trace_id = %trace_id,
+    );
+    let _guard = span.enter();
+    tracing::debug!("request");
     crate::utils::metrics::record_ipc_request();
     let resp = match req.op.as_str() {
         "dispatch" => handle_dispatch(&store, &queue, req.payload).await,
@@ -530,7 +565,9 @@ async fn handle_dispatch(
     // the daemon layer. Reference: APScheduler replace_existing=False raises
     // ConflictingIdError.
     if task.replace_existing {
-        let _ = store.delete_task(&task.id).await;
+        if let Err(e) = store.delete_task(&task.id).await {
+            tracing::warn!(task_id = %task.id, error = %e, "replace_existing: delete prior task failed");
+        }
     } else if let Ok(Some(_existing)) = store.load_task(&task.id).await {
         return Ok(Response::error(0, format!(
             "task id '{}' already exists; use replace_existing=true to overwrite",
@@ -564,7 +601,7 @@ async fn handle_state_op(
 ) -> Result<Response> {
     let task_id = payload.get("task_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing task_id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -573,7 +610,7 @@ async fn handle_state_op(
     }
     let info = outcome::handle_state(store, task_id).await?;
     let data = serde_json::to_value(&info)
-        .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
     Ok(Response::success(0, data))
 }
 
@@ -583,7 +620,7 @@ async fn handle_result_op(
 ) -> Result<Response> {
     let task_id = payload.get("task_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing task_id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -592,7 +629,7 @@ async fn handle_result_op(
     }
     let result = outcome::handle_result(store, task_id).await?;
     let data = serde_json::to_value(&result)
-        .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
     Ok(Response::success(0, data))
 }
 
@@ -604,7 +641,7 @@ async fn handle_remove_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -625,7 +662,7 @@ async fn handle_pause_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -648,7 +685,7 @@ async fn handle_cancel_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -658,7 +695,11 @@ async fn handle_cancel_op(
     store.cancel_task(task_id).await?;
     // 通知正在执行的 executor 终止子进程。
     // 对 Pending 任务（已被 cancel_task 转 Cancelled 终态）此调用返回 false，无副作用。
-    let _ = queue.signal_cancel(task_id).await;
+    // signal_cancel 返回 bool（是否找到并通知了正在执行的任务），不返回 Result。
+    let signaled = queue.signal_cancel(task_id).await;
+    if !signaled {
+        tracing::debug!(task_id = %task_id, "signal_cancel: no in-flight executor found (task may already be terminal)");
+    }
     Ok(Response::success(0, serde_json::json!({"cancelled": true})))
 }
 
@@ -710,7 +751,7 @@ async fn handle_requeue_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -731,10 +772,10 @@ async fn handle_reschedule_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     let new_cron = payload.get("cron")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing cron".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing cron".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -763,7 +804,7 @@ async fn handle_get_op(
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     match store.load_task(task_id).await? {
         Some(task) => {
             // P0-17: ownership check — only the task's owner can access it.
@@ -771,7 +812,7 @@ async fn handle_get_op(
                 return Ok(resp);
             }
             let data = serde_json::to_value(&task)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
             Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
         }
         None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
@@ -828,9 +869,9 @@ async fn handle_chain_op(
 ) -> Result<Response> {
     let tasks = payload.get("tasks")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| XhjobError::Ipc("missing or invalid tasks array".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing or invalid tasks array".to_string()))?;
     if tasks.is_empty() {
-        return Err(XhjobError::Ipc("chain requires at least one task".to_string()));
+        return Err(XhjobError::ipc("chain requires at least one task".to_string()));
     }
     let chain_id = new_id();
     let now = store::now_ts() as i64;
@@ -842,7 +883,7 @@ async fn handle_chain_op(
     // to run and bumps `current_step`. We set the task's `meta` to encode
     // the chain_id so queue.rs can call advance() on the next success.
     let next = crate::scheduler::chain::advance(store, &chain_id).await?
-        .ok_or_else(|| XhjobError::Store(format!("chain {} produced no first step", chain_id)))?;
+        .ok_or_else(|| XhjobError::store(format!("chain {} produced no first step", chain_id)))?;
     let builder = TaskBuilder::from_json(&next.to_string())?;
     let mut task = builder.build()?;
     // P0-17: propagate owner to chain step task so subsequent ownership
@@ -881,11 +922,11 @@ async fn handle_chain_state_op(
 ) -> Result<Response> {
     let chain_id = payload.get("chain_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing chain_id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing chain_id".to_string()))?;
     match store.get_chain(chain_id).await? {
         Some(record) => {
             let data = serde_json::to_value(&record)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
             Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
         }
         None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
@@ -904,9 +945,9 @@ async fn handle_group_op(
 ) -> Result<Response> {
     let tasks = payload.get("tasks")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| XhjobError::Ipc("missing or invalid tasks array".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing or invalid tasks array".to_string()))?;
     if tasks.is_empty() {
-        return Err(XhjobError::Ipc("group requires at least one task".to_string()));
+        return Err(XhjobError::ipc("group requires at least one task".to_string()));
     }
     let group_id = new_id();
     let now = store::now_ts() as i64;
@@ -956,13 +997,13 @@ async fn handle_group_state_op(
 ) -> Result<Response> {
     let group_id = payload.get("group_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing group_id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing group_id".to_string()))?;
     match store.get_group(group_id).await? {
         Some(record) => {
             let (total, succeeded, failed, pending) =
                 crate::scheduler::group::summarize(store, group_id).await?;
             let mut data = serde_json::to_value(&record)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("summary".to_string(), serde_json::json!({
                     "total": total,
@@ -997,18 +1038,18 @@ async fn handle_chord_op(
 ) -> Result<Response> {
     let header_arr = payload.get("header")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| XhjobError::Ipc("missing or invalid header array".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing or invalid header array".to_string()))?;
     if header_arr.is_empty() {
-        return Err(XhjobError::Ipc("chord requires at least one header task".to_string()));
+        return Err(XhjobError::ipc("chord requires at least one header task".to_string()));
     }
     let callback_json = payload.get("callback")
-        .ok_or_else(|| XhjobError::Ipc("missing callback".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing callback".to_string()))?;
     // Validate the callback config parses as a TaskBuilder up front so we
     // can fail the IPC call before dispatching any header tasks.
     let callback_str = serde_json::to_string(callback_json)
-        .map_err(|e| XhjobError::Ipc(format!("serialize callback: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("serialize callback: {}", e)))?;
     if let Err(e) = TaskBuilder::from_json(&callback_str) {
-        return Err(XhjobError::Ipc(format!("invalid callback builder: {}", e)));
+        return Err(XhjobError::ipc(format!("invalid callback builder: {}", e)));
     }
 
     let chord_id = new_id();
@@ -1044,11 +1085,11 @@ async fn handle_chord_state_op(
 ) -> Result<Response> {
     let chord_id = payload.get("chord_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing chord_id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing chord_id".to_string()))?;
     match store.get_chord(chord_id).await? {
         Some(record) => {
             let data = serde_json::to_value(&record)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
             Ok(Response::success(0, serde_json::json!({"ok": true, "data": data})))
         }
         None => Ok(Response::success(0, serde_json::json!({"ok": false, "error": "not found"}))),
@@ -1064,7 +1105,7 @@ async fn handle_report_progress_op(
 ) -> Result<Response> {
     let id = payload.get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
     let percent = payload.get("percent")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u8;
@@ -1133,14 +1174,14 @@ async fn handle_inspect_op(
             // P0-17: filter out tasks owned by other tenants.
             let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?
         }
         "registered" => {
             let tasks = store.list_registered_summary().await?;
             // P0-17: filter out tasks owned by other tenants.
             let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?
         }
         "scheduled" => {
             let now = crate::store::now_ts();
@@ -1148,12 +1189,12 @@ async fn handle_inspect_op(
             // P0-17: filter out tasks owned by other tenants.
             let tasks = filter_summaries_by_owner(tasks);
             serde_json::to_value(&tasks)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?
         }
         _ => {
             let stats = store.worker_stats().await?;
             serde_json::to_value(&stats)
-                .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?
+                .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?
         }
     };
     Ok(Response::success(0, serde_json::json!({"data": data})))

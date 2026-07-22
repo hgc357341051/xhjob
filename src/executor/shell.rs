@@ -33,7 +33,7 @@ impl Executor for ShellExecutor {
         let soft_timeout = task.soft_timeout;
         Box::pin(async move {
             let payload: ShellPayload = serde_json::from_value(payload_val)
-                .map_err(|e| XhjobError::Exec(format!("invalid shell payload: {}", e)))?;
+                .map_err(|e| XhjobError::exec(format!("invalid shell payload: {}", e)))?;
 
             let mut cmd = build_command(&payload.cmd);
 
@@ -42,7 +42,7 @@ impl Executor for ShellExecutor {
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::null())
                 .spawn()
-                .map_err(|e| XhjobError::Exec(format!("spawn: {}", e)))?;
+                .map_err(|e| XhjobError::exec(format!("spawn: {}", e)))?;
 
             // Wait with timeout
             let stdout_fut = child.stdout.take();
@@ -64,24 +64,28 @@ impl Executor for ShellExecutor {
                     let grace = timeout - soft_secs;
                     // Phase 1: wait soft_secs for graceful completion (no signal yet).
                     match tokio::time::timeout(Duration::from_secs(soft_secs), child.wait()).await {
-                        Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                        Ok(s) => s.map_err(|e| XhjobError::exec(format!("wait: {}", e))),
                         Err(_) => {
                             // soft_timeout elapsed — send SIGTERM to the child.
+                            // P1: target the whole process group (negative pid)
+                            // so grandchildren spawned by the shell are also
+                            // signaled. process_group(0) in build_command
+                            // made the child the group leader, so -pid == pgid.
                             #[cfg(unix)]
                             if let Some(pid) = child.id() {
                                 use nix::sys::signal::{kill, Signal};
                                 use nix::unistd::Pid;
-                                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
                             }
                             // Phase 2: wait grace period for graceful exit after SIGTERM.
                             match tokio::time::timeout(Duration::from_secs(grace), child.wait()).await {
-                                Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                                Ok(s) => s.map_err(|e| XhjobError::exec(format!("wait: {}", e))),
                                 Err(_) => {
                                     // SIGKILL after grace period — reap the child
                                     // so it doesn't become a zombie.
                                     let _ = child.start_kill();
                                     let _ = child.wait().await;
-                                    Err(XhjobError::Exec(format!(
+                                    Err(XhjobError::exec(format!(
                                         "timeout after {}s (soft={}s, grace={}s, SIGKILL)",
                                         timeout, soft_secs, grace
                                     )))
@@ -92,12 +96,12 @@ impl Executor for ShellExecutor {
                 } else {
                     // No soft_timeout: existing logic, just wait timeout then SIGKILL.
                     match tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await {
-                        Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                        Ok(s) => s.map_err(|e| XhjobError::exec(format!("wait: {}", e))),
                         Err(_) => {
                             // timeout: kill the child and reap.
                             let _ = child.start_kill();
                             let _ = child.wait().await;
-                            Err(XhjobError::Exec(format!("timeout after {}s", timeout)))
+                            Err(XhjobError::exec(format!("timeout after {}s", timeout)))
                         }
                     }
                 }
@@ -112,21 +116,30 @@ impl Executor for ShellExecutor {
             //
             // We spawn two read tasks and race the wait against the cancel
             // watcher; on completion/cancel we collect whatever was captured.
+            // P1 fix: cap captured stdout/stderr at MAX_OUTPUT_BYTES so a
+            // runaway child cannot exhaust daemon memory by streaming GBs.
+            // We use `take(MAX)` so reads stop at the cap; the remainder is
+            // simply discarded (the child may then block on a full pipe,
+            // which is fine — we already have enough to surface a result and
+            // the wait/timeout path will reap it).
+            const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB per stream
             let stdout_task = tokio::spawn(async move {
-                if let Some(mut s) = stdout_fut {
+                if let Some(s) = stdout_fut {
                     use tokio::io::AsyncReadExt;
                     let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf).await;
+                    let mut limited = s.take(MAX_OUTPUT_BYTES as u64);
+                    let _ = limited.read_to_end(&mut buf).await;
                     Some(buf)
                 } else {
                     None
                 }
             });
             let stderr_task = tokio::spawn(async move {
-                if let Some(mut s) = stderr_fut {
+                if let Some(s) = stderr_fut {
                     use tokio::io::AsyncReadExt;
                     let mut buf = Vec::new();
-                    let _ = s.read_to_end(&mut buf).await;
+                    let mut limited = s.take(MAX_OUTPUT_BYTES as u64);
+                    let _ = limited.read_to_end(&mut buf).await;
                     Some(buf)
                 } else {
                     None
@@ -151,11 +164,13 @@ impl Executor for ShellExecutor {
                     _ = cancel_watcher => {
                         // cancel 触发：发送 SIGTERM，给 500ms grace 等待优雅退出；
                         // 超时则 SIGKILL 并 reap，避免僵尸进程。
+                        // P1: signal the whole process group (negative pid) so
+                        // grandchildren are also terminated.
                         #[cfg(unix)]
                         if let Some(pid) = child.id() {
                             use nix::sys::signal::{kill, Signal};
                             use nix::unistd::Pid;
-                            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                            let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
                         }
                         #[cfg(not(unix))]
                         { let _ = child.start_kill(); }
@@ -166,7 +181,7 @@ impl Executor for ShellExecutor {
                                 let _ = child.wait().await;
                             }
                         }
-                        Err(XhjobError::Exec("cancelled".to_string()))
+                        Err(XhjobError::exec("cancelled".to_string()))
                     }
                 }
             } else {
@@ -180,15 +195,15 @@ impl Executor for ShellExecutor {
                 Duration::from_millis(500),
                 stdout_task,
             ).await
-                .map_err(|_| XhjobError::Exec("stdout drain timeout".to_string()))?
-                .map_err(|e| XhjobError::Exec(format!("stdout join: {}", e)))?
+                .map_err(|_| XhjobError::exec("stdout drain timeout".to_string()))?
+                .map_err(|e| XhjobError::exec(format!("stdout join: {}", e)))?
                 .unwrap_or_default();
             let stderr_buf = tokio::time::timeout(
                 Duration::from_millis(500),
                 stderr_task,
             ).await
-                .map_err(|_| XhjobError::Exec("stderr drain timeout".to_string()))?
-                .map_err(|e| XhjobError::Exec(format!("stderr join: {}", e)))?
+                .map_err(|_| XhjobError::exec("stderr drain timeout".to_string()))?
+                .map_err(|e| XhjobError::exec(format!("stderr join: {}", e)))?
                 .unwrap_or_default();
 
             let (stdout_text, stderr_text, exit_code) = match status_result {
@@ -234,7 +249,7 @@ fn decode_output(bytes: &[u8], encoding: Option<&String>) -> Result<String> {
 /// - `"utf-8"` / `"utf8"`: lossy UTF-8 passthrough (same as the None path).
 ///
 /// Any other value is forwarded to `encoding_rs::Encoding::for_label`. Unknown
-/// labels produce `XhjobError::Exec("unsupported encoding: ...")`.
+/// labels produce `XhjobError::exec("unsupported encoding: ...")`.
 pub(crate) fn decode_bytes(bytes: &[u8], encoding: &str) -> Result<String> {
     let enc_lower = encoding.to_lowercase();
     if enc_lower == "auto" {
@@ -245,7 +260,7 @@ pub(crate) fn decode_bytes(bytes: &[u8], encoding: &str) -> Result<String> {
         return Ok(String::from_utf8_lossy(bytes).to_string());
     }
     let enc = encoding_rs::Encoding::for_label(encoding.as_bytes())
-        .ok_or_else(|| XhjobError::Exec(format!("unsupported encoding: {}", encoding)))?;
+        .ok_or_else(|| XhjobError::exec(format!("unsupported encoding: {}", encoding)))?;
     let (text, _encoding_used) = enc.decode_without_bom_handling(bytes);
     Ok(text.to_string())
 }
@@ -287,17 +302,52 @@ fn detect_encoding() -> &'static str {
 }
 
 /// Build the platform-specific command.
+///
+/// P1 hardening (all applied here so every spawn path benefits):
+/// - `kill_on_drop(true)`: if the `Child` handle is dropped without an
+///   explicit `kill()` (e.g. panic, early return, daemon SIGKILL), tokio
+///   sends SIGKILL to the child so it cannot be orphaned. Without this,
+///   a daemon killed mid-task leaves `bash` + its grandchildren running.
+/// - `process_group(0)` (Unix): puts the child in its own process group
+///   (pgid == child pid), so a `kill(-pgid, SIGTERM)` reaches the whole
+///   tree (grandchildren spawned by the shell included), not just the
+///   top-level `bash`. Combined with the negative-pid kills in
+///   `execute_with_cancel`, this prevents grandchildren from surviving
+///   a timeout/cancel.
+/// - `env_clear()` + minimal env: starts from a known-clean environment
+///   (no leakage of daemon's PATH / HOME / secrets into user tasks) and
+///   re-adds only `PATH` and `HOME`. This is defence-in-depth against
+///   tasks that happen to share the daemon's uid.
 fn build_command(cmd: &str) -> tokio::process::Command {
     #[cfg(unix)]
     {
         let mut c = tokio::process::Command::new("bash");
         c.arg("-c").arg(cmd);
+        // Put the child in its own process group so we can signal the
+        // whole tree on timeout/cancel. (tokio re-exports this from
+        // std::os::unix::process::CommandExt via its Command type.)
+        c.process_group(0);
+        // kill_on_drop: orphan-safety net for panic / early-return paths.
+        c.kill_on_drop(true);
+        // env_clear + minimal env: avoid leaking daemon env into user tasks.
+        c.env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            c.env("PATH", path);
+        } else {
+            c.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                c.env("HOME", home);
+            }
+        }
         c
     }
     #[cfg(windows)]
     {
         let mut c = tokio::process::Command::new("cmd");
         c.arg("/C").arg(cmd);
+        c.kill_on_drop(true);
         c
     }
 }
@@ -357,7 +407,7 @@ mod tests {
         }
     }
 
-    /// Unknown encoding labels must surface as `Err(XhjobError::Exec(...))`
+    /// Unknown encoding labels must surface as `Err(XhjobError::exec(...))`
     /// rather than silently falling back to lossy UTF-8.
     #[test]
     fn decode_bytes_invalid_encoding_returns_error() {

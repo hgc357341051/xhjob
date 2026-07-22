@@ -37,7 +37,7 @@ pub(crate) struct ParsedProxy {
 /// `reqwest::Proxy::socks5` / `socks5h`).
 pub(crate) fn parse_proxy_url(url: &str) -> Result<ParsedProxy> {
     let (scheme, rest) = url.split_once("://")
-        .ok_or_else(|| XhjobError::Exec(format!("invalid proxy url (no scheme): {}", url)))?;
+        .ok_or_else(|| XhjobError::exec(format!("invalid proxy url (no scheme): {}", url)))?;
 
     // Split `user:pass@host:port` (if present). We use `rfind` so a password
     // containing `@` (rare but possible) does not break parsing.
@@ -91,9 +91,9 @@ fn build_proxy(proxy_str: &str) -> Result<reqwest::Proxy> {
             let url = format!("socks5h://{}", parsed.host_port);
             reqwest::Proxy::all(url.as_str())
         }
-        other => return Err(XhjobError::Exec(format!("unsupported proxy scheme: {}", other))),
+        other => return Err(XhjobError::exec(format!("unsupported proxy scheme: {}", other))),
     }
-    .map_err(|e| XhjobError::Exec(format!("parse proxy {}: {}", proxy_str, e)))?;
+    .map_err(|e| XhjobError::exec(format!("parse proxy {}: {}", proxy_str, e)))?;
 
     let proxy = if let Some(user) = parsed.user {
         let pass = parsed.pass.unwrap_or_default();
@@ -112,10 +112,21 @@ impl Executor for HttpExecutor {
         let proxy = task.proxy.clone();
         Box::pin(async move {
             let payload: HttpPayload = serde_json::from_value(payload_val)
-                .map_err(|e| XhjobError::Exec(format!("invalid http payload: {}", e)))?;
+                .map_err(|e| XhjobError::exec(format!("invalid http payload: {}", e)))?;
 
             let mut client_builder = reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout));
+                .timeout(Duration::from_secs(timeout))
+                // P1 fix: separate, shorter connect timeout so a dead host
+                // fails fast instead of consuming the whole `timeout` budget
+                // (or, if `timeout` is large, hanging the worker for minutes).
+                // 10s is enough for any healthy local/LAN connect; TCP SYN
+                // retransmits alone exceed this for unreachable hosts.
+                .connect_timeout(Duration::from_secs(
+                    std::env::var("XHJOB_HTTP_CONNECT_TIMEOUT")
+                        .ok().and_then(|s| s.parse::<u64>().ok())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(10)
+                ));
 
             if let Some(proxy_str) = &proxy {
                 let p = build_proxy(proxy_str)?;
@@ -123,7 +134,7 @@ impl Executor for HttpExecutor {
             }
 
             let client = client_builder.build()
-                .map_err(|e| XhjobError::Exec(format!("build client: {}", e)))?;
+                .map_err(|e| XhjobError::exec(format!("build client: {}", e)))?;
 
             let method = match payload.method.to_uppercase().as_str() {
                 "GET" => reqwest::Method::GET,
@@ -132,7 +143,7 @@ impl Executor for HttpExecutor {
                 "DELETE" => reqwest::Method::DELETE,
                 "PATCH" => reqwest::Method::PATCH,
                 "HEAD" => reqwest::Method::HEAD,
-                other => return Err(XhjobError::Exec(format!("unsupported method: {}", other))),
+                other => return Err(XhjobError::exec(format!("unsupported method: {}", other))),
             };
 
             let mut req = client.request(method, &payload.url);
@@ -144,10 +155,45 @@ impl Executor for HttpExecutor {
             }
 
             let resp = req.send().await
-                .map_err(|e| XhjobError::Exec(format!("http send: {}", e)))?;
+                .map_err(|e| XhjobError::exec(format!("http send: {}", e)))?;
             let status = resp.status().as_u16() as i32;
-            let body = resp.text().await
-                .map_err(|e| XhjobError::Exec(format!("read body: {}", e)))?;
+
+            // P1 fix: cap response body size so a malicious / runaway server
+            // cannot exhaust daemon memory by streaming GBs. We pre-check
+            // Content-Length when present, and also enforce a hard cap during
+            // streaming read so chunked-transfer responses are bounded too.
+            const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+            if let Some(cl) = resp.content_length() {
+                if cl > MAX_BODY_BYTES {
+                    return Err(XhjobError::exec(format!(
+                        "response body too large: {} bytes (max {})",
+                        cl, MAX_BODY_BYTES
+                    )));
+                }
+            }
+            // Stream the body with a hard cap — works even for chunked
+            // responses that omit Content-Length. We accumulate into a Vec
+            // bounded by MAX_BODY_BYTES; if the cap is hit we error out.
+            let mut stream = resp.bytes_stream();
+            use futures_util::StreamExt;
+            let mut body_buf: Vec<u8> = Vec::new();
+            let mut exceeded = false;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|e| XhjobError::exec(format!("read body chunk: {}", e)))?;
+                if body_buf.len() + chunk.len() > MAX_BODY_BYTES as usize {
+                    exceeded = true;
+                    break;
+                }
+                body_buf.extend_from_slice(&chunk);
+            }
+            if exceeded {
+                return Err(XhjobError::exec(format!(
+                    "response body exceeded max {} bytes during streaming",
+                    MAX_BODY_BYTES
+                )));
+            }
+            let body = String::from_utf8_lossy(&body_buf).to_string();
 
             Ok(TaskResult {
                 body: Some(body),

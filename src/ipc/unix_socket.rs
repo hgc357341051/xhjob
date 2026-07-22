@@ -26,7 +26,7 @@ impl UnixListenerWrapper {
         // remove stale socket file
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)
-            .map_err(|e| XhjobError::Ipc(format!("bind {}: {}", path, e)))?;
+            .map_err(|e| XhjobError::ipc(format!("bind {}: {}", path, e)))?;
         // P0 fix: use fchmod on the raw fd (not path-based chmod) to close
         // the TOCTOU window. With path-based chmod, an attacker who can create
         // a symlink at `path` between bind() and set_permissions() could
@@ -53,7 +53,7 @@ impl IpcListener for UnixListenerWrapper {
     fn accept<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>> {
         Box::pin(async move {
             let (stream, _addr) = self.inner.accept().await
-                .map_err(|e| XhjobError::Ipc(format!("accept: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("accept: {}", e)))?;
             // Fix 5: SO_PEERCRED peer authentication.
             //
             // Without this check, any local user who can reach the socket
@@ -90,7 +90,7 @@ impl IpcListener for UnixListenerWrapper {
 /// Allows: root (uid 0), same uid as daemon, same gid as daemon.
 fn verify_peer_cred(stream: &UnixStream) -> Result<()> {
     let cred = stream.peer_cred()
-        .map_err(|e| XhjobError::Ipc(format!("peer_cred: {}", e)))?;
+        .map_err(|e| XhjobError::ipc(format!("peer_cred: {}", e)))?;
     let peer_uid = cred.uid();
     let peer_gid = cred.gid();
     // Use nix::unistd for geteuid/getegid (nix is already a unix dependency).
@@ -108,7 +108,7 @@ fn verify_peer_cred(stream: &UnixStream) -> Result<()> {
     if peer_gid == my_gid {
         return Ok(());
     }
-    Err(XhjobError::Ipc(format!(
+    Err(XhjobError::ipc(format!(
         "peer credential rejected: peer uid={} gid={} vs daemon uid={} gid={} (set XHJOB_IPC_NO_PEERCRED=1 to bypass for testing)",
         peer_uid, peer_gid, my_uid, my_gid
     )))
@@ -126,11 +126,11 @@ impl UnixStreamWrapper {
                 // fallback to blocking connect with timeout
                 let _ = e;
                 let s = StdUnixStream::connect(&path)
-                    .map_err(|e| XhjobError::Ipc(format!("connect {}: {}", path, e)))?;
+                    .map_err(|e| XhjobError::ipc(format!("connect {}: {}", path, e)))?;
                 s.set_nonblocking(true)
-                    .map_err(|e| XhjobError::Ipc(format!("set_nonblocking: {}", e)))?;
+                    .map_err(|e| XhjobError::ipc(format!("set_nonblocking: {}", e)))?;
                 let s = tokio::net::UnixStream::from_std(s)
-                    .map_err(|e| XhjobError::Ipc(format!("from_std: {}", e)))?;
+                    .map_err(|e| XhjobError::ipc(format!("from_std: {}", e)))?;
                 Ok(Box::new(s))
             }
         }

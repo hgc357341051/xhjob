@@ -16,7 +16,7 @@ impl NamedPipeListenerWrapper {
         let first = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&pipe_name)
-            .map_err(|e| XhjobError::Ipc(format!("create pipe {}: {}", pipe_name, e)))?;
+            .map_err(|e| XhjobError::ipc(format!("create pipe {}: {}", pipe_name, e)))?;
         Ok(Self {
             pipe_name,
             first: Mutex::new(Some(first)),
@@ -36,10 +36,10 @@ impl IpcListener for NamedPipeListenerWrapper {
                 Some(s) => s,
                 None => ServerOptions::new()
                     .create(&self.pipe_name)
-                    .map_err(|e| XhjobError::Ipc(format!("create pipe instance: {}", e)))?,
+                    .map_err(|e| XhjobError::ipc(format!("create pipe instance: {}", e)))?,
             };
             server.connect().await
-                .map_err(|e| XhjobError::Ipc(format!("pipe connect: {}", e)))?;
+                .map_err(|e| XhjobError::ipc(format!("pipe connect: {}", e)))?;
             Ok(Box::new(server) as Box<dyn IpcStream>)
         })
     }
@@ -51,7 +51,7 @@ impl NamedPipeClientWrapper {
     pub fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
         let pipe_name = ipc_path(service_name);
         let client = NamedPipeClient::connect(&pipe_name)
-            .map_err(|e| XhjobError::Ipc(format!("client connect {}: {}", pipe_name, e)))?;
+            .map_err(|e| XhjobError::ipc(format!("client connect {}: {}", pipe_name, e)))?;
         Ok(Box::new(client))
     }
 }

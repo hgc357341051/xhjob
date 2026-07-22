@@ -54,7 +54,7 @@ pub async fn advance(
 
     let now = now_ts() as i64;
     let mut record = store.get_chain(chain_id).await?
-        .ok_or_else(|| XhjobError::Store(format!("chain not found: {}", chain_id)))?;
+        .ok_or_else(|| XhjobError::store(format!("chain not found: {}", chain_id)))?;
     if record.state == "success" || record.state == "failed" {
         return Ok(None);
     }
