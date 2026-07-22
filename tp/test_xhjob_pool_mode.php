@@ -3,8 +3,8 @@
 // +----------------------------------------------------------------------
 // | Xhjob 扩展 - 两种池模式对比测试
 // +----------------------------------------------------------------------
-// | 验证 coroutine（默认协程池，tokio async，最大并发 1024）
-// | 与 thread（多线程池，std::thread + crossbeam-channel，线程数=CPU 核数）
+// | 验证 async（默认 async task 池，tokio M:N，最大并发 1024）
+// | 与 thread（1:1 线程池，std::thread + crossbeam-channel，线程数=CPU 核数）
 // | 两种模式都能正常工作。
 // |
 // | 用法：
@@ -69,7 +69,7 @@ function assertEq($a, $b, string $msg): void
 /**
  * 以指定池模式运行全部测试步骤
  *
- * @param string $mode 'coroutine' 或 'thread'
+ * @param string $mode 'async' 或 'thread'（'coroutine' 为 'async' 兼容别名）
  * @return array{0:int,1:int,2:array} [pass, fail, failedSteps]
  */
 function runTests(string $mode): array
@@ -252,9 +252,9 @@ echo "=== 两种池模式对比测试 ===\n";
 echo "service={$SERVICE} data_dir={$DATA_DIR}\n";
 echo "PHP extension: " . (extension_loaded('xhjob') ? 'loaded' : 'NOT loaded') . "\n\n";
 
-// 协程池模式
-echo "--- 协程池模式（coroutine）---\n";
-[$corPass, $corFail, $corFailed] = runTests('coroutine');
+// async 模式
+echo "--- async 模式（async）---\n";
+[$corPass, $corFail, $corFailed] = runTests('async');
 
 // 线程池模式
 echo "\n--- 多线程池模式（thread）---\n";
@@ -262,7 +262,7 @@ echo "\n--- 多线程池模式（thread）---\n";
 
 // 汇总
 echo "\n=== 汇总 ===\n";
-echo "协程池: {$corPass} passed, {$corFail} failed";
+echo "async 池: {$corPass} passed, {$corFail} failed";
 if (!empty($corFailed)) {
     echo " (失败步骤: [" . implode(', ', $corFailed) . "])";
 }
@@ -279,7 +279,7 @@ if ($corFail === 0 && $thrFail === 0) {
     echo "两种池模式均通过全部测试，行为一致。\n";
 } else {
     if ($corFail > 0) {
-        echo "协程池模式存在失败步骤: [" . implode(', ', $corFailed) . "]\n";
+        echo "async 模式存在失败步骤: [" . implode(', ', $corFailed) . "]\n";
     }
     if ($thrFail > 0) {
         echo "线程池模式存在失败步骤: [" . implode(', ', $thrFailed) . "]\n";

@@ -197,10 +197,10 @@ impl TaskQueue {
             now_ts() as i64,
         ).await;
 
-        // Dispatch via pool (coroutine by default, thread when XHJOB_POOL_MODE=thread).
-        // Thread mode: each task runs in a dedicated worker thread via block_on,
-        // concurrency is bounded by thread count (default=num_cpus).
-        // Coroutine mode (default): async tasks on tokio runtime, max concurrency 1024.
+        // Dispatch via pool (async by default, thread when XHJOB_POOL_MODE=thread).
+        // Thread mode (1:1): each task runs in a dedicated OS worker thread via
+        // block_on, concurrency is bounded by thread count (default=num_cpus).
+        // Async mode (M:N, default): async tasks on tokio runtime, max concurrency 1024.
         let store = Arc::clone(&self.store);
         let overlap = Arc::clone(&self.overlap);
         let queue_arc = Arc::clone(&self);
@@ -469,11 +469,13 @@ impl TaskQueue {
             overlap.on_finish(&task_clone.id).await;
         };
 
-        // Pool mode selection: coroutine (default) or thread.
-        // XHJOB_POOL_MODE=thread → ThreadPool (std::thread + block_on, bounded by thread count)
-        // XHJOB_POOL_MODE=coroutine (default) → CoroutinePool (tokio async, max 1024)
+        // Pool mode selection: async (default) or thread.
+        // XHJOB_POOL_MODE=thread → ThreadPool (1:1 OS thread, std::thread + block_on,
+        //   bounded by thread count; recommended for CPU-bound tasks)
+        // XHJOB_POOL_MODE=async (default) or legacy alias `coroutine`
+        //   → async task pool (M:N tokio scheduling, max 1024; recommended for IO-bound)
         let pool_mode = std::env::var("XHJOB_POOL_MODE")
-            .unwrap_or_else(|_| "coroutine".to_string());
+            .unwrap_or_else(|_| "async".to_string());
         if pool_mode == "thread" {
             crate::pool::thread_pool::global().submit(move || {
                 if let Some(rt) = coroutine_pool::global_runtime() {
@@ -481,6 +483,7 @@ impl TaskQueue {
                 }
             });
         } else {
+            // `async` (recommended) and `coroutine` (legacy alias) both route here.
             let _ = coroutine_pool::global().spawn(task_future);
         }
 

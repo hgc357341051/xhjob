@@ -1,12 +1,19 @@
-//! 线程池模块（多线程池模式）。
+//! 线程池模块（1:1 OS 线程调度模式）。
 //!
 //! 当 `XHJOB_POOL_MODE=thread` 时，daemon 使用此线程池执行任务。每个任务
 //! 在独立的工作线程中运行（通过 `block_on` 执行 async future），适合
 //! CPU 密集型或需要严格并发控制的场景。并发度由线程数控制（默认=CPU 核数，
 //! 可通过 `XHJOB_THREAD_POOL_SIZE` 覆盖）。
 //!
-//! 默认模式 `XHJOB_POOL_MODE=coroutine` 使用协程池（tokio async runtime），
-//! 适合 IO 密集型任务，最大并发 1024（可通过 `XHJOB_COROUTINE_POOL_SIZE` 覆盖）。
+//! 默认模式 `XHJOB_POOL_MODE=async`（或兼容别名 `coroutine`）使用 async task
+//! 池（tokio M:N 调度），适合 IO 密集型任务，最大并发 1024（可通过
+//! `XHJOB_ASYNC_POOL_SIZE` 或兼容别名 `XHJOB_COROUTINE_POOL_SIZE` 覆盖）。
+//!
+//! 两种模式本质区别：
+//!   - async（默认，M:N）：N 个 tokio worker 线程复用跑 M 个 async task，
+//!     task 在 `await` 时 yield 让出线程，单线程可高并发处理 IO。
+//!   - thread（1:1）：每个任务独占一个 OS 线程，`block_on` 阻塞整个线程，
+//!     真并行受限于线程数，适合 CPU 密集型或需严格隔离。
 //!
 //! Built on top of `std::thread` + `crossbeam-channel`.
 

@@ -1,8 +1,15 @@
-//! Real coroutine pool backed by tokio.
+//! Async task pool backed by tokio (M:N scheduling).
 //!
-//! Spawns async tasks onto the global tokio runtime, gated by a `Semaphore`
-//! to enforce a max concurrency. The default max concurrency is 1024; it can
-//! be overridden via `XHJOB_COROUTINE_POOL_SIZE`.
+//! Spawns async tasks (Futures) onto the global tokio runtime, gated by a
+//! `Semaphore` to enforce a max concurrency. The default max concurrency is
+//! 1024; it can be overridden via `XHJOB_ASYNC_POOL_SIZE` (recommended) or
+//! `XHJOB_COROUTINE_POOL_SIZE` (legacy alias, kept for backward compatibility).
+//!
+//! NOTE on naming: Rust has no language-level "coroutine" — only `async/await`
+//! + `Future` compiled to state machines, polled by a runtime (tokio). The
+//! file/struct name `coroutine_pool` is kept for path stability, but the
+//! accurate term is "async task pool": M async tasks multiplexed onto N tokio
+//! worker threads (N = num_cpus) via cooperative `await` yield points.
 
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -50,10 +57,15 @@ impl CoroutinePool {
 }
 
 /// Get the configured max concurrency.
+///
+/// Reads `XHJOB_ASYNC_POOL_SIZE` (recommended) first, then falls back to
+/// `XHJOB_COROUTINE_POOL_SIZE` (legacy alias). Defaults to 1024.
 pub fn configured_max() -> usize {
-    if let Ok(s) = std::env::var("XHJOB_COROUTINE_POOL_SIZE") {
-        if let Ok(n) = s.parse::<usize>() {
-            if n > 0 { return n; }
+    for var in ["XHJOB_ASYNC_POOL_SIZE", "XHJOB_COROUTINE_POOL_SIZE"] {
+        if let Ok(s) = std::env::var(var) {
+            if let Ok(n) = s.parse::<usize>() {
+                if n > 0 { return n; }
+            }
         }
     }
     1024

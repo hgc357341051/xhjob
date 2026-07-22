@@ -14,11 +14,13 @@ return [
     'api_token'    => env('XHJOB_API_TOKEN', null),
 
     // 任务执行池模式：
-    //   - 'coroutine'（默认）：多协程池，基于 tokio async runtime，适合 IO 密集型
-    //     任务（HTTP 请求、shell 命令）。最大并发 1024，可通过
-    //     XHJOB_COROUTINE_POOL_SIZE 覆盖。
-    //   - 'thread'：多线程池，基于 std::thread + crossbeam-channel，每个任务
+    //   - 'async'（默认，推荐）：async task 池，基于 tokio M:N 调度（N 个 tokio
+    //     worker 线程复用跑 M 个 async task，task 在 await 时 yield 让出线程）。
+    //     适合 IO 密集型任务（HTTP 请求、shell 命令）。最大并发 1024，
+    //     可通过 XHJOB_ASYNC_POOL_SIZE 覆盖。
+    //     兼容别名：'coroutine'（等价于 'async'，保持向后兼容）。
+    //   - 'thread'：1:1 OS 线程池，基于 std::thread + crossbeam-channel，每个任务
     //     在独立工作线程中执行（block_on），适合 CPU 密集型或需严格并发控制
     //     的场景。线程数默认=CPU 核数，可通过 XHJOB_THREAD_POOL_SIZE 覆盖。
-    'pool_mode'    => env('XHJOB_POOL_MODE', 'coroutine'),
+    'pool_mode'    => env('XHJOB_POOL_MODE', 'async'),
 ];
