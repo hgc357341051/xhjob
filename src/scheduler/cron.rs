@@ -318,7 +318,9 @@ impl CronScheduler {
         // Reference: Celery result_expires auto-cleanup.
         let last = LAST_CLEANUP_TS.load(Ordering::Relaxed);
         if now > last && now - last > 60 {
-            let _ = self.store.cleanup_expired_results().await;
+            if let Err(e) = self.store.cleanup_expired_results().await {
+                tracing::warn!(error = %e, "cleanup_expired_results failed");
+            }
             LAST_CLEANUP_TS.store(now, Ordering::Relaxed);
         }
         Ok(due)

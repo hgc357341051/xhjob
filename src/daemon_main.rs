@@ -412,6 +412,40 @@ async fn handle_connection(
     Ok(())
 }
 
+/// P0-17 fix: default-deny ownership check.
+///
+/// Returns `Ok(())` if the caller may access `task`, otherwise returns
+/// `Ok(Response::error(...))` wrapped in `Err`-free form via the
+/// `OwnershipResult` alias. The rule is intentionally strict:
+///
+/// - If the task has no owner (empty string, e.g. legacy rows written
+///   before P0-17) → any caller may access (backward compatible).
+/// - If the task has an owner AND the caller's `XHJOB_OWNER` env var is
+///   empty → DENY (default-deny: an unauthenticated caller cannot touch
+///   owned tasks). This closes the bypass where an attacker simply
+///   unsets `XHJOB_OWNER` to access another tenant's tasks.
+/// - If both are non-empty and differ → DENY.
+/// - If both are non-empty and equal → allow.
+///
+/// The previous "soft" check (`!task.owner.is_empty() && !owner.is_empty()
+/// && task.owner != owner`) let an empty caller owner bypass all checks;
+/// this helper makes the empty-caller case deny when the task is owned.
+fn ownership_check(task: &crate::store::Task) -> std::result::Result<(), Response> {
+    if task.owner.is_empty() {
+        // Legacy / unowned task — backward compat: any caller may access.
+        return Ok(());
+    }
+    let caller = std::env::var("XHJOB_OWNER").unwrap_or_default();
+    if caller.is_empty() {
+        // Default-deny: caller did not identify itself but task is owned.
+        return Err(Response::error(0, "ownership: caller has no XHJOB_OWNER but task is owned"));
+    }
+    if task.owner != caller {
+        return Err(Response::error(0, "ownership: task belongs to a different owner"));
+    }
+    Ok(())
+}
+
 async fn handle_dispatch(
     store: &Arc<dyn TaskStore>,
     queue: &Arc<TaskQueue>,
@@ -479,9 +513,8 @@ async fn handle_state_op(
         .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     let info = outcome::handle_state(store, task_id).await?;
@@ -499,9 +532,8 @@ async fn handle_result_op(
         .ok_or_else(|| XhjobError::Ipc("missing task_id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     let result = outcome::handle_result(store, task_id).await?;
@@ -521,9 +553,8 @@ async fn handle_remove_op(
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     store.remove_task(task_id).await?;
@@ -543,9 +574,8 @@ async fn handle_pause_op(
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     store.set_paused(task_id, paused).await?;
@@ -567,9 +597,8 @@ async fn handle_cancel_op(
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     store.cancel_task(task_id).await?;
@@ -628,9 +657,8 @@ async fn handle_requeue_op(
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     let requeued = store.requeue_task(task_id).await?;
@@ -653,9 +681,8 @@ async fn handle_reschedule_op(
         .ok_or_else(|| XhjobError::Ipc("missing cron".to_string()))?;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(task_id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     let rescheduled = store.reschedule_task(task_id, new_cron).await?;
@@ -684,9 +711,8 @@ async fn handle_get_op(
     match store.load_task(task_id).await? {
         Some(task) => {
             // P0-17: ownership check — only the task's owner can access it.
-            let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-            if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-                return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+            if let Err(resp) = ownership_check(&task) {
+                return Ok(resp);
             }
             let data = serde_json::to_value(&task)
                 .map_err(|e| XhjobError::Ipc(format!("serialize: {}", e)))?;
@@ -713,9 +739,8 @@ async fn handle_events_op(
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(tid) = task_id_filter.as_deref() {
         if let Some(task) = store.load_task(tid).await? {
-            let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-            if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-                return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+            if let Err(resp) = ownership_check(&task) {
+                return Ok(resp);
             }
         }
     }
@@ -755,6 +780,11 @@ async fn handle_chain_op(
         .ok_or_else(|| XhjobError::Store(format!("chain {} produced no first step", chain_id)))?;
     let builder = TaskBuilder::from_json(&next.to_string())?;
     let mut task = builder.build()?;
+    // P0-17: propagate owner to chain step task so subsequent ownership
+    // checks on this task (state/result/cancel/requeue) honor the chain
+    // creator's identity. Without this, chain tasks are unowned and the
+    // default-deny ownership_check cannot protect them.
+    task.owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
     // Tag the task with the chain_id so queue.rs can advance the chain on
     // success / mark_failed on failure.
     let meta_obj = match task.meta.take() {
@@ -820,6 +850,9 @@ async fn handle_group_op(
     for cfg in tasks {
         let builder = TaskBuilder::from_json(&cfg.to_string())?;
         let mut task = builder.build()?;
+        // P0-17: propagate owner to each group member task so subsequent
+        // ownership checks honor the group creator's identity.
+        task.owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
         // Tag the task with the group_id so queue.rs can refresh the group
         // state on completion.
         let meta_obj = match task.meta.take() {
@@ -919,6 +952,9 @@ async fn handle_chord_op(
     for cfg in header_arr {
         let builder = TaskBuilder::from_json(&cfg.to_string())?;
         let mut task = builder.build()?;
+        // P0-17: propagate owner to each chord header task so subsequent
+        // ownership checks honor the chord creator's identity.
+        task.owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
         // Tag the task with the chord_id so queue.rs can refresh the chord
         // state on completion. Uses the dedicated `chord_id` field (no
         // need to mash it into `meta`).
@@ -972,9 +1008,8 @@ async fn handle_report_progress_op(
     }
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(id).await? {
-        let owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
-        if !task.owner.is_empty() && !owner.is_empty() && task.owner != owner {
-            return Ok(Response::error(0, "ownership: task belongs to a different owner"));
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
         }
     }
     let meta = payload.get("meta")

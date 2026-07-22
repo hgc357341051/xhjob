@@ -175,7 +175,12 @@ pub async fn refresh_state(
         let meta_json = serde_json::to_string(&results)
             .map_err(|e| crate::errors::XhjobError::Store(format!("chord meta encode: {}", e)))?;
         callback = callback.meta(meta_json);
-        let task = callback.build()?;
+        let mut task = callback.build()?;
+        // P0-17: propagate owner to the chord callback task so subsequent
+        // ownership checks honor the chord creator's identity. Without
+        // this, the callback task would be unowned and bypass the
+        // default-deny ownership_check.
+        task.owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
         let callback_task_id = task.id.clone();
         store.insert_task(task).await?;
         store

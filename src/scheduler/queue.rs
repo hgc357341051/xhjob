@@ -346,8 +346,18 @@ impl TaskQueue {
                         tracing::warn!(task_id = %task_clone.id, error = %e, "set_attempts_and_error failed");
                     }
                 } else {
-                    if let Err(e) = crate::retry::schedule_retry(&store, &task_clone, err_str, effective_retry_max).await {
-                        tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                    match crate::retry::schedule_retry(&store, &task_clone, err_str, effective_retry_max).await {
+                        Ok(true) => {
+                            // Retry actually scheduled — bump retry counter.
+                            crate::utils::metrics::record_retry();
+                        }
+                        Ok(false) => {
+                            // Attempts exhausted — schedule_retry already
+                            // marked the task as Failed. No retry counter.
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                        }
                     }
                 }
                 crate::utils::metrics::record_failure();
@@ -514,8 +524,18 @@ impl TaskQueue {
                 } else {
                     // Retryable: schedule retry (which itself may
                     // permanently fail if attempts are exhausted).
-                    if let Err(e) = crate::retry::schedule_retry(&store, &task_clone, err_msg.clone(), effective_retry_max).await {
-                        tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                    match crate::retry::schedule_retry(&store, &task_clone, err_msg.clone(), effective_retry_max).await {
+                        Ok(true) => {
+                            // Retry actually scheduled — bump retry counter.
+                            crate::utils::metrics::record_retry();
+                        }
+                        Ok(false) => {
+                            // Attempts exhausted — schedule_retry already
+                            // marked the task as Failed. No retry counter.
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id = %task_clone.id, error = %e, "schedule_retry failed");
+                        }
                     }
                     // Record a `Failed` event (A17) for the individual
                     // attempt; the retry will be processed separately.
@@ -805,6 +825,12 @@ async fn advance_chain_and_dispatch(
                 _ => Some(serde_json::json!({"xhjob_chain_id": chain_id}).to_string()),
             };
             task.meta = meta_obj;
+            // P0-17: propagate owner to chain step task so subsequent
+            // ownership checks honor the chain creator's identity. Without
+            // this, only the first step (set in handle_chain_op) would be
+            // owned; subsequent steps dispatched from queue.rs would be
+            // unowned and bypass the default-deny ownership_check.
+            task.owner = std::env::var("XHJOB_OWNER").unwrap_or_default();
             let task_id = task.id.clone();
             let priority = task.priority;
             if let Err(e) = store.insert_task(task).await {
