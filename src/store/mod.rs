@@ -1480,4 +1480,76 @@ mod tests {
         let f = store.load_task("t-failed").await.unwrap().unwrap();
         assert_eq!(f.state, TaskState::Failed);
     }
+
+    /// H7 fix: list_tasks with tag filter returns only matching tasks.
+    /// Previously only state filter was tested; tag filter path was untested.
+    #[tokio::test]
+    async fn test_in_memory_list_tasks_with_tag_filter() {
+        let store = InMemoryStore::new();
+
+        let mut t1 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "a"}));
+        t1.id = "t1".to_string();
+        t1.tags = vec!["prod".to_string(), "critical".to_string()];
+        store.insert_task(t1).await.unwrap();
+
+        let mut t2 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "b"}));
+        t2.id = "t2".to_string();
+        t2.tags = vec!["staging".to_string()];
+        store.insert_task(t2).await.unwrap();
+
+        let mut t3 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "c"}));
+        t3.id = "t3".to_string();
+        t3.tags = vec!["prod".to_string()];
+        store.insert_task(t3).await.unwrap();
+
+        // Filter by "prod" tag → t1 + t3.
+        let prod = store.list_tasks(None, Some("prod")).await.unwrap();
+        assert_eq!(prod.len(), 2);
+        let ids: Vec<_> = prod.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"t1"));
+        assert!(ids.contains(&"t3"));
+        assert!(!ids.contains(&"t2"));
+
+        // Filter by "staging" tag → t2 only.
+        let staging = store.list_tasks(None, Some("staging")).await.unwrap();
+        assert_eq!(staging.len(), 1);
+        assert_eq!(staging[0].id, "t2");
+
+        // Filter by nonexistent tag → empty.
+        let none = store.list_tasks(None, Some("nonexistent")).await.unwrap();
+        assert_eq!(none.len(), 0);
+    }
+
+    /// H9 fix: update_progress persists percent + meta and load_task reads them back.
+    /// Previously update_progress was untested (silent regression risk).
+    #[tokio::test]
+    async fn test_in_memory_update_progress_roundtrip() {
+        let store = InMemoryStore::new();
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
+        task.id = "prog-1".to_string();
+        store.insert_task(task).await.unwrap();
+
+        // Initial state: no progress.
+        let initial = store.load_task("prog-1").await.unwrap().unwrap();
+        assert_eq!(initial.progress, None);
+        assert_eq!(initial.progress_meta, None);
+
+        // Update progress to 50% with meta.
+        store.update_progress("prog-1", 50, Some(r#"{"step":"halfway"}"#.to_string())).await.unwrap();
+        let mid = store.load_task("prog-1").await.unwrap().unwrap();
+        assert_eq!(mid.progress, Some(50));
+        assert_eq!(mid.progress_meta.as_deref(), Some(r#"{"step":"halfway"}"#));
+
+        // Update to 100% with different meta.
+        store.update_progress("prog-1", 100, Some(r#"{"step":"done"}"#.to_string())).await.unwrap();
+        let done = store.load_task("prog-1").await.unwrap().unwrap();
+        assert_eq!(done.progress, Some(100));
+        assert_eq!(done.progress_meta.as_deref(), Some(r#"{"step":"done"}"#));
+
+        // Update with None meta clears it.
+        store.update_progress("prog-1", 75, None).await.unwrap();
+        let cleared = store.load_task("prog-1").await.unwrap().unwrap();
+        assert_eq!(cleared.progress, Some(75));
+        assert_eq!(cleared.progress_meta, None);
+    }
 }

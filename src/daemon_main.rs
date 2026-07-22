@@ -447,6 +447,28 @@ async fn handle_connection(
     Ok(())
 }
 
+/// BUG fix (TOCTOU): per-task-id dispatch lock.
+///
+/// Without this, two concurrent PHP-FPM workers dispatching the same explicit
+/// `id` with `replace_existing=false` both see `load_task → None`, both proceed
+/// to `insert_task`, and the second silently overwrites the first via
+/// `INSERT OR REPLACE` — losing the first task without reporting the conflict.
+///
+/// We shard a `Mutex<()>` per task id (same pattern as the chord/chain locks
+/// in scheduler/) and acquire it around the check-then-insert critical section
+/// in `handle_dispatch`. Different ids are not serialized against each other.
+static DISPATCH_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+fn dispatch_locks() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    DISPATCH_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+async fn get_dispatch_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let arc = {
+        let mut map = dispatch_locks().lock().unwrap();
+        map.entry(task_id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    arc
+}
+
 /// P0-17 fix: default-deny ownership check.
 ///
 /// Returns `Ok(())` if the caller may access `task`, otherwise returns
@@ -554,6 +576,15 @@ async fn handle_dispatch(
     task.owner = owner;
     let task_id = task.id.clone();
     let priority = task.priority;
+    // BUG fix (TOCTOU): acquire a per-task-id lock around the check-then-insert
+    // critical section so two concurrent dispatches of the same explicit `id`
+    // with `replace_existing=false` can't both observe "not exists" and then
+    // both insert (second silently overwriting the first via INSERT OR REPLACE).
+    // Different task ids are NOT serialized against each other — only same-id
+    // dispatches are ordered. Lock is released after `insert_task` returns.
+    // Bind the Arc to a stable local so the MutexGuard outlives the temporary.
+    let _dispatch_arc = get_dispatch_lock(&task_id).await;
+    let _dispatch_guard = _dispatch_arc.lock().await;
     // replace_existing (A14): when true and the user supplied an explicit
     // `id`, drop any pre-existing task with the same id before inserting.
     // Mirrors APScheduler's `replace_existing=True` semantics.
@@ -589,6 +620,10 @@ async fn handle_dispatch(
     let should_defer = is_pure_date_trigger
         && task.next_fire.map(|nf| nf > now).unwrap_or(false);
     store.insert_task(task).await?;
+    // Release the dispatch lock before enqueueing — enqueue is idempotent and
+    // doesn't need to be inside the critical section, so we don't serialize
+    // queue activity across same-id dispatches any longer than necessary.
+    drop(_dispatch_guard);
     if !should_defer {
         queue.enqueue(&task_id, priority).await?;
     }
@@ -1106,12 +1141,18 @@ async fn handle_report_progress_op(
     let id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
-    let percent = payload.get("percent")
+    // BUG fix: validate BEFORE casting to u8. The previous `as u8` cast
+    // happened before the range check, so values like 256 truncated to 0
+    // (bypassing the `> 100` guard) and 356 truncated to 100 (passing the
+    // guard as a perfect 100%). Any value of the form `256*k + 0..100`
+    // silently bypassed validation. Parse as u64, range-check, then narrow.
+    let percent_u64 = payload.get("percent")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u8;
-    if percent > 100 {
+        .unwrap_or(0);
+    if percent_u64 > 100 {
         return Ok(Response::error(0, "percent must be 0-100".to_string()));
     }
+    let percent = percent_u64 as u8;
     // P0-17: ownership check — only the task's owner can access it.
     if let Some(task) = store.load_task(id).await? {
         if let Err(resp) = ownership_check(&task) {
@@ -1241,4 +1282,170 @@ fn install_unix_signal_handler() -> tokio::sync::mpsc::Receiver<i32> {
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Task, TaskType, TaskSummary, TaskEvent, EventType};
+
+    /// Serialize tests that mutate the `XHJOB_OWNER` env var. `std::env::set_var`
+    /// / `remove_var` are process-global and NOT thread-safe — when these
+    /// owner-filter tests run in parallel, one test's `remove_var` can fire
+    /// between another test's `set_var` and the filter call, producing flaky
+    /// failures. This static mutex serializes them so only one owner-test
+    /// touches the env at a time. Acquire it as the FIRST line of each test.
+    static OWNER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper: build a minimal Task with the given owner.
+    fn make_task(id: &str, owner: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            task_type: TaskType::Shell,
+            payload: serde_json::json!({"cmd": "echo hi"}),
+            cron: None,
+            retry_max: 0,
+            retry_delay: 0,
+            timeout: 10,
+            priority: 0,
+            allow_overlap: false,
+            max_instances: 1,
+            coalesce: false,
+            persist: true,
+            proxy: None,
+            encoding: None,
+            timezone: None,
+            state: crate::store::TaskState::Pending,
+            attempts: 0,
+            next_fire: None,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            last_error: None,
+            max_executions: 0,
+            execution_count: 0,
+            paused: false,
+            cancel_requested: false,
+            start_date: None,
+            end_date: None,
+            result_ttl: 0,
+            meta: None,
+            interval: None,
+            run_at: None,
+            jitter: 0,
+            expires: 0,
+            retry_backoff: false,
+            ignore_result: false,
+            acks_late: false,
+            soft_timeout: None,
+            misfire_grace_time: 0,
+            replace_existing: false,
+            tags: Vec::new(),
+            rate_limit_count: 0,
+            rate_limit_window: 0,
+            acks_on_failure: true,
+            idempotent: false,
+            progress: None,
+            progress_meta: None,
+            owner: owner.to_string(),
+            chord_id: None,
+        }
+    }
+
+    /// ownership_check: empty task owner → allow (legacy backward compat).
+    #[test]
+    fn test_ownership_check_empty_task_owner_allows_any_caller() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("XHJOB_OWNER");
+        let task = make_task("t1", "");
+        assert!(ownership_check(&task).is_ok());
+    }
+
+    /// ownership_check: owned task + empty caller → DENY (default-deny).
+    #[test]
+    fn test_ownership_check_owned_task_empty_caller_denies() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("XHJOB_OWNER");
+        let task = make_task("t1", "tenant-a");
+        assert!(ownership_check(&task).is_err());
+    }
+
+    /// ownership_check: owned task + matching caller → allow.
+    #[test]
+    fn test_ownership_check_matching_owner_allows() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::set_var("XHJOB_OWNER", "tenant-a");
+        let task = make_task("t1", "tenant-a");
+        assert!(ownership_check(&task).is_ok());
+        std::env::remove_var("XHJOB_OWNER");
+    }
+
+    /// ownership_check: owned task + mismatched caller → DENY.
+    #[test]
+    fn test_ownership_check_mismatched_owner_denies() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::set_var("XHJOB_OWNER", "tenant-a");
+        let task = make_task("t1", "tenant-b");
+        assert!(ownership_check(&task).is_err());
+        std::env::remove_var("XHJOB_OWNER");
+    }
+
+    /// filter_summaries_by_owner: empty caller sees only unowned tasks.
+    #[test]
+    fn test_filter_summaries_by_owner_empty_caller_sees_only_unowned() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("XHJOB_OWNER");
+        let summaries = vec![
+            TaskSummary::from(&make_task("t1", "")),       // unowned → visible
+            TaskSummary::from(&make_task("t2", "tenant-a")), // owned → hidden
+            TaskSummary::from(&make_task("t3", "tenant-b")), // owned → hidden
+        ];
+        let filtered = filter_summaries_by_owner(summaries);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "t1");
+    }
+
+    /// filter_summaries_by_owner: caller sees own + unowned, not others'.
+    #[test]
+    fn test_filter_summaries_by_owner_caller_sees_own_and_unowned() {
+        let _g = OWNER_ENV_LOCK.lock().unwrap();
+        std::env::set_var("XHJOB_OWNER", "tenant-a");
+        let summaries = vec![
+            TaskSummary::from(&make_task("t1", "")),
+            TaskSummary::from(&make_task("t2", "tenant-a")),
+            TaskSummary::from(&make_task("t3", "tenant-b")),
+        ];
+        let filtered = filter_summaries_by_owner(summaries);
+        assert_eq!(filtered.len(), 2);
+        let ids: Vec<_> = filtered.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"t1"));
+        assert!(ids.contains(&"t2"));
+        assert!(!ids.contains(&"t3"));
+        std::env::remove_var("XHJOB_OWNER");
+    }
+
+    /// filter_events_by_owner: async filter — caller sees only own + unowned events.
+    #[tokio::test]
+    async fn test_filter_events_by_owner_async() {
+        std::env::set_var("XHJOB_OWNER", "tenant-a");
+        let store: Arc<dyn TaskStore> = Arc::new(crate::store::InMemoryStore::new());
+        // Seed tasks with different owners.
+        store.insert_task(make_task("owned-a", "tenant-a")).await.unwrap();
+        store.insert_task(make_task("owned-b", "tenant-b")).await.unwrap();
+        store.insert_task(make_task("unowned", "")).await.unwrap();
+        // Build events referencing each task.
+        let now = crate::store::now_ts() as i64;
+        let events = vec![
+            TaskEvent { task_id: "owned-a".to_string(), event_type: EventType::Succeeded, payload: None, ts: now },
+            TaskEvent { task_id: "owned-b".to_string(), event_type: EventType::Succeeded, payload: None, ts: now },
+            TaskEvent { task_id: "unowned".to_string(), event_type: EventType::Succeeded, payload: None, ts: now },
+        ];
+        let filtered = filter_events_by_owner(&store, events).await;
+        assert_eq!(filtered.len(), 2);
+        let task_ids: Vec<_> = filtered.iter().map(|e| e.task_id.as_str()).collect();
+        assert!(task_ids.contains(&"owned-a"));
+        assert!(task_ids.contains(&"unowned"));
+        assert!(!task_ids.contains(&"owned-b"));
+        std::env::remove_var("XHJOB_OWNER");
+    }
 }

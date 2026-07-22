@@ -334,4 +334,63 @@ mod tests {
         assert_eq!(r.new_state, "partial_failed");
         assert!(r.callback_task_id.is_none());
     }
+
+    /// H4 fix: per-chord mutex prevents duplicate callback dispatch when two
+    /// concurrent header completions both call refresh_state. Without the
+    /// mutex, both would observe "all succeeded" and both would insert a
+    /// callback task — a double-dispatch. The mutex serializes them so only
+    /// the first inserts the callback; the second sees the chord is already
+    /// terminal and returns the existing callback_task_id.
+    #[tokio::test]
+    async fn test_concurrent_refresh_does_not_double_dispatch_callback() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let mut t1 = Task::new(TaskType::Shell, json!({"cmd":"a"}));
+        t1.id = "h1".to_string();
+        t1.state = TaskState::Success;
+        store.insert_task(t1).await.unwrap();
+
+        let mut t2 = Task::new(TaskType::Shell, json!({"cmd":"b"}));
+        t2.id = "h2".to_string();
+        t2.state = TaskState::Success;
+        store.insert_task(t2).await.unwrap();
+
+        store.save_result("h1", crate::store::TaskResult {
+            stdout: Some("ok1".to_string()),
+            exit_code: Some(0),
+            ..Default::default()
+        }).await.unwrap();
+        store.save_result("h2", crate::store::TaskResult {
+            stdout: Some("ok2".to_string()),
+            exit_code: Some(0),
+            ..Default::default()
+        }).await.unwrap();
+
+        let callback = TaskBuilder::new().via_shell("echo done").to_json();
+        store
+            .create_chord("c-concurrent", &["h1".to_string(), "h2".to_string()], &callback, now_ts() as i64)
+            .await
+            .unwrap();
+
+        // Spawn two concurrent refresh_state calls on the same chord.
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+        let h1 = tokio::spawn(async move { refresh_state(&s1, "c-concurrent").await.unwrap() });
+        let h2 = tokio::spawn(async move { refresh_state(&s2, "c-concurrent").await.unwrap() });
+        let (r1, r2) = tokio::join!(h1, h2);
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+
+        // Both must report success, and both must return the SAME callback id
+        // (the second caller observed the chord already terminal via the mutex
+        // and returned the stored callback_task_id instead of inserting a new one).
+        assert_eq!(r1.new_state, "success");
+        assert_eq!(r2.new_state, "success");
+        let cb1 = r1.callback_task_id.expect("first caller should have callback id");
+        let cb2 = r2.callback_task_id.expect("second caller should have callback id");
+        assert_eq!(cb1, cb2, "both callers must see the SAME callback id (no double dispatch)");
+
+        // Exactly one callback task should exist in the store.
+        let rec = store.get_chord("c-concurrent").await.unwrap().unwrap();
+        assert_eq!(rec.callback_task_id, Some(cb1));
+    }
 }

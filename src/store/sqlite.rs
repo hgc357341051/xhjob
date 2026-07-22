@@ -649,6 +649,21 @@ impl TaskStore for SqliteStore {
                     )",
                     params![now],
                 ).map_err(|e| XhjobError::store(format!("cleanup_expired_results: {}", e)))?;
+                // MINOR fix: periodic WAL checkpoint. With journal_mode=WAL
+                // (set at init), the `-wal` file grows indefinitely as
+                // writes accumulate. PASSIVE checkpoint folds committed WAL
+                // frames back into the main db file without blocking readers
+                // or writers. This runs every ~60s alongside the result-TTL
+                // cleanup (cron.rs::scan_once), so the WAL stays bounded.
+                // We intentionally ignore the checkpoint result rows
+                // (busy=1 just means "try again later" — not an error).
+                // Use execute_batch + function-call syntax because
+                // `PRAGMA wal_checkpoint(PASSIVE)` returns a result set and
+                // cannot be expressed via `pragma_update` (which emits
+                // `PRAGMA name = value` — wrong for wal_checkpoint).
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                    tracing::debug!(error = %e, "wal_checkpoint PASSIVE failed (non-fatal)");
+                }
                 Ok(deleted as u64)
             })
             .await
