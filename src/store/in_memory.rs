@@ -241,9 +241,9 @@ impl TaskStore for InMemoryStore {
                 Some(t) => t,
                 None => return Ok(false),
             };
-            // Only requeue terminal Cancelled / Failed / Expired tasks.
+            // 仅终态 Cancelled / Failed / Expired / Success 任务可重新入队。
             let requeueable = matches!(task.state,
-                TaskState::Cancelled | TaskState::Failed | TaskState::Expired);
+                TaskState::Cancelled | TaskState::Failed | TaskState::Expired | TaskState::Success);
             if !requeueable {
                 return Ok(false);
             }

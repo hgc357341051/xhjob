@@ -46,7 +46,7 @@ $state = xhjob_state("any-id", "1invalid");
 check("returns array", is_array($state), "got: " . gettype($state));
 check("state field exists", isset($state['state']), "keys: " . implode(',', array_keys($state ?? [])));
 // Should not crash with fatal error; state should be unknown/error indicator
-check("state is not success", ($state['state'] ?? '') !== 'SUCCESS', "state={$state['state']}");
+check("state is not success", ($state['state'] ?? '') !== 'success', "state={$state['state']}");
 
 // 3. invalid service name in result
 echo "Test 3: invalid service name in result\n";
@@ -101,11 +101,11 @@ if (!getenv('XHJOB_NETWORK_TESTS')) {
     while (time() - $start < $maxWait) {
         $state = xhjob_state($id, "boundary-svc");
         $s = $state['state'] ?? '';
-        if (in_array($s, ['SUCCESS', 'FAILED', 'CANCELLED'])) break;
+        if (in_array($s, ['success', 'failed', 'cancelled'])) break;
         usleep(500_000);
     }
     $state = xhjob_state($id, "boundary-svc");
-    check("HTTP 404 → FAILED", ($state['state'] ?? '') === 'FAILED', "state={$state['state']}");
+    check("HTTP 404 → FAILED", ($state['state'] ?? '') === 'failed', "state={$state['state']}");
     check("attempts == 1 (not retried)", ($state['attempts'] ?? 0) == 1, "attempts={$state['attempts']}");
     xhjob_stop("boundary-svc");
 }

@@ -40,13 +40,13 @@ $lastCount = 0;
 while (time() - $start < 30) {
     $state = xhjob_state($id, "max-exec-svc");
     $lastCount = $state['execution_count'] ?? 0;
-    if (($state['state'] ?? '') === 'SUCCESS') break;
+    if (($state['state'] ?? '') === 'success') break;
     usleep(500_000);
 }
 
 $state = xhjob_state($id, "max-exec-svc");
 check("state == SUCCESS after max executions",
-    ($state['state'] ?? '') === 'SUCCESS',
+    ($state['state'] ?? '') === 'success',
     "state=" . ($state['state'] ?? ''));
 check("execution_count == 3",
     ($state['execution_count'] ?? 0) == 3,

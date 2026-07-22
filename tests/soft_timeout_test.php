@@ -50,7 +50,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 usleep(3_000_000);
 $state = xhjob_state($id, "softtimeout-svc");
 check("state eventually SUCCESS (graceful SIGTERM exit)",
-    ($state['state'] ?? '') === 'SUCCESS',
+    ($state['state'] ?? '') === 'success',
     "state=" . ($state['state'] ?? ''));
 check("soft_timeout=2 visible in state",
     ($state['soft_timeout'] ?? null) === "2",
@@ -84,7 +84,7 @@ check("dispatched", is_string($id2) && !str_starts_with($id2, "error:"), "id2=$i
 usleep(5_000_000);
 $state2 = xhjob_state($id2, "softtimeout-svc");
 check("state eventually FAILED (SIGKILL after grace period)",
-    ($state2['state'] ?? '') === 'FAILED',
+    ($state2['state'] ?? '') === 'failed',
     "state=" . ($state2['state'] ?? ''));
 check("last_error mentions SIGKILL",
     str_contains((string)($state2['last_error'] ?? ''), 'SIGKILL'),
@@ -104,7 +104,7 @@ check("dispatched", is_string($id3) && !str_starts_with($id3, "error:"), "id3=$i
 usleep(500_000);
 $state3 = xhjob_state($id3, "softtimeout-svc");
 check("state eventually SUCCESS",
-    ($state3['state'] ?? '') === 'SUCCESS',
+    ($state3['state'] ?? '') === 'success',
     "state=" . ($state3['state'] ?? ''));
 check("soft_timeout=null (disabled, treated as None)",
     ($state3['soft_timeout'] ?? 'unset') === 'null',

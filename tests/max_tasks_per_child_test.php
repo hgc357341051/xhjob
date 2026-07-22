@@ -69,7 +69,7 @@ while (time() - $start < 15) {
     $allSuccess = true;
     foreach ($ids as $id) {
         $s = xhjob_state($id, "default", $dataDir);
-        if (($s['state'] ?? '') !== 'SUCCESS') { $allSuccess = false; break; }
+        if (($s['state'] ?? '') !== 'success') { $allSuccess = false; break; }
     }
     if ($allSuccess && count($ids) > 0) break;
     usleep(500_000);
@@ -78,7 +78,7 @@ while (time() - $start < 15) {
 $successCount = 0;
 foreach ($ids as $id) {
     $s = xhjob_state($id, "default", $dataDir);
-    if (($s['state'] ?? '') === 'SUCCESS') $successCount++;
+    if (($s['state'] ?? '') === 'success') $successCount++;
 }
 ok($successCount === 5, "all 5 tasks reached SUCCESS (got=$successCount)");
 

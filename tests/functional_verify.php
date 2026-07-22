@@ -25,7 +25,7 @@ function wait_state($id, $svc = 'verify', $timeout = 50) {
     for ($i = 0; $i < $timeout; $i++) {
         $s = xhjob_state($id, $svc);
         $st = $s['state'] ?? 'UNKNOWN';
-        if (in_array($st, ['SUCCESS', 'FAILED', 'CANCELLED'], true)) {
+        if (in_array($st, ['success', 'failed', 'cancelled'], true)) {
             return $s;
         }
         usleep(200_000);
@@ -38,7 +38,7 @@ echo "\n=== Test 1: shell 任务 stdout/exit_code ===\n";
 $id = Xhjob::task()->service('verify')->viaShell('echo hello-shell')->timeout(5)->dispatch();
 $s = wait_state($id);
 $r = xhjob_result($id, 'verify');
-check('shell state=SUCCESS', ($s['state'] ?? '') === 'SUCCESS');
+check('shell state=SUCCESS', ($s['state'] ?? '') === 'success');
 check('shell stdout 含 hello-shell', strpos($r['stdout'] ?? '', 'hello-shell') !== false);
 check('shell exit_code=0', ($r['exit_code'] ?? '') === '0');
 
@@ -51,7 +51,7 @@ $id = Xhjob::task()->service('verify')
     ->dispatch();
 // retry: 3 retries × 1s base + 可能的指数退避，预留 30s
 $s = wait_state($id, 'verify', 150);
-check('retry state=FAILED', ($s['state'] ?? '') === 'FAILED');
+check('retry state=FAILED', ($s['state'] ?? '') === 'failed');
 // withRetry(3, 1) = 最多重试 3 次，加上初次执行，attempts 应 >= 3
 $attempts = intval($s['attempts'] ?? '0');
 check("retry attempts>=3 (实际: $attempts)", $attempts >= 3);
@@ -74,9 +74,9 @@ $id2 = Xhjob::task()->service('verify')
     ->dispatch();
 $s1 = wait_state($id1, 'verify', 60);
 $s2 = wait_state($id2, 'verify', 60);
-check('overlap slow task SUCCESS', ($s1['state'] ?? '') === 'SUCCESS');
+check('overlap slow task SUCCESS', ($s1['state'] ?? '') === 'success');
 // 第二个任务要么 SUCCESS（排队后执行），要么被跳过
-check('overlap second task completed (SUCCESS)', ($s2['state'] ?? '') === 'SUCCESS');
+check('overlap second task completed (SUCCESS)', ($s2['state'] ?? '') === 'success');
 
 // ===== Test 4: persist 任务：restart 后任务状态可查 =====
 echo "\n=== Test 4: persist 任务 restart 后可查 ===\n";
@@ -96,7 +96,7 @@ if (str_starts_with($id, 'error:')) {
     check('persist dispatch succeeded', false);
 } else {
     $s = wait_state($id, 'persist-svc');
-    check('persist task SUCCESS', ($s['state'] ?? '') === 'SUCCESS');
+    check('persist task SUCCESS', ($s['state'] ?? '') === 'success');
 
     // restart daemon
     xhjob_restart('persist-svc');

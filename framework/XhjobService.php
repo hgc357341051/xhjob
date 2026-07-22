@@ -153,7 +153,7 @@ class XhjobService
      * 健康检查
      *
      * 通过 xhjob_status 验证 daemon 是否运行，并通过 xhjob_list 获取任务统计。
-     * stats 为按状态分组的任务计数（如 PENDING => 3, RUNNING => 1）。
+     * stats 为按状态分组的任务计数（如 pending => 3, running => 1）。
      *
      * @return array ['healthy' => bool, 'pid' => int|null, 'stats' => array]
      */

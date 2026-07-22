@@ -3,7 +3,9 @@
 //! Memory queue + store-backed persistence. The daemon pulls pending tasks
 //! and dispatches them to the appropriate executor via the coroutine pool.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 use crate::errors::Result;
 use crate::store::{TaskState, TaskStore, now_ts};
@@ -16,6 +18,10 @@ pub struct TaskQueue {
     overlap: Arc<OverlapController>,
     /// Pending task ids awaiting execution (in-memory fast path).
     pending: Mutex<Vec<(i32, String)>>, // (priority, task_id), max-heap semantics
+    /// 正在执行的任务的 cancel 标志。task_id -> 共享的 AtomicBool。
+    /// `signal_cancel` 设置对应标志，executor 在执行循环中轮询检测以终止子进程。
+    /// 任务派发前注册，派发完成后注销。
+    cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl TaskQueue {
@@ -24,6 +30,34 @@ impl TaskQueue {
             store,
             overlap,
             pending: Mutex::new(Vec::new()),
+            cancel_flags: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 注册一个 cancel 标志，供 executor 在执行期间轮询。
+    /// 若该 task_id 已存在标志则覆盖（理论上不会发生）。
+    async fn register_cancel_flag(&self, task_id: &str, flag: Arc<AtomicBool>) {
+        let mut g = self.cancel_flags.lock().await;
+        g.insert(task_id.to_string(), flag);
+    }
+
+    /// 注销 cancel 标志（任务派发完成后调用）。
+    async fn unregister_cancel_flag(&self, task_id: &str) {
+        let mut g = self.cancel_flags.lock().await;
+        g.remove(task_id);
+    }
+
+    /// 对正在执行的任务设置 cancel 标志，使 executor 终止子进程。
+    /// 返回是否找到并设置了标志（true 表示任务正在执行且已通知取消）。
+    /// 对 Pending 任务无需调用此方法——`cancel_task` 已直接将其转 Cancelled 终态。
+    /// Reference: Celery revoke (terminate=true).
+    pub async fn signal_cancel(&self, task_id: &str) -> bool {
+        let g = self.cancel_flags.lock().await;
+        if let Some(flag) = g.get(task_id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            false
         }
     }
 
@@ -123,7 +157,15 @@ impl TaskQueue {
         let queue_arc = Arc::clone(&self);
         let task_clone = task.clone();
         coroutine_pool::global().spawn(async move {
-            let result = dispatch_task(&task_clone).await;
+            // 创建 cancel 标志并注册到 queue，使 handle_cancel_op 能够
+            // 通过 signal_cancel 通知 executor 终止子进程。
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            queue_arc.register_cancel_flag(&task_clone.id, Arc::clone(&cancel_flag)).await;
+
+            let result = dispatch_task(&task_clone, Some(Arc::clone(&cancel_flag))).await;
+
+            // 派发完成，注销 cancel 标志（后续 signal_cancel 无需再通知）。
+            queue_arc.unregister_cancel_flag(&task_clone.id).await;
             let finished = now_ts();
             // Save the result if dispatch succeeded, so the result is visible
             // regardless of whether cancel was requested during execution.

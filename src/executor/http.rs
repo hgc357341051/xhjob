@@ -106,7 +106,7 @@ fn build_proxy(proxy_str: &str) -> Result<reqwest::Proxy> {
 }
 
 impl Executor for HttpExecutor {
-    fn execute(&self, task: &Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + '_>> {
+    fn execute<'a>(&'a self, task: &'a Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
         let proxy = task.proxy.clone();

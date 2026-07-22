@@ -3,6 +3,8 @@
 //! Unix: runs `bash -c "<cmd>"` via tokio::process::Command.
 //! Windows: runs `cmd /C "<cmd>"` via tokio::process::Command.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use crate::errors::{Result, XhjobError};
 use crate::store::{Task, TaskResult, ShellPayload};
@@ -19,7 +21,12 @@ impl Default for ShellExecutor {
 }
 
 impl Executor for ShellExecutor {
-    fn execute(&self, task: &Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + '_>> {
+    fn execute<'a>(&'a self, task: &'a Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+        // 委托给 execute_with_cancel，不传 cancel 标志（向后兼容）。
+        self.execute_with_cancel(task, None)
+    }
+
+    fn execute_with_cancel<'a>(&'a self, task: &'a Task, cancel_flag: Option<Arc<AtomicBool>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
         let encoding = task.encoding.clone();
@@ -49,42 +56,95 @@ impl Executor for ShellExecutor {
             // Reference: Celery soft_time_limit.
             let soft = soft_timeout.filter(|&s| s > 0 && s < timeout);
 
-            let status_result = if let Some(soft_secs) = soft {
-                let grace = timeout - soft_secs;
-                // Phase 1: wait soft_secs for graceful completion (no signal yet).
-                match tokio::time::timeout(Duration::from_secs(soft_secs), child.wait()).await {
-                    Ok(s) => Ok(s), // completed before soft_timeout
-                    Err(_) => {
-                        // soft_timeout elapsed — send SIGTERM to the child.
+            // 主等待逻辑封装为 async 块，便于与 cancel 检查并发执行。
+            // 返回 Result<ExitStatus, XhjobError>，错误已包含 timeout / wait
+            // 失败的语义，且内部完成 SIGTERM / SIGKILL 与 reap。
+            let wait_fut = async {
+                if let Some(soft_secs) = soft {
+                    let grace = timeout - soft_secs;
+                    // Phase 1: wait soft_secs for graceful completion (no signal yet).
+                    match tokio::time::timeout(Duration::from_secs(soft_secs), child.wait()).await {
+                        Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                        Err(_) => {
+                            // soft_timeout elapsed — send SIGTERM to the child.
+                            #[cfg(unix)]
+                            if let Some(pid) = child.id() {
+                                use nix::sys::signal::{kill, Signal};
+                                use nix::unistd::Pid;
+                                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                            }
+                            // Phase 2: wait grace period for graceful exit after SIGTERM.
+                            match tokio::time::timeout(Duration::from_secs(grace), child.wait()).await {
+                                Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                                Err(_) => {
+                                    // SIGKILL after grace period — reap the child
+                                    // so it doesn't become a zombie.
+                                    let _ = child.start_kill();
+                                    let _ = child.wait().await;
+                                    Err(XhjobError::Exec(format!(
+                                        "timeout after {}s (soft={}s, grace={}s, SIGKILL)",
+                                        timeout, soft_secs, grace
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // No soft_timeout: existing logic, just wait timeout then SIGKILL.
+                    match tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await {
+                        Ok(s) => s.map_err(|e| XhjobError::Exec(format!("wait: {}", e))),
+                        Err(_) => {
+                            // timeout: kill the child and reap.
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            Err(XhjobError::Exec(format!("timeout after {}s", timeout)))
+                        }
+                    }
+                }
+            };
+
+            // 与 cancel 检查循环并发：当提供 cancel_flag 时，每 200ms 检查一次；
+            // 检测到取消则终止子进程并返回 cancelled 错误。
+            // Reference: Celery revoke (terminate=true).
+            let status_result: std::result::Result<std::process::ExitStatus, XhjobError> = if let Some(flag) = cancel_flag.as_ref() {
+                let flag = Arc::clone(flag);
+                let cancel_watcher = async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if flag.load(Ordering::SeqCst) {
+                            return;
+                        }
+                    }
+                };
+                tokio::select! {
+                    r = wait_fut => r,
+                    _ = cancel_watcher => {
+                        // cancel 触发：发送 SIGTERM，给 500ms grace 等待优雅退出；
+                        // 超时则 SIGKILL 并 reap，避免僵尸进程。
                         #[cfg(unix)]
                         if let Some(pid) = child.id() {
                             use nix::sys::signal::{kill, Signal};
                             use nix::unistd::Pid;
                             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
                         }
-                        // Phase 2: wait grace period for graceful exit after SIGTERM.
-                        match tokio::time::timeout(Duration::from_secs(grace), child.wait()).await {
-                            Ok(s) => Ok(s), // graceful exit after SIGTERM
+                        #[cfg(not(unix))]
+                        { let _ = child.start_kill(); }
+                        match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+                            Ok(_) => {}
                             Err(_) => {
-                                // SIGKILL after grace period — reap the child
-                                // so it doesn't become a zombie.
                                 let _ = child.start_kill();
                                 let _ = child.wait().await;
-                                return Err(XhjobError::Exec(format!(
-                                    "timeout after {}s (soft={}s, grace={}s, SIGKILL)",
-                                    timeout, soft_secs, grace
-                                )));
                             }
                         }
+                        Err(XhjobError::Exec("cancelled".to_string()))
                     }
                 }
             } else {
-                // No soft_timeout: existing logic, just wait timeout then SIGKILL.
-                tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await
+                wait_fut.await
             };
 
             let (stdout_text, stderr_text, exit_code) = match status_result {
-                Ok(Ok(status)) => {
+                Ok(status) => {
                     // Read stdout/stderr from the captured pipes
                     let stdout_text = if let Some(mut s) = stdout_fut {
                         use tokio::io::AsyncReadExt;
@@ -101,13 +161,8 @@ impl Executor for ShellExecutor {
                     let code = status.code().unwrap_or(-1);
                     (stdout_text, stderr_text, code)
                 }
-                Ok(Err(e)) => {
-                    return Err(XhjobError::Exec(format!("wait: {}", e)));
-                }
-                Err(_) => {
-                    // timeout: kill the child
-                    let _ = child.start_kill();
-                    return Err(XhjobError::Exec(format!("timeout after {}s", timeout)));
+                Err(e) => {
+                    return Err(e);
                 }
             };
 
@@ -323,5 +378,68 @@ mod tests {
         assert!(result.is_err(), "expected Err (SIGKILL after grace period)");
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("SIGKILL"), "error message should mention SIGKILL: {}", msg);
+    }
+
+    /// cancel 修复验证：对一个长时间运行的 shell 任务设置 cancel_flag 后，
+    /// executor 应在 ~200ms 轮询窗口内检测到取消，终止子进程并返回
+    /// "cancelled" 错误，而不是等任务自然结束（30s）。
+    ///
+    /// 修复前：executor 不检查 cancel_flag，任务运行到 timeout（30s）才返回。
+    /// 修复后：executor 每 200ms 检查 cancel_flag，检测到后立即 SIGTERM + reap。
+    /// Reference: Celery revoke (terminate=true).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancel_flag_terminates_running_child() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+
+        // sleep 30 — 如果 cancel 不生效，测试会因 timeout=10s 而失败（耗时 10s）；
+        // 如果 cancel 生效，应在 ~1s 内返回。
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "sleep 30"}));
+        task.timeout = 10; // 硬超时兜底，防止 cancel 失效时挂住整个测试套件
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&cancel_flag);
+
+        // 500ms 后设置 cancel 标志，模拟 xhjob_cancel 调用
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let result = ShellExecutor.execute_with_cancel(&task, Some(cancel_flag)).await;
+        let elapsed = start.elapsed();
+
+        // 应返回 Err 且错误信息包含 "cancelled"
+        assert!(result.is_err(), "expected Err after cancel");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("cancelled"), "error should mention cancelled: {}", msg);
+
+        // 应在远小于 30s 内返回（cancel 轮询间隔 200ms + 500ms 延迟 + grace 500ms）。
+        // 上限给 5s 足够宽松，只要远小于 timeout=10s 即说明 cancel 生效。
+        assert!(elapsed.as_secs() < 5,
+            "cancel should terminate child quickly, took {:?}s", elapsed);
+    }
+
+    /// 验证不提供 cancel_flag 时，execute_with_cancel 行为与 execute 一致
+    /// （正常完成、不受 cancel 轮询影响）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_with_cancel_none_completes_normally() {
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hello"}));
+        task.timeout = 5;
+
+        let result = ShellExecutor.execute_with_cancel(&task, None).await
+            .expect("execute_with_cancel(None) should succeed");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.as_deref().unwrap_or("").contains("hello"),
+            "stdout should contain hello: {:?}", result.stdout);
     }
 }

@@ -1084,7 +1084,7 @@ pub fn xhjob_chain_state(chain_id: String, name: Option<String>, data_dir: Optio
 
 /// Create a group of tasks (C16). Parallel batch: all tasks are dispatched
 /// concurrently. As each task completes the daemon updates the group
-/// state. Final group state is "succeeded" (all ok) / "partial_failed"
+/// state. Final group state is "success" (all ok) / "partial_failed"
 /// (some failed) / "failed" (all failed).
 ///
 /// `tasks_json` is a JSON array of TaskBuilder config objects.

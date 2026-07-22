@@ -41,7 +41,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 usleep(200_000);
 $state1 = xhjob_state($id, "resched-svc");
 check("state is PENDING or RUNNING initially",
-    in_array(($state1['state'] ?? ''), ['PENDING', 'RUNNING']),
+    in_array(($state1['state'] ?? ''), ['pending', 'running']),
     "state=" . ($state1['state'] ?? ''));
 check("meta preserved initially",
     ($state1['meta'] ?? '') === '{"k":"v"}',
@@ -54,7 +54,7 @@ check("xhjob_reschedule returns true", $ok === true);
 // Verify state still non-terminal and meta preserved after reschedule.
 $state2 = xhjob_state($id, "resched-svc");
 check("state still PENDING or RUNNING after reschedule",
-    in_array(($state2['state'] ?? ''), ['PENDING', 'RUNNING']),
+    in_array(($state2['state'] ?? ''), ['pending', 'running']),
     "state=" . ($state2['state'] ?? ''));
 check("meta preserved after reschedule",
     ($state2['meta'] ?? '') === '{"k":"v"}',
@@ -75,7 +75,7 @@ check("reschedule with invalid cron returns false", $ok === false);
 // the next minute boundary. The state must remain non-terminal.
 $state3 = xhjob_state($id, "resched-svc");
 check("state still non-terminal after invalid cron reschedule",
-    in_array(($state3['state'] ?? ''), ['PENDING', 'RUNNING']),
+    in_array(($state3['state'] ?? ''), ['pending', 'running']),
     "state=" . ($state3['state'] ?? ''));
 
 // Test 4: reschedule of an interval (non-cron) task returns false.

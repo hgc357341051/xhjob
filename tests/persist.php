@@ -44,7 +44,7 @@ echo "persist cron task dispatched: $id\n";
 // Wait for first fire
 for ($i = 0; $i < 30; $i++) {
     $s = xhjob_state($id, $svc);
-    if (($s['state'] ?? '') === 'SUCCESS') break;
+    if (($s['state'] ?? '') === 'success') break;
     usleep(100000);
 }
 echo "first run completed\n";
@@ -75,7 +75,7 @@ echo "task recovered, state={$s['state']}\n";
 $success2 = false;
 for ($i = 0; $i < 60; $i++) {
     $s = xhjob_state($id, $svc);
-    if (($s['state'] ?? '') === 'SUCCESS') {
+    if (($s['state'] ?? '') === 'success') {
         // Check the attempts increased or the finished_at timestamp updated
         $success2 = true;
         break;

@@ -243,7 +243,7 @@ async fn handle_connection(
         "remove" => handle_remove_op(&store, req.payload).await,
         "pause" => handle_pause_op(&store, req.payload, true).await,
         "resume" => handle_pause_op(&store, req.payload, false).await,
-        "cancel" => handle_cancel_op(&store, req.payload).await,
+        "cancel" => handle_cancel_op(&store, &queue, req.payload).await,
         "list" => handle_list_op(&store, req.payload).await,
         "requeue" => handle_requeue_op(&store, req.payload).await,
         "reschedule" => handle_reschedule_op(&store, req.payload).await,
@@ -359,15 +359,21 @@ async fn handle_pause_op(
 
 /// Handler for `cancel` op: cancel a task.
 /// Pending → Cancelled terminal; Running → cancel_requested=true (no retry, no cron re-trigger).
-/// Reference: Celery revoke.
+/// 对 Running 任务，同时通过 `queue.signal_cancel` 通知 executor 立即终止子进程，
+/// 避免任务继续运行到自然结束。
+/// Reference: Celery revoke (terminate=true).
 async fn handle_cancel_op(
     store: &Arc<dyn TaskStore>,
+    queue: &Arc<TaskQueue>,
     payload: serde_json::Value,
 ) -> Result<Response> {
     let task_id = payload.get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| XhjobError::Ipc("missing id".to_string()))?;
     store.cancel_task(task_id).await?;
+    // 通知正在执行的 executor 终止子进程。
+    // 对 Pending 任务（已被 cancel_task 转 Cancelled 终态）此调用返回 false，无副作用。
+    let _ = queue.signal_cancel(task_id).await;
     Ok(Response::success(0, serde_json::json!({"cancelled": true})))
 }
 
@@ -380,15 +386,20 @@ async fn handle_list_op(
     let state_filter: Option<String> = payload.get("state_filter")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // 兼容历史的大写输入与新的小写标准（serde 风格，如 "success"/"pending"）。
     let state_filter = match state_filter.as_deref() {
-        Some("PENDING") => Some(TaskState::Pending),
-        Some("RUNNING") => Some(TaskState::Running),
-        Some("INTERRUPTED") => Some(TaskState::Interrupted),
-        Some("SUCCESS") => Some(TaskState::Success),
-        Some("FAILED") => Some(TaskState::Failed),
-        Some("CANCELLED") => Some(TaskState::Cancelled),
-        Some("EXPIRED") => Some(TaskState::Expired),
-        Some(other) => return Err(XhjobError::InvalidTask(format!("invalid state_filter: {}", other))),
+        Some(s) => {
+            match s.to_ascii_lowercase().as_str() {
+                "pending" => Some(TaskState::Pending),
+                "running" => Some(TaskState::Running),
+                "interrupted" => Some(TaskState::Interrupted),
+                "success" => Some(TaskState::Success),
+                "failed" => Some(TaskState::Failed),
+                "cancelled" => Some(TaskState::Cancelled),
+                "expired" => Some(TaskState::Expired),
+                other => return Err(XhjobError::InvalidTask(format!("invalid state_filter: {}", other))),
+            }
+        }
         None => None,
     };
     let tag_filter: Option<String> = payload.get("tag_filter")

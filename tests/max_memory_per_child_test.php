@@ -79,7 +79,7 @@ while (time() < $deadline && $successCount < count($ids)) {
     $successCount = 0;
     foreach ($ids as $tid) {
         $s = xhjob_state($tid, 'default', $dataDir);
-        if (($s['state'] ?? '') === 'SUCCESS') {
+        if (($s['state'] ?? '') === 'success') {
             $successCount++;
         }
     }

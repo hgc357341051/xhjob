@@ -32,7 +32,7 @@ echo "slow task dispatched: $id\n";
 sleep(2);
 
 $s = xhjob_state($id);
-if (($s['state'] ?? 'UNKNOWN') !== 'RUNNING') {
+if (($s['state'] ?? 'UNKNOWN') !== 'running') {
     echo "FAIL: expected RUNNING after 2s, got: {$s['state']}\n";
     var_dump($s);
     xhjob_stop(); exit(1);
@@ -44,13 +44,13 @@ $finalState = null;
 for ($i = 0; $i < 100; $i++) {
     $s = xhjob_state($id);
     $state = $s['state'] ?? 'UNKNOWN';
-    if ($state === 'SUCCESS' || $state === 'FAILED') {
+    if ($state === 'success' || $state === 'failed') {
         $finalState = $state;
         break;
     }
     usleep(100000);
 }
-if ($finalState !== 'SUCCESS') {
+if ($finalState !== 'success') {
     echo "FAIL: expected SUCCESS after wait, got: $finalState\n";
     var_dump(xhjob_state($id));
     xhjob_stop(); exit(1);

@@ -40,11 +40,11 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 $start = time();
 while (time() - $start < 10) {
     $state = xhjob_state($id, "result-ttl-svc");
-    if (($state['state'] ?? '') === 'SUCCESS') break;
+    if (($state['state'] ?? '') === 'success') break;
     usleep(500_000);
 }
 $state = xhjob_state($id, "result-ttl-svc");
-check("state == SUCCESS", ($state['state'] ?? '') === 'SUCCESS', "state=" . ($state['state'] ?? ''));
+check("state == SUCCESS", ($state['state'] ?? '') === 'success', "state=" . ($state['state'] ?? ''));
 
 // Immediately fetch result - should have stdout
 $result = xhjob_result($id, "result-ttl-svc");

@@ -55,7 +55,7 @@ $final = null;
 for ($i = 0; $i < 50; $i++) {
     $state = xhjob_state($id, 'smoke', $dir);
     $s = $state['state'] ?? 'UNKNOWN';
-    if (in_array($s, ['SUCCESS', 'FAILED', 'CANCELLED'], true)) {
+    if (in_array($s, ['success', 'failed', 'cancelled'], true)) {
         $final = $state;
         break;
     }
@@ -66,7 +66,7 @@ echo "final state: " . json_encode($final) . "\n";
 $result = xhjob_result($id, 'smoke', $dir);
 echo "result: " . json_encode($result) . "\n";
 
-if (($final['state'] ?? '') !== 'SUCCESS') {
+if (($final['state'] ?? '') !== 'success') {
     echo "FAIL: task did not succeed\n";
     xhjob_stop('smoke', $dir);
     exit(1);

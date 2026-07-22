@@ -61,12 +61,12 @@ while (time() - $start < 30) {
     $s = xhjob_state($id, "backoff-svc");
     $finalState = $s['state'] ?? '';
     $finalAttempts = $s['attempts'] ?? -1;
-    if ($finalState === 'FAILED') break;
+    if ($finalState === 'failed') break;
     usleep(500_000);
 }
 
 check("state == FAILED after retries exhausted",
-    $finalState === 'FAILED',
+    $finalState === 'failed',
     "state=" . $finalState);
 // withRetry(3, 1) 表示 retry_max=3（3 次重试），总执行次数 = 1 次初始 + 3 次重试 = 4
 // 最后一次失败时 attempts 从 3 增至 4 并标记为 FAILED

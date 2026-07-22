@@ -8,9 +8,10 @@
 //! `current_step` and dispatches the next task in the chain. On any step
 //! failure, the chain state becomes "failed" and remaining steps are
 //! skipped. After all steps complete successfully, the chain state becomes
-//! "succeeded".
+//! "success".
 //!
-//! Chain state transitions: pending -> running -> succeeded / failed.
+//! Chain state transitions: pending -> running -> success / failed
+//! （与 TaskState::as_str() 一致，统一为小写）。
 
 use crate::errors::{Result, XhjobError};
 use crate::store::{ChainRecord, TaskStore};
@@ -28,13 +29,13 @@ pub async fn advance(
     let now = now_ts() as i64;
     let mut record = store.get_chain(chain_id).await?
         .ok_or_else(|| XhjobError::Store(format!("chain not found: {}", chain_id)))?;
-    if record.state == "succeeded" || record.state == "failed" {
+    if record.state == "success" || record.state == "failed" {
         return Ok(None);
     }
     let next_step = record.current_step;
     if (next_step as usize) >= record.tasks.len() {
-        // All steps done: mark as succeeded.
-        store.update_chain_step(chain_id, next_step, "succeeded", now).await?;
+        // All steps done: mark as success.
+        store.update_chain_step(chain_id, next_step, "success", now).await?;
         return Ok(None);
     }
     // Mark as running (first time) and pick the next task config.
@@ -86,11 +87,11 @@ mod tests {
         // Third advance returns step 2.
         let s2 = advance(&store, "c1").await.unwrap().expect("step2");
         assert_eq!(s2, json!({"cmd":"step3"}));
-        // Fourth advance returns None (chain complete) and marks succeeded.
+        // Fourth advance returns None (chain complete) and marks success.
         let s3 = advance(&store, "c1").await.unwrap();
         assert!(s3.is_none(), "after last step advance returns None");
         let record = store.get_chain("c1").await.unwrap().unwrap();
-        assert_eq!(record.state, "succeeded");
+        assert_eq!(record.state, "success");
         assert_eq!(record.current_step, 3);
     }
 

@@ -51,7 +51,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 
 $state = xhjob_state($id, "maxinst-svc");
 check("state is PENDING or RUNNING",
-    in_array(($state['state'] ?? ''), ['PENDING', 'RUNNING']),
+    in_array(($state['state'] ?? ''), ['pending', 'running']),
     "state=" . ($state['state'] ?? ''));
 
 // Test 2: default maxInstances=1 + allowOverlap(false) — backcompat no-overlap.

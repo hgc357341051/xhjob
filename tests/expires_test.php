@@ -40,7 +40,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 
 $state = xhjob_state($id, "expires-svc");
 check("state == PENDING initially",
-    ($state['state'] ?? '') === 'PENDING',
+    ($state['state'] ?? '') === 'pending',
     "state=" . ($state['state'] ?? ''));
 check("expires == 2 in state info",
     ($state['expires'] ?? '') === '2',
@@ -53,24 +53,24 @@ $finalState = '';
 while (time() - $start < 8) {
     $s = xhjob_state($id, "expires-svc");
     $finalState = $s['state'] ?? '';
-    if ($finalState === 'EXPIRED') break;
+    if ($finalState === 'expired') break;
     usleep(500_000);
 }
 
 check("state == EXPIRED after expires window",
-    $finalState === 'EXPIRED',
+    $finalState === 'expired',
     "state=" . $finalState);
 
 // Verify EXPIRED is terminal (no further state changes).
 sleep(1);
 $s = xhjob_state($id, "expires-svc");
 check("state stays EXPIRED (terminal)",
-    ($s['state'] ?? '') === 'EXPIRED',
+    ($s['state'] ?? '') === 'expired',
     "state=" . ($s['state'] ?? ''));
 
 // Test 3: xhjob_list with EXPIRED filter returns the expired task.
 echo "Test 3: xhjob_list state filter EXPIRED\n";
-$json = xhjob_list("expires-svc", "EXPIRED");
+$json = xhjob_list("expires-svc", "expired");
 $tasks = json_decode($json, true);
 if (!is_array($tasks)) $tasks = [];
 $found = false;

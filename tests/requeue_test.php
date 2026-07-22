@@ -44,7 +44,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 
 $state = xhjob_state($id, "requeue-svc");
 check("state == PENDING initially",
-    ($state['state'] ?? '') === 'PENDING',
+    ($state['state'] ?? '') === 'pending',
     "state=" . ($state['state'] ?? ''));
 
 $ok = xhjob_cancel($id, "requeue-svc");
@@ -52,7 +52,7 @@ check("xhjob_cancel returns true", $ok === true);
 
 $state = xhjob_state($id, "requeue-svc");
 check("state == CANCELLED after cancel",
-    ($state['state'] ?? '') === 'CANCELLED',
+    ($state['state'] ?? '') === 'cancelled',
     "state=" . ($state['state'] ?? ''));
 
 // Test 2: requeue the cancelled task → state returns to PENDING.
@@ -62,7 +62,7 @@ check("xhjob_requeue returns true", $ok === true);
 
 $state = xhjob_state($id, "requeue-svc");
 check("state == PENDING after requeue",
-    ($state['state'] ?? '') === 'PENDING',
+    ($state['state'] ?? '') === 'pending',
     "state=" . ($state['state'] ?? ''));
 // 注意：xhjob_state 返回的 attempts 是字符串 '0'，不是 int 0
 check("attempts == 0 after requeue",

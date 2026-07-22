@@ -128,7 +128,7 @@ class TaskManager
     /**
      * 列出任务
      *
-     * @param string|null $stateFilter 状态过滤（如 'PENDING'、'SUCCESS'）
+     * @param string|null $stateFilter 状态过滤（如 'pending'、'success'）
      * @param string|null $tag         标签过滤
      * @return array 任务列表
      * @throws InvalidTaskConfigException 查询失败时抛出
@@ -301,7 +301,7 @@ class TaskManager
      * 每 200ms 轮询一次 state()，直到匹配或超时。
      *
      * @param string $id            任务 ID
-     * @param string $expectedState 期望状态（如 'SUCCESS'、'FAILED'）
+     * @param string $expectedState 期望状态（如 'success'、'failed'）
      * @param int    $timeoutSec    超时秒数，默认 30
      * @return bool 是否在超时前达到指定状态
      */

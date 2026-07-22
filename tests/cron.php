@@ -36,11 +36,11 @@ $attempts = 0;
 for ($i = 0; $i < 60; $i++) {  // up to 6 seconds
     $s = xhjob_state($id);
     $state = $s['state'] ?? 'UNKNOWN';
-    if ($state === 'SUCCESS') {
+    if ($state === 'success') {
         $successSeen = true;
         break;
     }
-    if ($state === 'FAILED') {
+    if ($state === 'failed') {
         echo "FAIL: task ended in FAILED state\n";
         var_dump(xhjob_state($id));
         var_dump(xhjob_result($id));

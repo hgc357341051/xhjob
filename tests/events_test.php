@@ -57,13 +57,13 @@ $finalState = null;
 for ($i = 0; $i < 50; $i++) {
     $s = xhjob_state($task_id, 'default', $dataDir);
     $st = $s['state'] ?? 'UNKNOWN';
-    if (in_array($st, ['SUCCESS', 'FAILED', 'CANCELLED', 'EXPIRED'], true)) {
+    if (in_array($st, ['success', 'failed', 'cancelled', 'expired'], true)) {
         $finalState = $st;
         break;
     }
     usleep(100_000);
 }
-ok($finalState === 'SUCCESS', "task reached SUCCESS (got: $finalState)");
+ok($finalState === 'success', "task reached SUCCESS (got: $finalState)");
 
 // Small grace period so the succeeded event is flushed to the store.
 usleep(200_000);

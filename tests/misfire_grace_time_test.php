@@ -47,7 +47,7 @@ ok(is_string($id1) && !str_starts_with($id1, "error:"), "dispatched cron task wi
 
 // Immediately query state → PENDING or RUNNING
 $state1 = xhjob_state($id1, "default", $dataDir);
-ok(in_array(($state1['state'] ?? ''), ['PENDING', 'RUNNING']),
+ok(in_array(($state1['state'] ?? ''), ['pending', 'running']),
     "state is PENDING or RUNNING immediately (state=" . ($state1['state'] ?? '') . ")");
 
 // Verify misfire_grace_time=5 via xhjob_get
@@ -64,7 +64,7 @@ while (time() - $start < 75) {
     $s = xhjob_state($id1, "default", $dataDir);
     $ec = (int)($s['execution_count'] ?? 0);
     $st = $s['state'] ?? '';
-    if ($ec >= 1 || $st === 'RUNNING') { $triggered = true; break; }
+    if ($ec >= 1 || $st === 'running') { $triggered = true; break; }
     sleep(1);
 }
 ok($triggered, "cron task triggered at least once (execution_count>=1 or RUNNING)");

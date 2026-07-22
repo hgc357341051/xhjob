@@ -39,7 +39,12 @@ impl TaskType {
 }
 
 /// Task state machine.
+///
+/// 所有对外 API（`xhjob_state` / `xhjob_list` / `xhjob_get` 等）统一返回
+/// serde 风格的小写形式（`"pending"` / `"running"` / `"success"` ...）。
+/// `as_str()` 与 serde 序列化保持一致，均输出小写。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskState {
     Pending,
     Running,
@@ -55,26 +60,29 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// 返回小写的状态字符串，与 serde 序列化结果一致。
     pub fn as_str(&self) -> &'static str {
         match self {
-            TaskState::Pending => "PENDING",
-            TaskState::Running => "RUNNING",
-            TaskState::Success => "SUCCESS",
-            TaskState::Failed => "FAILED",
-            TaskState::Interrupted => "INTERRUPTED",
-            TaskState::Cancelled => "CANCELLED",
-            TaskState::Expired => "EXPIRED",
+            TaskState::Pending => "pending",
+            TaskState::Running => "running",
+            TaskState::Success => "success",
+            TaskState::Failed => "failed",
+            TaskState::Interrupted => "interrupted",
+            TaskState::Cancelled => "cancelled",
+            TaskState::Expired => "expired",
         }
     }
+    /// 解析状态字符串。同时接受新的小写形式与历史的大写形式，
+    /// 以便兼容旧数据库 / 旧调用方。
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
-            "PENDING" => Ok(TaskState::Pending),
-            "RUNNING" => Ok(TaskState::Running),
-            "SUCCESS" => Ok(TaskState::Success),
-            "FAILED" => Ok(TaskState::Failed),
-            "INTERRUPTED" => Ok(TaskState::Interrupted),
-            "CANCELLED" => Ok(TaskState::Cancelled),
-            "EXPIRED" => Ok(TaskState::Expired),
+            "pending" | "PENDING" => Ok(TaskState::Pending),
+            "running" | "RUNNING" => Ok(TaskState::Running),
+            "success" | "SUCCESS" => Ok(TaskState::Success),
+            "failed" | "FAILED" => Ok(TaskState::Failed),
+            "interrupted" | "INTERRUPTED" => Ok(TaskState::Interrupted),
+            "cancelled" | "CANCELLED" => Ok(TaskState::Cancelled),
+            "expired" | "EXPIRED" => Ok(TaskState::Expired),
             other => Err(XhjobError::Store(format!("unknown state: {}", other))),
         }
     }
@@ -442,7 +450,7 @@ pub struct ChainRecord {
     /// Ordered list of task builder JSON configs.
     pub tasks: Vec<serde_json::Value>,
     pub current_step: u32,
-    /// "pending" / "running" / "succeeded" / "failed".
+    /// "pending" / "running" / "success" / "failed"（与 TaskState::as_str() 一致）。
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -455,7 +463,8 @@ pub struct GroupRecord {
     pub group_id: String,
     /// Parallel task configs.
     pub tasks: Vec<serde_json::Value>,
-    /// "pending" / "running" / "succeeded" / "partial_failed" / "failed".
+    /// "pending" / "running" / "success" / "partial_failed" / "failed"
+    /// （"success"/"failed" 与 TaskState::as_str() 一致）。
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -499,11 +508,10 @@ pub trait TaskStore: Send + Sync {
     /// contains `tag` are returned. Reference: APScheduler get_jobs +
     /// tag-based filtering.
     fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>>;
-    /// Re-queue a terminal task (Cancelled / Failed / Expired) back to Pending
-    /// so it can be triggered again. Resets `attempts=0` and sets
-    /// `next_fire=now` so the next scan picks it up immediately. Returns
-    /// `true` if the task was requeued, `false` if the task was not in a
-    /// requeueable terminal state (or does not exist).
+    /// 将终态任务（Cancelled / Failed / Expired / Success）重新入队为 Pending，
+    /// 以便再次触发执行。重置 `attempts=0` 并设置 `next_fire=now`，
+    /// 使下一次扫描立即拾取该任务。返回 `true` 表示已重新入队，
+    /// `false` 表示任务不处于可重新入队的终态（或不存在）。
     /// Reference: Celery requeue.
     fn requeue_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
 
@@ -712,7 +720,7 @@ mod tests {
     #[test]
     fn test_task_state_cancelled_roundtrip() {
         let s = TaskState::Cancelled.as_str();
-        assert_eq!(s, "CANCELLED");
+        assert_eq!(s, "cancelled");
         assert_eq!(TaskState::from_str(s).unwrap(), TaskState::Cancelled);
     }
 
@@ -1228,13 +1236,11 @@ mod tests {
         assert_eq!(obj.get("proxy").and_then(|v| v.as_str()), Some("http://proxy.example"));
         assert_eq!(obj.get("encoding").and_then(|v| v.as_str()), Some("GBK"));
         // Identity + execution metadata also present.
-        // Note: TaskState serializes to the Rust enum variant name (PascalCase)
-        // via serde's default enum serialization; `as_str()` returns the
-        // uppercase string used in IPC / SQLite storage. Here we verify the
-        // serde JSON form (which is what xhjob_get returns to PHP).
+        // TaskState 通过 `#[serde(rename_all = "lowercase")]` 序列化为小写形式，
+        // 与 `as_str()` 输出一致；xhjob_get / xhjob_state / xhjob_list 均返回该小写形式。
         assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("t-get-full"));
         assert_eq!(obj.get("task_type").and_then(|v| v.as_str()), Some("shell"));
-        assert_eq!(obj.get("state").and_then(|v| v.as_str()), Some("Pending"));
+        assert_eq!(obj.get("state").and_then(|v| v.as_str()), Some("pending"));
         assert_eq!(obj.get("attempts").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(obj.get("execution_count").and_then(|v| v.as_u64()), Some(0));
         assert!(obj.contains_key("created_at"));

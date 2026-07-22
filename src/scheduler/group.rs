@@ -7,8 +7,9 @@
 //! each task completes, the daemon updates a per-task completion record
 //! (stored in the group's `payload` JSON: a map of `task_id -> result`).
 //!
-//! Group state transitions: pending -> running -> succeeded (all ok) /
-//! partial_failed (some failed) / failed (all failed).
+//! Group state transitions: pending -> running -> success (all ok) /
+//! partial_failed (some failed) / failed (all failed)
+//! （"success"/"failed" 与 TaskState::as_str() 一致，统一为小写）。
 //!
 //! The current implementation does NOT persist per-task completion to keep
 //! the data model simple — `group_state` queries the live task states in
@@ -74,7 +75,7 @@ pub async fn refresh_state(
     } else if pending > 0 {
         "running"
     } else if failed == 0 {
-        "succeeded"
+        "success"
     } else if succeeded == 0 {
         "failed"
     } else {
@@ -114,7 +115,7 @@ mod tests {
         let (total, ok, fail, pend) = summarize(&store, "g-ok").await.unwrap();
         assert_eq!((total, ok, fail, pend), (2, 2, 0, 0));
         let state = refresh_state(&store, "g-ok").await.unwrap();
-        assert_eq!(state, "succeeded");
+        assert_eq!(state, "success");
     }
 
     #[tokio::test]

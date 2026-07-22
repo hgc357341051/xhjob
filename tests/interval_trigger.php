@@ -46,7 +46,7 @@ while (time() - $start < 8) {
 
 $state = xhjob_state($id, "interval-svc");
 check("state not terminal (interval keeps firing)",
-    in_array(($state['state'] ?? ''), ['PENDING', 'RUNNING']),
+    in_array(($state['state'] ?? ''), ['pending', 'running']),
     "state=" . ($state['state'] ?? ''));
 check("execution_count >= 2 within 8s",
     ($state['execution_count'] ?? 0) >= 2,

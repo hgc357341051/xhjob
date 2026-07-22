@@ -165,16 +165,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let payload_str: String = row.get("payload")?;
     let payload: serde_json::Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null);
     let state_str: String = row.get("state")?;
-    let state = match state_str.as_str() {
-        "PENDING" => TaskState::Pending,
-        "RUNNING" => TaskState::Running,
-        "SUCCESS" => TaskState::Success,
-        "FAILED" => TaskState::Failed,
-        "INTERRUPTED" => TaskState::Interrupted,
-        "CANCELLED" => TaskState::Cancelled,
-        "EXPIRED" => TaskState::Expired,
-        _ => TaskState::Pending,
-    };
+    // 兼容历史的大写存储与新的小写存储；无法识别时回退为 Pending。
+    let state = TaskState::from_str(&state_str).unwrap_or(TaskState::Pending);
     Ok(Task {
         id: row.get("id")?,
         task_type,
@@ -304,7 +296,8 @@ impl TaskStore for SqliteStore {
         Box::pin(async move {
             let conn = self.conn.lock().await;
             let mut stmt = conn.prepare(
-                "SELECT * FROM tasks WHERE state IN ('PENDING', 'RUNNING', 'INTERRUPTED')"
+                // 同时匹配新的小写与历史的大写存储，保证旧库数据仍可被恢复。
+                "SELECT * FROM tasks WHERE state IN ('pending', 'running', 'interrupted', 'PENDING', 'RUNNING', 'INTERRUPTED')"
             ).map_err(|e| XhjobError::Store(format!("prepare: {}", e)))?;
             let rows = stmt.query_map([], task_from_row)
                 .map_err(|e| XhjobError::Store(format!("query: {}", e)))?;
@@ -358,7 +351,7 @@ impl TaskStore for SqliteStore {
         Box::pin(async move {
             let conn = self.conn.lock().await;
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id = ?1 AND state = 'RUNNING'",
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1 AND state IN ('running', 'RUNNING')",
                 params![id],
                 |row| row.get(0),
             ).map_err(|e| XhjobError::Store(format!("count: {}", e)))?;
@@ -458,12 +451,13 @@ impl TaskStore for SqliteStore {
                 params![id],
                 |row| row.get(0),
             ).map_err(|e| XhjobError::Store(format!("cancel_task query: {}", e)))?;
-            if state_str == "PENDING" {
+            // 大小写无关比较，兼容历史的大写存储与新的小写存储。
+            if state_str.eq_ignore_ascii_case("PENDING") {
                 conn.execute(
-                    "UPDATE tasks SET state = 'CANCELLED', cancel_requested = 1, finished_at = ?1 WHERE id = ?2",
+                    "UPDATE tasks SET state = 'cancelled', cancel_requested = 1, finished_at = ?1 WHERE id = ?2",
                     params![crate::store::now_ts() as i64, id],
                 ).map_err(|e| XhjobError::Store(format!("cancel_task update: {}", e)))?;
-            } else if state_str == "RUNNING" {
+            } else if state_str.eq_ignore_ascii_case("RUNNING") {
                 conn.execute(
                     "UPDATE tasks SET cancel_requested = 1 WHERE id = ?1",
                     params![id],
@@ -548,14 +542,16 @@ impl TaskStore for SqliteStore {
                 Some(s) => s,
                 None => return Ok(false), // task does not exist
             };
-            // Only requeue terminal Cancelled / Failed / Expired tasks.
-            let requeueable = matches!(state_str.as_str(), "CANCELLED" | "FAILED" | "EXPIRED");
+            // 仅终态 Cancelled / Failed / Expired / Success 任务可重新入队。
+            // 大小写无关比较，兼容历史的大写存储与新的小写存储。
+            let requeueable = matches!(state_str.to_ascii_lowercase().as_str(),
+                "cancelled" | "failed" | "expired" | "success");
             if !requeueable {
                 return Ok(false);
             }
             let now = crate::store::now_ts() as i64;
             conn.execute(
-                "UPDATE tasks SET state = 'PENDING', attempts = 0, last_error = NULL, \
+                "UPDATE tasks SET state = 'pending', attempts = 0, last_error = NULL, \
                  started_at = NULL, finished_at = NULL, cancel_requested = 0, \
                  next_fire = ?1 WHERE id = ?2",
                 params![now, id],
@@ -590,8 +586,9 @@ impl TaskStore for SqliteStore {
                 return Ok(false);
             }
             // Don't reschedule terminal tasks.
-            let is_terminal = matches!(state_str.as_str(),
-                "SUCCESS" | "FAILED" | "CANCELLED" | "EXPIRED");
+            // 大小写无关比较，兼容历史的大写存储与新的小写存储。
+            let is_terminal = matches!(state_str.to_ascii_lowercase().as_str(),
+                "success" | "failed" | "cancelled" | "expired");
             if is_terminal {
                 return Ok(false);
             }
@@ -617,11 +614,11 @@ impl TaskStore for SqliteStore {
             // fresh timestamps.
             let changed = conn.execute(
                 "UPDATE tasks
-                 SET state = 'PENDING',
+                 SET state = 'pending',
                      next_fire = ?1,
                      started_at = NULL,
                      finished_at = NULL
-                 WHERE state = 'RUNNING' AND acks_late = 1",
+                 WHERE state IN ('running', 'RUNNING') AND acks_late = 1",
                 params![now],
             ).map_err(|e| XhjobError::Store(format!("reset_running_to_pending update: {}", e)))?;
             Ok(changed as u64)

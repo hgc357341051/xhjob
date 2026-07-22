@@ -72,7 +72,7 @@ if (is_string($json)) {
         check("id matches dispatched id", ($task['id'] ?? '') === $id, "id=" . ($task['id'] ?? ''));
         check("task_type=shell", ($task['task_type'] ?? '') === 'shell', "task_type=" . ($task['task_type'] ?? ''));
         check("state is Pending or Running",
-            in_array($task['state'] ?? '', ['Pending', 'Running', 'PENDING', 'RUNNING']),
+            in_array($task['state'] ?? '', ['Pending', 'Running', 'pending', 'running']),
             "state=" . ($task['state'] ?? ''));
         check("attempts present", array_key_exists('attempts', $task));
         check("execution_count present", array_key_exists('execution_count', $task));

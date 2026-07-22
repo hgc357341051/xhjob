@@ -72,7 +72,7 @@ check("dispatched task with endAt", is_string($id2) && !str_starts_with($id2, "e
 sleep(6);
 $state = xhjob_state($id2, "start-end-svc");
 check("state == SUCCESS after end_date",
-    ($state['state'] ?? '') === 'SUCCESS',
+    ($state['state'] ?? '') === 'success',
     "state=" . ($state['state'] ?? ''));
 
 // Cleanup

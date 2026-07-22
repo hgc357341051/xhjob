@@ -73,7 +73,7 @@ $id2 = Xhjob::task()
 
 $state2 = xhjob_state($id2, "lifecycle-svc");
 check("task2 starts PENDING (startAt delayed)",
-    ($state2['state'] ?? '') === 'PENDING',
+    ($state2['state'] ?? '') === 'pending',
     "state=" . ($state2['state'] ?? ''));
 
 $ok = xhjob_cancel($id2, "lifecycle-svc");
@@ -81,7 +81,7 @@ check("xhjob_cancel returns true", $ok === true);
 
 $state2 = xhjob_state($id2, "lifecycle-svc");
 check("state == CANCELLED after cancel",
-    ($state2['state'] ?? '') === 'CANCELLED',
+    ($state2['state'] ?? '') === 'cancelled',
     "state=" . ($state2['state'] ?? ''));
 
 // Test 4: remove task definition
@@ -120,16 +120,16 @@ check("id2 (cancelled) in list", $foundId2);
 check("id3 (removed) NOT in list", !in_array($id3, array_column($tasks, 'id')));
 
 // Test 6: list by state filter
-// 注意：xhjob_list 返回的 JSON 中 state 字段是 serde 序列化的 TaskState 枚举
-// 形如 "Cancelled"（混合大小写），不同于 xhjob_state 返回的 "CANCELLED"（全大写）
-echo "Test 6: list by state filter (CANCELLED)\n";
-$json = xhjob_list("lifecycle-svc", "CANCELLED");
+// 注意：xhjob_list 与 xhjob_state 现在统一返回小写状态值（serde 风格，
+// 如 "cancelled"），state_filter 输入参数同样接受小写。
+echo "Test 6: list by state filter (cancelled)\n";
+$json = xhjob_list("lifecycle-svc", "cancelled");
 $tasks = json_decode($json, true);
 check("filtered list returns array", is_array($tasks));
 
 $allCancelled = true;
 foreach ($tasks as $t) {
-    if (strtoupper($t['state'] ?? '') !== 'CANCELLED') $allCancelled = false;
+    if (($t['state'] ?? '') !== 'cancelled') $allCancelled = false;
 }
 check("all returned tasks are CANCELLED", $allCancelled);
 check("id2 (cancelled) is in CANCELLED filter", in_array($id2, array_column($tasks, 'id')));

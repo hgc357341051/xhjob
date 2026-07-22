@@ -64,7 +64,7 @@ if (is_array($task)) {
 
 // Immediately query state → PENDING or RUNNING
 $state = xhjob_state($id, "default", $dataDir);
-ok(in_array(($state['state'] ?? ''), ['PENDING', 'RUNNING']),
+ok(in_array(($state['state'] ?? ''), ['pending', 'running']),
     "state is PENDING or RUNNING immediately (state=" . ($state['state'] ?? '') . ")");
 
 // Wait for cron trigger (up to 75 seconds)
@@ -75,7 +75,7 @@ while (time() - $start < 75) {
     $s = xhjob_state($id, "default", $dataDir);
     $ec = (int)($s['execution_count'] ?? 0);
     $st = $s['state'] ?? '';
-    if ($ec >= 1 || $st === 'RUNNING') { $triggered = true; break; }
+    if ($ec >= 1 || $st === 'running') { $triggered = true; break; }
     sleep(1);
 }
 ok($triggered, "cron task triggered at least once within rate_limit window");

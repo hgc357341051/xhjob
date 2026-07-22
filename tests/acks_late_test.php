@@ -50,7 +50,7 @@ check("dispatched", is_string($id) && !str_starts_with($id, "error:"), "id=$id")
 usleep(500_000);
 $state = xhjob_state($id, "ackslate-svc");
 check("state eventually SUCCESS",
-    ($state['state'] ?? '') === 'SUCCESS',
+    ($state['state'] ?? '') === 'success',
     "state=" . ($state['state'] ?? ''));
 // 注意：xhjob_state 返回的 acks_late 是字符串 'true'，不是 bool true
 // （xhjob_get 返回的 Task JSON 中 acks_late 才是 bool true）
@@ -70,7 +70,7 @@ check("dispatched", is_string($id2) && !str_starts_with($id2, "error:"), "id=$id
 usleep(500_000);
 $state2 = xhjob_state($id2, "ackslate-svc");
 check("state eventually SUCCESS",
-    ($state2['state'] ?? '') === 'SUCCESS',
+    ($state2['state'] ?? '') === 'success',
     "state=" . ($state2['state'] ?? ''));
 // 注意：xhjob_state 返回的 acks_late 是字符串 'false'，不是 bool false
 check("acks_late=false (default) visible in state",

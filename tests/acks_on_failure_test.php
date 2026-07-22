@@ -58,9 +58,9 @@ ok(is_array($task1) && ($task1['acks_on_failure'] ?? null) === false,
 echo "Waiting 10s for retry cycles...\n";
 sleep(10);
 $state1 = xhjob_state($id1, "default", $dataDir);
-ok(in_array(($state1['state'] ?? ''), ['PENDING', 'RUNNING']),
+ok(in_array(($state1['state'] ?? ''), ['pending', 'running']),
     "state is PENDING or RUNNING after 10s (infinite retry, not FAILED) (state=" . ($state1['state'] ?? '') . ")");
-ok(($state1['state'] ?? '') !== 'FAILED',
+ok(($state1['state'] ?? '') !== 'failed',
     "state is NOT FAILED (acks_on_failure=false retries indefinitely)");
 
 // Cancel the infinitely-retrying task → CANCELLED
@@ -74,10 +74,10 @@ $finalState1 = '';
 while (time() - $start < 5) {
     $s = xhjob_state($id1, "default", $dataDir);
     $finalState1 = $s['state'] ?? '';
-    if ($finalState1 === 'CANCELLED') break;
+    if ($finalState1 === 'cancelled') break;
     usleep(500_000);
 }
-ok($finalState1 === 'CANCELLED',
+ok($finalState1 === 'cancelled',
     "state is CANCELLED after cancel (state=" . $finalState1 . ")");
 
 // Test 3: acks_on_failure=true (default) → FAILED terminal after retry_max
@@ -101,7 +101,7 @@ ok(is_array($task2) && ($task2['acks_on_failure'] ?? null) === true,
 echo "Waiting 5s for retry_max to exhaust...\n";
 sleep(5);
 $state2 = xhjob_state($id2, "default", $dataDir);
-ok(($state2['state'] ?? '') === 'FAILED',
+ok(($state2['state'] ?? '') === 'failed',
     "state is FAILED (terminal) after retry_max exhausted with acks_on_failure=true (state=" . ($state2['state'] ?? '') . ")");
 
 // Cleanup

@@ -44,12 +44,12 @@ $finalState = '';
 while (time() - $start < 10) {
     $state = xhjob_state($id, "runat-svc");
     $finalState = $state['state'] ?? '';
-    if ($finalState === 'SUCCESS') break;
+    if ($finalState === 'success') break;
     usleep(500_000);
 }
 
 check("state == SUCCESS after runAt fired",
-    $finalState === 'SUCCESS',
+    $finalState === 'success',
     "state=$finalState");
 
 // Test 2: After SUCCESS, the task should NOT re-fire (one-shot).
