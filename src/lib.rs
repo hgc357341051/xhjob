@@ -126,7 +126,10 @@ pub fn xhjob_status(name: Option<String>, data_dir: Option<String>) -> Vec<(Stri
 pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<String>) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
-        Err(e) => return e,
+        // P0-1: must use "error:" prefix so PHP-side dispatch() can detect
+        // service-name validation failures instead of treating the error
+        // string as a task_id (which would cause a "fake success").
+        Err(e) => return format!("error: {}", e),
     };
     let data_dir = normalize_data_dir(data_dir);
     // Build a one-shot request to the daemon and return the task_id (or error string).
@@ -893,8 +896,35 @@ impl Xhjob {
     /// existing task with the same id is fully replaced.
     /// PHP: `withId(string $id): $this` (snake→camel auto-conversion)
     /// Reference: APScheduler id / replace_existing.
+    ///
+    /// P0-2: id must match `^[A-Za-z0-9_-]{1,64}$`. This prevents two classes
+    /// of bug: (1) ids starting with `"error:"` would break the PHP-side
+    /// dispatch() error-detection contract (which uses `str_starts_with($r,
+    /// 'error:')`); (2) ids containing arbitrary chars (e.g. JSON, SQL
+    /// meta-chars) could cause downstream parsing/sqlite issues. Empty
+    /// string is treated as None (auto-generate), preserving existing
+    /// behavior.
     pub fn id(&mut self, id: String) -> &mut Self {
-        self.builder.id = if id.is_empty() { None } else { Some(id) };
+        if id.is_empty() {
+            self.builder.id = None;
+            return self;
+        }
+        // Validate charset: A-Z a-z 0-9 _ - only, length 1..=64.
+        let valid = id.len() <= 64
+            && id.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+            });
+        if !valid {
+            tracing::warn!(
+                id = %id,
+                "withId rejected: id must match ^[A-Za-z0-9_-]{{1,64}}$; falling back to auto-generate"
+            );
+            // Reject by setting None rather than panic — panic across extern "C"
+            // is UB (see Fix 1 panic=abort). Auto-generate is safer than abort.
+            self.builder.id = None;
+            return self;
+        }
+        self.builder.id = Some(id);
         self
     }
 

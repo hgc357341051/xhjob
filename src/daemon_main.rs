@@ -242,8 +242,29 @@ async fn run_daemon() -> Result<()> {
                 let store = Arc::clone(&store_ipc);
                 let queue = Arc::clone(&queue_ipc);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, store, queue).await {
-                        tracing::debug!(error = %e, "connection handler exited");
+                    // P0-3: bound the per-connection handler with a timeout so
+                    // that a half-closed / malicious / OOM-killed PHP-FPM
+                    // worker cannot leave a daemon-side tokio task forever
+                    // blocked in read_frame/write_frame, accumulating socket
+                    // fds until daemon becomes silently unavailable (ulimit).
+                    // 15s is generous enough for any legitimate store op
+                    // (including list_events / inspect) while still catching
+                    // stuck connections.
+                    let conn_timeout = std::time::Duration::from_secs(15);
+                    match tokio::time::timeout(
+                        conn_timeout,
+                        handle_connection(stream, store, queue),
+                    ).await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "connection handler exited");
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                elapsed_secs = conn_timeout.as_secs(),
+                                "connection handler timed out, dropping connection"
+                            );
+                        }
                     }
                 });
             }

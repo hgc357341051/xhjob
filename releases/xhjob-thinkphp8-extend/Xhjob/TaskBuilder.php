@@ -92,6 +92,7 @@ class TaskBuilder
             'acks_on_failure'     => true,
             'idempotent'          => false,
             'countdown'           => null,
+            'encoding'            => null,
         ];
     }
 
@@ -423,7 +424,34 @@ class TaskBuilder
         if ($this->config['task_type'] !== 'http') {
             throw new InvalidTaskConfigException('withProxy 仅适用于 http 任务');
         }
-        $this->config['payload']['proxy'] = $p;
+        // P0-16: proxy must be written to the top-level `proxy` field, NOT
+        // `payload.proxy`. Rust's Task.proxy (src/store/mod.rs) is read from
+        // the top-level JSON key; writing it under payload caused the proxy
+        // setting to be silently dropped.
+        $this->config['proxy'] = $p;
+        return $this;
+    }
+
+    /**
+     * 设置 shell 任务输出编码（仅 shell 任务）
+     *
+     * 对应 Rust Task.encoding 字段。stdout/stderr 字节流会按此编码
+     * 解码为 UTF-8。支持 encoding_rs 接受的所有标签（GBK / Big5 /
+     * Shift_JIS / auto 等）。
+     *
+     * P0-18: 之前 PHP 端无此方法，Rust 的 withEncoding() 无法从
+     * PHP 调用，shell 中文输出任务只能用默认 UTF-8。
+     *
+     * @param string $encoding 编码标签，如 "GBK" / "Big5" / "auto"
+     *
+     * @return self
+     */
+    public function withEncoding(string $encoding): self
+    {
+        if ($this->config['task_type'] !== 'shell') {
+            throw new InvalidTaskConfigException('withEncoding 仅适用于 shell 任务');
+        }
+        $this->config['encoding'] = $encoding;
         return $this;
     }
 

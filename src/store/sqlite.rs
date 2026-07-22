@@ -20,6 +20,13 @@ impl SqliteStore {
             .map_err(|e| XhjobError::Store(format!("set WAL: {}", e)))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| XhjobError::Store(format!("set synchronous: {}", e)))?;
+        // P0-6: busy_timeout=5000ms. Without this, concurrent writes from
+        // multiple PHP-FPM workers immediately hit SQLITE_BUSY instead of
+        // waiting for the lock holder to release. 5s is the SQLite
+        // recommended default and aligns with libsqlite3's own default
+        // for many higher-level wrappers.
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(|e| XhjobError::Store(format!("set busy_timeout: {}", e)))?;
         // Schema
         conn.execute_batch(
             r#"

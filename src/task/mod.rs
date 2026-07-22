@@ -630,6 +630,29 @@ impl TaskBuilder {
         let task_type = self.task_type.ok_or_else(|| XhjobError::InvalidTask(
             "task type not set; call via_http() or via_shell() first".to_string()
         ))?;
+        // P0-2: validate explicit id charset. ids must match
+        // `^[A-Za-z0-9_-]{1,64}$`. This prevents two classes of bug:
+        //   (1) ids starting with "error:" break the PHP-side dispatch()
+        //       error-detection contract (str_starts_with($r, 'error:'));
+        //   (2) ids containing SQL meta-chars / JSON quotes could cause
+        //       downstream issues. Empty id is allowed (means auto-generate).
+        if let Some(ref id) = self.id {
+            if id.is_empty() {
+                // empty string is treated as "not set" — fall through to
+                // auto-generate below.
+            } else {
+                let valid = id.len() <= 64
+                    && id.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+                    });
+                if !valid {
+                    return Err(XhjobError::InvalidTask(format!(
+                        "task id '{}' is invalid: must match ^[A-Za-z0-9_-]{{1,64}}$",
+                        id
+                    )));
+                }
+            }
+        }
         let mut task = Task::new(task_type, self.payload);
         task.cron = self.cron;
         task.retry_max = self.retry_max;
@@ -881,5 +904,56 @@ mod tests {
         assert!(!task.persist, "persist default = false");
         assert!(!task.allow_overlap, "allow_overlap default = false");
         assert!(task.acks_on_failure, "acks_on_failure default = true");
+    }
+
+    /// P0-2: build() must reject ids that don't match `^[A-Za-z0-9_-]{1,64}$`.
+    /// This includes ids containing "error:" prefix (which would break PHP
+    /// dispatch() error-detection contract), SQL meta-chars, JSON quotes, etc.
+    #[test]
+    fn test_build_rejects_invalid_id_charset() {
+        let bad_ids = [
+            "error: malicious",      // contains ":" and space
+            "'; DROP TABLE tasks; --", // SQL injection chars
+            "id with spaces",        // spaces
+            "id/with/slashes",       // slashes
+            &"a".repeat(65),         // too long (>64)
+        ];
+        for bad in bad_ids {
+            let json = format!(
+                r#"{{"task_type":"shell","payload":{{"cmd":"echo hi"}},"id":"{}"}}"#,
+                bad.replace('"', "\\\"").replace('\\', "\\\\")
+            );
+            let b = TaskBuilder::from_json(&json).expect("JSON should deserialize");
+            let err = b.build().expect_err(
+                &format!("id '{}' should be rejected", bad)
+            );
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("invalid") && msg.contains("id"),
+                "error message should mention invalid id: {}", msg
+            );
+        }
+    }
+
+    /// P0-2: build() must accept ids that match `^[A-Za-z0-9_-]{1,64}$`.
+    #[test]
+    fn test_build_accepts_valid_id_charset() {
+        let good_ids = [
+            "my-task-001_ABC",
+            "a",
+            &"a".repeat(64),  // max length
+            "ABC123-_-",
+        ];
+        for good in good_ids {
+            let json = format!(
+                r#"{{"task_type":"shell","payload":{{"cmd":"echo hi"}},"id":"{}"}}"#,
+                good
+            );
+            let b = TaskBuilder::from_json(&json).expect("JSON should deserialize");
+            let task = b.build().expect(
+                &format!("id '{}' should be accepted", good)
+            );
+            assert_eq!(task.id, *good);
+        }
     }
 }
