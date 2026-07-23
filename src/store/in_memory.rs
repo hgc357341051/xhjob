@@ -298,7 +298,7 @@ impl TaskStore for InMemoryStore {
             let now = crate::store::now_ts();
             let mut reset = 0u64;
             for task in guard.values_mut() {
-                if task.state == TaskState::Running {
+                if task.state == TaskState::Running || task.state == TaskState::Interrupted {
                     // P0 fix (C1): reset ALL running tasks on startup, not
                     // just acks_late ones. A daemon crash leaves Running tasks
                     // with no worker executing them — without this reset they
@@ -307,6 +307,12 @@ impl TaskStore for InMemoryStore {
                     // acks_late=true tasks, meaning the majority of tasks
                     // (acks_late defaults to false) were silently orphaned
                     // on every unclean restart.
+                    //
+                    // Also reset Interrupted tasks: these are tasks that were
+                    // Running when the daemon was gracefully shut down (the
+                    // daemon marks them Interrupted on shutdown so users can
+                    // distinguish "interrupted by shutdown" from "crashed").
+                    // On restart they should be re-enqueued.
                     task.state = TaskState::Pending;
                     task.next_fire = Some(now);
                     // Clear started_at / finished_at so the next execution
@@ -317,6 +323,37 @@ impl TaskStore for InMemoryStore {
                 }
             }
             Ok(reset)
+        })
+    }
+
+    fn mark_running_as_interrupted(&self, reason: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        let reason = reason.to_string();
+        Box::pin(async move {
+            let mut guard = self.tasks.write().await;
+            let now = crate::store::now_ts() as i64;
+            let mut transitioned: Vec<String> = Vec::new();
+            for (id, task) in guard.iter_mut() {
+                if task.state == TaskState::Running {
+                    task.state = TaskState::Interrupted;
+                    task.finished_at = Some(now as u64);
+                    transitioned.push(id.clone());
+                }
+            }
+            let count = transitioned.len() as u64;
+            drop(guard);
+            // Record an Interrupted event per task outside the tasks write
+            // lock to avoid re-entrancy with the events lock.
+            for id in &transitioned {
+                if let Err(e) = self.record_event(
+                    id,
+                    super::EventType::Interrupted,
+                    Some(&reason),
+                    now,
+                ).await {
+                    tracing::warn!(task_id = %id, error = %e, "record_event Interrupted failed");
+                }
+            }
+            Ok(count)
         })
     }
 

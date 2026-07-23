@@ -819,15 +819,69 @@ impl TaskStore for SqliteStore {
                 // forever and are never re-enqueued (scan only picks up Pending).
                 // The old code only reset acks_late=1 tasks, meaning the majority
                 // (acks_late defaults to false) were silently orphaned.
+                //
+                // Also reset Interrupted tasks: these are tasks that were
+                // Running when the daemon was gracefully shut down (the daemon
+                // marks them Interrupted on shutdown). On restart they should
+                // be re-enqueued.
                 let changed = conn.execute(
                     "UPDATE tasks
                      SET state = 'pending',
                          next_fire = ?1,
                          started_at = NULL,
                          finished_at = NULL
-                     WHERE state IN ('running', 'RUNNING')",
+                     WHERE state IN ('running', 'RUNNING', 'interrupted', 'INTERRUPTED')",
                     params![now],
                 ).map_err(|e| XhjobError::store(format!("reset_running_to_pending update: {}", e)))?;
+                Ok(changed as u64)
+            })
+            .await
+            .map_err(|e| XhjobError::store(format!("spawn_blocking join: {}", e)))?
+        })
+    }
+
+    fn mark_running_as_interrupted(&self, reason: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+        let reason = reason.to_string();
+        Box::pin(async move {
+            let conn = Arc::clone(&self.conn);
+            tokio::task::spawn_blocking(move || {
+                let mut conn = conn.lock().unwrap();
+                let now = crate::store::now_ts() as i64;
+                // Collect ids of all Running tasks BEFORE the UPDATE so we
+                // can emit an Interrupted event per task in the same
+                // transaction. We read-then-update inside a single tx for
+                // atomicity.
+                let tx = conn.transaction()
+                    .map_err(|e| XhjobError::store(format!("begin tx: {}", e)))?;
+                let ids: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM tasks WHERE state IN ('running', 'RUNNING')"
+                    ).map_err(|e| XhjobError::store(format!("select running: {}", e)))?;
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(0))
+                        .map_err(|e| XhjobError::store(format!("query_map running: {}", e)))?;
+                    let mut v = Vec::new();
+                    for r in rows {
+                        v.push(r.map_err(|e| XhjobError::store(format!("query_map running row: {}", e)))?);
+                    }
+                    v
+                };
+                let changed = tx.execute(
+                    "UPDATE tasks
+                     SET state = 'interrupted',
+                         finished_at = ?1
+                     WHERE state IN ('running', 'RUNNING')",
+                    params![now],
+                ).map_err(|e| XhjobError::store(format!("mark_running_as_interrupted update: {}", e)))?;
+                // Emit one Interrupted event per transitioned task.
+                let event_type_str = super::EventType::Interrupted.as_str();
+                for id in &ids {
+                    tx.execute(
+                        "INSERT INTO events (task_id, event_type, payload, ts) VALUES (?1, ?2, ?3, ?4)",
+                        params![id, event_type_str, reason, now],
+                    ).map_err(|e| XhjobError::store(format!("insert Interrupted event: {}", e)))?;
+                }
+                tx.commit()
+                    .map_err(|e| XhjobError::store(format!("commit tx: {}", e)))?;
                 Ok(changed as u64)
             })
             .await

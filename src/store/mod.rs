@@ -479,6 +479,13 @@ pub enum EventType {
     Expired,
     MaxInstancesReached,
     RateLimited,
+    /// Emitted when a Running task is marked Interrupted because the daemon
+    /// was gracefully shut down (drain deadline reached while the task was
+    /// still executing). Distinguishes "interrupted by shutdown" from a
+    /// crash — on restart both kinds are reset to Pending by
+    /// `reset_running_to_pending`, but the event log keeps the distinction
+    /// for observability.
+    Interrupted,
 }
 
 impl EventType {
@@ -494,6 +501,7 @@ impl EventType {
             EventType::Expired => "expired",
             EventType::MaxInstancesReached => "max_instances_reached",
             EventType::RateLimited => "rate_limited",
+            EventType::Interrupted => "interrupted",
         }
     }
     pub fn from_str(s: &str) -> Result<Self> {
@@ -508,6 +516,7 @@ impl EventType {
             "expired" => Ok(EventType::Expired),
             "max_instances_reached" => Ok(EventType::MaxInstancesReached),
             "rate_limited" => Ok(EventType::RateLimited),
+            "interrupted" => Ok(EventType::Interrupted),
             other => Err(XhjobError::store(format!("unknown event type: {}", other))),
         }
     }
@@ -635,10 +644,28 @@ pub trait TaskStore: Send + Sync {
     /// mid-execution, in-flight tasks with `acks_late=true` are re-queued
     /// instead of being left in the Running state forever.
     ///
+    /// Also resets tasks in the `Interrupted` state (left behind by a
+    /// previous graceful shutdown via `mark_running_as_interrupted`) —
+    /// they are re-enqueued on the next scan just like Running tasks.
+    ///
     /// Returns the number of tasks reset.
     ///
     /// Reference: Celery acks_late.
     fn reset_running_to_pending(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+
+    /// Mark all Running tasks as Interrupted. Called by the daemon on
+    /// graceful shutdown AFTER the drain deadline (so still-running tasks
+    /// are the ones that could not be drained in time). Distinguishes
+    /// "interrupted by shutdown" from a crash in the event log: on the
+    /// next daemon startup, `reset_running_to_pending` will re-enqueue
+    /// both Running (crash recovery) and Interrupted (shutdown recovery)
+    /// tasks back to Pending.
+    ///
+    /// For each transitioned task, an `EventType::Interrupted` event is
+    /// recorded with the drain reason in the payload.
+    ///
+    /// Returns the number of tasks transitioned.
+    fn mark_running_as_interrupted(&self, reason: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
 
     // ----- Event log (A17) -----
 
@@ -1497,5 +1524,125 @@ mod tests {
 
         let f = store.load_task("t-failed").await.unwrap().unwrap();
         assert_eq!(f.state, TaskState::Failed);
+    }
+
+    /// Interrupted state recovery: `mark_running_as_interrupted` should
+    /// transition all Running tasks to Interrupted AND emit one
+    /// `EventType::Interrupted` event per task with the supplied reason
+    /// in the payload. This is the daemon graceful-shutdown path.
+    ///
+    /// Verifies that the previously-dead-code `TaskState::Interrupted` and
+    /// the new `EventType::Interrupted` variant are actually reachable.
+    #[tokio::test]
+    async fn test_mark_running_as_interrupted_transitions_state_and_emits_event() {
+        let store = InMemoryStore::new();
+        let now = now_ts();
+
+        // Two Running tasks (one acks_late, one not) — both should be marked.
+        let mut t1 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "a"}));
+        t1.id = "t-run-1".to_string();
+        t1.state = TaskState::Running;
+        t1.acks_late = true;
+        t1.started_at = Some(now.saturating_sub(10));
+        store.insert_task(t1).await.unwrap();
+
+        let mut t2 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "b"}));
+        t2.id = "t-run-2".to_string();
+        t2.state = TaskState::Running;
+        t2.acks_late = false;
+        t2.started_at = Some(now.saturating_sub(5));
+        store.insert_task(t2).await.unwrap();
+
+        // A Pending task — should NOT be touched by mark_running_as_interrupted.
+        let mut t3 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "c"}));
+        t3.id = "t-pending-3".to_string();
+        t3.state = TaskState::Pending;
+        t3.next_fire = Some(now + 60);
+        store.insert_task(t3).await.unwrap();
+
+        let count = store.mark_running_as_interrupted("drain deadline").await.unwrap();
+        assert_eq!(count, 2, "both Running tasks should be transitioned");
+
+        // Verify state transition.
+        let l1 = store.load_task("t-run-1").await.unwrap().unwrap();
+        assert_eq!(l1.state, TaskState::Interrupted,
+            "Running task should now be Interrupted");
+        assert!(l1.finished_at.is_some(),
+            "Interrupted task should have finished_at set");
+
+        let l2 = store.load_task("t-run-2").await.unwrap().unwrap();
+        assert_eq!(l2.state, TaskState::Interrupted);
+
+        let l3 = store.load_task("t-pending-3").await.unwrap().unwrap();
+        assert_eq!(l3.state, TaskState::Pending,
+            "Pending task should be untouched by mark_running_as_interrupted");
+
+        // Verify one Interrupted event per transitioned task was emitted.
+        let events = store.list_events(0, None).await.unwrap();
+        let interrupted_events: Vec<_> = events.iter()
+            .filter(|e| e.event_type == EventType::Interrupted)
+            .collect();
+        assert_eq!(interrupted_events.len(), 2,
+            "one Interrupted event per transitioned task should be emitted");
+        assert!(interrupted_events.iter().all(|e| e.payload.as_deref() == Some("drain deadline")),
+            "Interrupted event payload should carry the supplied reason");
+    }
+
+    /// Interrupted state recovery: on the next daemon startup,
+    /// `reset_running_to_pending` should re-enqueue Interrupted tasks
+    /// (left behind by a previous graceful shutdown via
+    /// `mark_running_as_interrupted`) back to Pending, indistinguishable
+    /// from crash-recovered Running tasks.
+    ///
+    /// Verifies the full shutdown → startup lifecycle:
+    ///   1. Task running.
+    ///   2. Daemon graceful shutdown → mark_running_as_interrupted → Interrupted.
+    ///   3. Daemon restart → reset_running_to_pending → Pending + next_fire=now.
+    #[tokio::test]
+    async fn test_interrupted_tasks_are_reset_to_pending_on_restart() {
+        let store = InMemoryStore::new();
+        let now = now_ts();
+
+        // Simulate a task that was running when the previous daemon shut down.
+        let mut t = Task::new(TaskType::Shell, serde_json::json!({"cmd": "x"}));
+        t.id = "t-interrupted".to_string();
+        t.state = TaskState::Running;
+        t.started_at = Some(now.saturating_sub(60));
+        store.insert_task(t).await.unwrap();
+
+        // Graceful shutdown: mark as Interrupted.
+        let n = store.mark_running_as_interrupted("shutdown").await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            store.load_task("t-interrupted").await.unwrap().unwrap().state,
+            TaskState::Interrupted
+        );
+
+        // Daemon restart: reset_running_to_pending re-enqueues Interrupted.
+        let reset = store.reset_running_to_pending().await.unwrap();
+        assert_eq!(reset, 1,
+            "Interrupted task should be reset to Pending on restart");
+
+        let loaded = store.load_task("t-interrupted").await.unwrap().unwrap();
+        assert_eq!(loaded.state, TaskState::Pending,
+            "Interrupted task should be back to Pending after restart");
+        assert!(loaded.next_fire.is_some(),
+            "Interrupted task should have next_fire set so scan picks it up");
+        assert!(loaded.started_at.is_none(),
+            "Interrupted task should have started_at cleared on reset");
+        assert!(loaded.finished_at.is_none(),
+            "Interrupted task should have finished_at cleared on reset");
+    }
+
+    /// `EventType::Interrupted` round-trips through as_str / from_str.
+    #[test]
+    fn test_event_type_interrupted_round_trip() {
+        assert_eq!(EventType::Interrupted.as_str(), "interrupted");
+        assert_eq!(
+            EventType::from_str("interrupted").unwrap(),
+            EventType::Interrupted
+        );
+        // Unknown string still errors (regression guard).
+        assert!(EventType::from_str("not-a-real-event").is_err());
     }
 }

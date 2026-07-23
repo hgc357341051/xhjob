@@ -400,6 +400,27 @@ async fn run_daemon() -> Result<()> {
     } else {
         tracing::info!("all in-flight tasks drained during shutdown");
     }
+
+    // Mark any tasks that are STILL in the Running state (i.e. drain could
+    // not finish them in time) as Interrupted instead of leaving them
+    // Running. This serves two purposes:
+    //
+    // 1. Distinguish "interrupted by graceful shutdown" from "left Running
+    //    by a crash" in the event log. On the next startup,
+    //    `reset_running_to_pending` re-enqueues both kinds back to Pending,
+    //    but the Interrupted event lets operators tell the two apart.
+    //
+    // 2. Without this, a Running task whose worker was killed by the
+    //    runtime drop on shutdown would stay Running forever in the store
+    //    (until the next reset_running_to_pending call) — making
+    //    `xhjob_state` return "running" for a task that has no live worker.
+    //
+    // The in-memory store is irrelevant here (its tasks die with the
+    // process), but for SQLite-backed stores this is the durable signal.
+    // Best-effort: ignore errors so we still proceed to daemon_stopping.
+    if let Err(e) = store.mark_running_as_interrupted("daemon shutdown drain deadline").await {
+        tracing::warn!(error = %e, "mark_running_as_interrupted failed during shutdown");
+    }
     #[cfg(unix)]
     crate::daemon::unix::daemon_stopping();
     #[cfg(windows)]

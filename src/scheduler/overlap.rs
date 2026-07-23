@@ -16,7 +16,11 @@ use crate::store::{Task, TaskStore};
 
 pub struct OverlapController {
     /// In-memory count of currently running instances per task id.
-    /// (used as a fast-path cache; the canonical source is the store.)
+    /// This is the canonical source for concurrency limiting: it correctly
+    /// tracks N>1 concurrent instances (unlike store.count_running_instances
+    /// which is based on the single-row tasks table and can only return 0/1).
+    /// Maintained by on_start / on_finish; reset to 0 on daemon restart (which
+    /// is consistent with reset_running_to_pending clearing all Running state).
     running: Mutex<HashMap<String, u32>>,
 }
 
@@ -59,14 +63,41 @@ impl OverlapController {
         match max_instances {
             None => Ok(true), // unlimited concurrency
             Some(limit) => {
-                let running_count = store.count_running_instances(&task.id).await?;
+                // Use the in-memory counter (maintained by on_start/on_finish)
+                // as the primary source — it correctly tracks N>1 concurrent
+                // instances. store.count_running_instances is based on the
+                // single-row tasks table and can only return 0/1, so it cannot
+                // express max_instances>1 concurrency. We take the max of both
+                // as a defensive measure (covers daemon-restart edge cases
+                // where the store still has Running rows before
+                // reset_running_to_pending runs).
+                let mem_count = {
+                    let g = self.running.lock().await;
+                    g.get(&task.id).copied().unwrap_or(0)
+                };
+                let store_count = store.count_running_instances(&task.id).await?;
+                let running_count = mem_count.max(store_count);
                 if running_count >= limit {
                     tracing::debug!(
                         task_id = %task.id,
                         running = running_count,
+                        mem_running = mem_count,
+                        store_running = store_count,
                         max = limit,
                         "SKIP_OVERLAP"
                     );
+                    // Record a MaxInstancesReached event so listeners can
+                    // observe the concurrency cap being hit (previously this
+                    // EventType variant was defined but never emitted).
+                    let now = crate::store::now_ts() as i64;
+                    if let Err(e) = store.record_event(
+                        &task.id,
+                        crate::store::EventType::MaxInstancesReached,
+                        None,
+                        now,
+                    ).await {
+                        tracing::warn!(task_id = %task.id, error = %e, "record_event MaxInstancesReached failed");
+                    }
                     return Ok(false);
                 }
                 Ok(true)
@@ -121,201 +152,55 @@ impl Default for OverlapController {
 mod tests {
     use super::*;
     use crate::store::{InMemoryStore, TaskState, TaskType};
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
-
-    /// A test-only wrapper around `InMemoryStore` that allows the test to
-    /// inject a fixed return value for `count_running_instances`. All other
-    /// `TaskStore` methods delegate to the inner store.
-    ///
-    /// This is required because the in-memory data model only tracks one row
-    /// per task ID, so `count_running_instances` can only ever return 0 or 1.
-    /// To exercise the `max_instances=N>1` boundary (e.g. "3rd instance skipped
-    /// when N=2"), we need to be able to return a count of 2.
-    struct CountOverrideStore {
-        inner: Arc<InMemoryStore>,
-        count_override: Arc<AsyncMutex<Option<u32>>>,
-    }
-
-    impl CountOverrideStore {
-        fn new() -> Self {
-            Self {
-                inner: Arc::new(InMemoryStore::new()),
-                count_override: Arc::new(AsyncMutex::new(None)),
-            }
-        }
-
-        async fn set_count(&self, c: Option<u32>) {
-            *self.count_override.lock().await = c;
-        }
-    }
-
-    impl TaskStore for CountOverrideStore {
-        fn insert_task(&self, task: Task) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.insert_task(task)
-        }
-        fn update_state(&self, id: &str, state: TaskState, started_at: Option<u64>, finished_at: Option<u64>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_state(id, state, started_at, finished_at)
-        }
-        fn save_result(&self, task_id: &str, result: crate::store::TaskResult) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.save_result(task_id, result)
-        }
-        fn load_active_tasks(&self) -> Pin<Box<dyn Future<Output = Result<Vec<Task>>> + Send + '_>> {
-            self.inner.load_active_tasks()
-        }
-        fn load_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<Option<Task>>> + Send + '_>> {
-            self.inner.load_task(id)
-        }
-        fn load_result(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::TaskResult>>> + Send + '_>> {
-            self.inner.load_result(id)
-        }
-        fn count_running_instances(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
-            let id = id.to_string();
-            let inner = Arc::clone(&self.inner);
-            let ov = Arc::clone(&self.count_override);
-            Box::pin(async move {
-                let guard = ov.lock().await;
-                if let Some(c) = *guard {
-                    return Ok(c);
-                }
-                drop(guard);
-                inner.count_running_instances(&id).await
-            })
-        }
-        fn update_next_fire(&self, id: &str, next_fire: Option<u64>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_next_fire(id, next_fire)
-        }
-        fn set_attempts_and_error(&self, id: &str, attempts: u32, last_error: Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.set_attempts_and_error(id, attempts, last_error)
-        }
-        fn delete_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.delete_task(id)
-        }
-        fn increment_execution_count(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<u32>> + Send + '_>> {
-            self.inner.increment_execution_count(id)
-        }
-        fn remove_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.remove_task(id)
-        }
-        fn set_paused(&self, id: &str, paused: bool) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.set_paused(id, paused)
-        }
-        fn cancel_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.cancel_task(id)
-        }
-        fn cleanup_expired_results(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
-            self.inner.cleanup_expired_results()
-        }
-        fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + 'a>> {
-            self.inner.list_tasks(state_filter, tag_filter)
-        }
-        fn requeue_task(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
-            self.inner.requeue_task(id)
-        }
-        fn reschedule_task(&self, id: &str, new_cron: &str) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
-            self.inner.reschedule_task(id, new_cron)
-        }
-        fn reset_running_to_pending(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
-            self.inner.reset_running_to_pending()
-        }
-        fn record_event(&self, task_id: &str, event_type: crate::store::EventType, payload: Option<&str>, ts: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.record_event(task_id, event_type, payload, ts)
-        }
-        fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskEvent>>> + Send + '_>> {
-            self.inner.list_events(since_ts, task_id_filter)
-        }
-        fn cleanup_expired_events(&self, ttl_secs: u64) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>> {
-            self.inner.cleanup_expired_events(ttl_secs)
-        }
-        fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.create_chain(chain_id, tasks, created_at)
-        }
-        fn get_chain(&self, chain_id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::ChainRecord>>> + Send + '_>> {
-            self.inner.get_chain(chain_id)
-        }
-        fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_chain_step(chain_id, current_step, state, updated_at)
-        }
-        fn list_chains_by_state(&self, state: &str) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::ChainRecord>>> + Send + '_>> {
-            self.inner.list_chains_by_state(state)
-        }
-        fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.create_group(group_id, tasks, created_at)
-        }
-        fn get_group(&self, group_id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::GroupRecord>>> + Send + '_>> {
-            self.inner.get_group(group_id)
-        }
-        fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_group_state(group_id, state, updated_at)
-        }
-        fn list_groups_by_state(&self, state: &str) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::GroupRecord>>> + Send + '_>> {
-            self.inner.list_groups_by_state(state)
-        }
-        fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.create_chord(id, header_task_ids, callback_json, created_at)
-        }
-        fn get_chord(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<Option<crate::store::ChordRecord>>> + Send + '_>> {
-            self.inner.get_chord(id)
-        }
-        fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_chord_state(id, state, callback_task_id, updated_at)
-        }
-        fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-            self.inner.update_progress(id, percent, meta)
-        }
-        fn list_active_summary(&self) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
-            self.inner.list_active_summary()
-        }
-        fn list_registered_summary(&self) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
-            self.inner.list_registered_summary()
-        }
-        fn list_scheduled_summary(&self, now: u64) -> Pin<Box<dyn Future<Output = Result<Vec<crate::store::TaskSummary>>> + Send + '_>> {
-            self.inner.list_scheduled_summary(now)
-        }
-        fn worker_stats(&self) -> Pin<Box<dyn Future<Output = Result<crate::store::WorkerStats>> + Send + '_>> {
-            self.inner.worker_stats()
-        }
-    }
 
     /// A10: with `max_instances=2`, the controller should allow up to 2 concurrent
-    /// instances and skip the 3rd. Uses a `CountOverrideStore` to simulate a
-    /// running-count of 2 (which the in-memory data model cannot represent
-    /// directly because it tracks one row per task id).
+    /// instances and skip the 3rd. Uses on_start to simulate concurrent instances
+    /// (the in-memory HashMap correctly tracks N>1, unlike store.count_running_instances
+    /// which is based on the single-row tasks table).
     /// Reference: APScheduler max_instances.
     #[tokio::test]
     async fn test_max_instances_allows_n_concurrent() {
-        let store_concrete = Arc::new(CountOverrideStore::new());
-        let store: Arc<dyn TaskStore> = store_concrete.clone();
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         let overlap = OverlapController::new();
 
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo"}));
         task.id = "t-max2".to_string();
         task.max_instances = 2;
         // allow_overlap stays false (default) — max_instances takes priority anyway.
-        store_concrete.inner.insert_task(task.clone()).await.unwrap();
+        store.insert_task(task.clone()).await.unwrap();
 
-        // count=0 (Pending): 0 < 2 → fire (1st instance allowed).
-        store_concrete.set_count(Some(0)).await;
+        // 0 running: 0 < 2 → fire (1st instance allowed).
         assert!(
             overlap.should_fire(&store, &task).await.unwrap(),
             "max_instances=2 with 0 running should fire (1st allowed)"
         );
 
-        // count=1 (one Running): 1 < 2 → fire (2nd instance allowed).
-        store_concrete.set_count(Some(1)).await;
+        // Simulate 1st instance running.
+        overlap.on_start(&task.id).await;
+        // 1 running: 1 < 2 → fire (2nd instance allowed).
         assert!(
             overlap.should_fire(&store, &task).await.unwrap(),
             "max_instances=2 with 1 running should fire (2nd allowed)"
         );
 
-        // count=2 (two Running): 2 >= 2 → skip (3rd instance skipped).
-        store_concrete.set_count(Some(2)).await;
+        // Simulate 2nd instance running.
+        overlap.on_start(&task.id).await;
+        // 2 running: 2 >= 2 → skip (3rd instance skipped).
         assert!(
             !overlap.should_fire(&store, &task).await.unwrap(),
             "max_instances=2 with 2 running should skip (3rd skipped)"
         );
+
+        // Simulate 1 instance finishing: 1 running → fire again.
+        overlap.on_finish(&task.id).await;
+        assert!(
+            overlap.should_fire(&store, &task).await.unwrap(),
+            "max_instances=2 with 1 running (after finish) should fire"
+        );
+
+        // Cleanup.
+        overlap.on_finish(&task.id).await;
     }
 
     /// A10 backward compat: default `max_instances=1` + `allow_overlap=false`
