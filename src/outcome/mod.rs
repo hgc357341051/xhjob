@@ -31,7 +31,7 @@ pub struct StateInfo {
     /// `Expired` terminal state. 0 = no expiry.
     pub expires: u64,
     /// Retry exponential backoff (C8): when true, retry delays grow
-    /// exponentially as `min(retry_delay * 2^(attempts-1), retry_delay * 60)`.
+    /// exponentially as `min(retry_delay * 2^attempts, retry_delay * 60)`.
     pub retry_backoff: bool,
     /// ignoreResult (C9): when true, no result row is persisted for this
     /// task — `xhjob_result()` will return null. Default false.
@@ -149,8 +149,14 @@ pub async fn query_state(
     service_name: &str,
     data_dir: Option<&str>,
 ) -> Result<StateInfo> {
+    // P1 fix (defense-in-depth): validate service_name here even though the
+    // PHP entry points in lib.rs already call resolve_service_name(). This
+    // guards against future internal callers that might bypass the PHP
+    // layer, and prevents the value from reaching ipc_path() (which joins
+    // it into a filesystem path) unvalidated.
+    let validated = crate::service::validate(service_name)?;
     let payload = serde_json::json!({ "task_id": task_id });
-    let resp = ipc_request("state", payload, service_name, data_dir).await?;
+    let resp = ipc_request("state", payload, &validated, data_dir).await?;
     if !resp.ok {
         return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }
@@ -166,8 +172,10 @@ pub async fn query_result(
     service_name: &str,
     data_dir: Option<&str>,
 ) -> Result<TaskResult> {
+    // P1 fix (defense-in-depth): see query_state above.
+    let validated = crate::service::validate(service_name)?;
     let payload = serde_json::json!({ "task_id": task_id });
-    let resp = ipc_request("result", payload, service_name, data_dir).await?;
+    let resp = ipc_request("result", payload, &validated, data_dir).await?;
     if !resp.ok {
         return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
     }

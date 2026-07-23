@@ -174,7 +174,11 @@ pub fn backoff_delay(task: &Task) -> u64 {
 /// Compute the next retry time (Unix timestamp) for a task given current attempts.
 pub fn next_retry_ts(task: &Task) -> u64 {
     let delay = backoff_delay(task);
-    crate::store::now_ts() + delay
+    // P2 fix: saturating_add prevents wraparound when delay is near u64::MAX
+    // (e.g. retry_delay close to u64::MAX/60 with retry_backoff=true). A
+    // wrap would produce a past timestamp, causing the scheduler to fire
+    // the retry immediately and defeating the backoff entirely.
+    crate::store::now_ts().saturating_add(delay)
 }
 
 /// Schedule a retry for the task: increment attempts, set last_error,
@@ -200,12 +204,16 @@ pub async fn schedule_retry(
             None,
             Some(crate::store::now_ts()),
         ).await?;
-        store.set_attempts_and_error(&task.id, task.attempts + 1, Some(error)).await?;
+        // P2 fix: saturating_add prevents u32 wraparound at u32::MAX. With
+        // acks_on_failure=false (effective_max_attempts=u32::MAX) a task can
+        // accumulate attempts up to u32::MAX; a plain +1 would wrap to 0,
+        // resetting the backoff sequence and creating a retry storm.
+        store.set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error)).await?;
         return Ok(false);
     }
 
     let next = next_retry_ts(task);
-    store.set_attempts_and_error(&task.id, task.attempts + 1, Some(error)).await?;
+    store.set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error)).await?;
     store.update_state(&task.id, TaskState::Pending, None, None).await?;
     store.update_next_fire(&task.id, Some(next)).await?;
     Ok(true)

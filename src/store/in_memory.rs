@@ -728,7 +728,8 @@ impl TaskStore for InMemoryStore {
                     }
                     task.next_fire = min_next;
                 } else if let Some(secs) = task.interval {
-                    task.next_fire = Some(now + secs);
+                    // P1 fix: saturating_add prevents u64 overflow (see task/mod.rs).
+                    task.next_fire = Some(now.saturating_add(secs));
                 } else if let Some(ts) = task.run_at {
                     task.next_fire = Some(ts as u64);
                 }

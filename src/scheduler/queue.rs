@@ -305,6 +305,15 @@ impl TaskQueue {
                         // still transitions correctly.
                         stored = r;
                     } else {
+                        // P2 fix: keep a copy of the original dispatch result
+                        // so that if load_result fails (transient SQLite error,
+                        // WAL checkpoint conflict, disk hiccup) we fall back to
+                        // the real result instead of TaskResult::default().
+                        // The previous unwrap_or_default() left all fields None,
+                        // which made the success check below use
+                        // unwrap_or(true) and could mark a FAILED task (e.g.
+                        // HTTP 500) as Success — a state-inconsistency bug.
+                        let original = r.clone();
                         if let Err(e) = store.save_result(&task_clone.id, r).await {
                             tracing::warn!(task_id = %task_clone.id, error = %e, "save_result failed");
                         }
@@ -312,7 +321,7 @@ impl TaskQueue {
                         // same data the success/failure check used.
                         stored = store.load_result(&task_clone.id).await
                             .ok().flatten()
-                            .unwrap_or_default();
+                            .unwrap_or(original);
                     }
                     dispatch_err = None;
                 }
@@ -379,7 +388,7 @@ impl TaskQueue {
                     }
                     if let Err(e) = store.set_attempts_and_error(
                         &task_clone.id,
-                        task_clone.attempts + 1,
+                        task_clone.attempts.saturating_add(1),
                         Some(format!("not retryable: {}", err_str)),
                     ).await {
                         tracing::warn!(task_id = %task_clone.id, error = %e, "set_attempts_and_error failed");
@@ -547,7 +556,7 @@ impl TaskQueue {
                     }
                     if let Err(e) = store.set_attempts_and_error(
                         &task_clone.id,
-                        task_clone.attempts + 1,
+                        task_clone.attempts.saturating_add(1),
                         Some(format!("not retryable: {}", err_msg)),
                     ).await {
                         tracing::warn!(task_id = %task_clone.id, error = %e, "set_attempts_and_error failed");
@@ -606,6 +615,19 @@ impl TaskQueue {
                 limits.record_task_execution();
             }
             overlap.on_finish(&task_clone.id).await;
+            // P1 fix: when a rate-limited task reaches a terminal state,
+            // release its rate-limit bucket so the per-task HashMap entry
+            // does not leak forever. Without this, a long-lived daemon
+            // processing many one-shot rate-limited tasks would accumulate
+            // dead entries (String + Vec<u64> each) and eventually OOM.
+            //
+            // IMPORTANT: only clean up on terminal states. Periodic tasks
+            // (cron/interval) that succeeded transition back to Pending to
+            // be re-fired by scan_once; their rate-limit bucket MUST be
+            // retained so the sliding window survives across fires.
+            if task_clone.rate_limit_count > 0 && final_state.is_terminal() {
+                queue_arc.rate_limiter.forget(&task_clone.id).await;
+            }
         };
 
         // Pool mode selection: async (default) or thread.

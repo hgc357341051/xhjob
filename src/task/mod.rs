@@ -754,7 +754,10 @@ impl TaskBuilder {
             // 0 延迟无意义，等同于不设置。
         } else if let Some(cd) = self.countdown {
             if task.run_at.is_none() {
-                task.run_at = Some(now_ts() as i64 + cd as i64);
+                // P1 fix: saturating_add prevents i64 overflow when cd is
+                // near i64::MAX. A wrap would produce a past or negative
+                // run_at, causing the task to fire immediately (or never).
+                task.run_at = Some((now_ts() as i64).saturating_add(cd as i64));
             } else {
                 tracing::warn!(
                     "both countdown and run_at set; run_at takes precedence"
@@ -858,15 +861,21 @@ impl TaskBuilder {
                 // Apply jitter: add a random offset in [0, jitter] to the
                 // initial next_fire for cron tasks.
                 if task.jitter > 0 {
-                    task.next_fire = Some(t + rand_jitter(task.jitter));
+                    // P1 fix: saturating_add prevents u64 overflow when t
+                    // (a future timestamp) plus a large jitter would wrap.
+                    task.next_fire = Some(t.saturating_add(rand_jitter(task.jitter)));
                 } else {
                     task.next_fire = Some(t);
                 }
             }
         } else if let Some(secs) = task.interval {
-            let mut nf = now_ts() + secs;
+            // P1 fix: saturating_add prevents u64 overflow when secs is
+            // near u64::MAX. A wrap would set next_fire to a small past
+            // timestamp, causing the interval task to fire immediately in
+            // a tight loop.
+            let mut nf = now_ts().saturating_add(secs);
             if task.jitter > 0 {
-                nf += rand_jitter(task.jitter);
+                nf = nf.saturating_add(rand_jitter(task.jitter));
             }
             task.next_fire = Some(nf);
         }

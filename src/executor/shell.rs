@@ -213,20 +213,40 @@ impl Executor for ShellExecutor {
             // Collect whatever the read tasks captured (they may still be
             // running if the child was killed before EOF; await them with a
             // short grace so we don't block forever on a closed pipe).
-            let stdout_buf = tokio::time::timeout(
+            //
+            // P1 fix: previously a drain timeout returned Err unconditionally
+            // via `?`, which marked an exit-0 success task as failed when a
+            // grandchild process (e.g. `nohup x &`, daemonizing scripts)
+            // inherited the pipe and kept it open past the 500ms grace. Now
+            // we treat drain timeout/join errors as non-fatal when the child
+            // already exited successfully — we just take whatever partial
+            // output was captured. On the error path (status_result is Err)
+            // we already tolerate partial output below.
+            let stdout_buf = match tokio::time::timeout(
                 Duration::from_millis(500),
                 stdout_task,
-            ).await
-                .map_err(|_| XhjobError::exec("stdout drain timeout".to_string()))?
-                .map_err(|e| XhjobError::exec(format!("stdout join: {}", e)))?
-                .unwrap_or_default();
-            let stderr_buf = tokio::time::timeout(
+            ).await {
+                Ok(Ok(Some(buf))) => buf,
+                _ => Vec::new(), // timeout, join error, or None: no captured output
+            };
+            let stderr_buf = match tokio::time::timeout(
                 Duration::from_millis(500),
                 stderr_task,
-            ).await
-                .map_err(|_| XhjobError::exec("stderr drain timeout".to_string()))?
-                .map_err(|e| XhjobError::exec(format!("stderr join: {}", e)))?
-                .unwrap_or_default();
+            ).await {
+                Ok(Ok(Some(buf))) => buf,
+                _ => Vec::new(),
+            };
+            if status_result.is_ok() {
+                // Log when we dropped output due to drain timeout on a
+                // successful task, so operators can diagnose missing stdout.
+                if stdout_buf.is_empty() || stderr_buf.is_empty() {
+                    tracing::debug!(
+                        stdout_len = stdout_buf.len(),
+                        stderr_len = stderr_buf.len(),
+                        "successful task had partial/empty drained output (grandchild may hold the pipe)"
+                    );
+                }
+            }
 
             let (stdout_text, stderr_text, exit_code) = match status_result {
                 Ok(status) => {

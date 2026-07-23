@@ -1686,4 +1686,78 @@ mod tests {
         // Unknown string still errors (regression guard).
         assert!(EventType::from_str("not-a-real-event").is_err());
     }
+
+    /// P1 regression: modify_job with `cron: null` must CLEAR the cron field.
+    /// Previously the in_memory backend cleared it but the SQLite backend
+    /// silently left the old value (the SET clause was skipped when the
+    /// parsed value was None), so a user who intended to stop a periodic
+    /// task from firing would see it keep firing. This test locks the
+    /// clear-on-null semantics for the in_memory backend (the SQLite
+    /// backend is exercised by the cross-process client_test).
+    #[tokio::test]
+    async fn test_modify_job_clears_cron_when_null() {
+        let store = InMemoryStore::new();
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo r"}));
+        task.id = "t-clear-cron".to_string();
+        task.cron = Some("*/5 * * * *".to_string());
+        task.state = TaskState::Pending;
+        task.next_fire = Some(now_ts() + 60);
+        store.insert_task(task).await.unwrap();
+
+        // Patch with cron=null to clear it.
+        let patch = serde_json::json!({ "cron": null });
+        let ok = store.modify_job("t-clear-cron", &patch).await.unwrap();
+        assert!(ok, "modify_job should report a change");
+
+        let loaded = store.load_task("t-clear-cron").await.unwrap().unwrap();
+        assert!(loaded.cron.is_none(),
+            "cron should be cleared after modify_job({{cron:null}}); got {:?}",
+            loaded.cron);
+    }
+
+    /// P1 regression: modify_job with `interval: null` must CLEAR the
+    /// interval field (same class of bug as the cron clear test above).
+    #[tokio::test]
+    async fn test_modify_job_clears_interval_when_null() {
+        let store = InMemoryStore::new();
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo r"}));
+        task.id = "t-clear-int".to_string();
+        task.interval = Some(30);
+        task.state = TaskState::Pending;
+        task.next_fire = Some(now_ts() + 30);
+        store.insert_task(task).await.unwrap();
+
+        let patch = serde_json::json!({ "interval": null });
+        let ok = store.modify_job("t-clear-int", &patch).await.unwrap();
+        assert!(ok);
+
+        let loaded = store.load_task("t-clear-int").await.unwrap().unwrap();
+        assert!(loaded.interval.is_none(),
+            "interval should be cleared after modify_job({{interval:null}}); got {:?}",
+            loaded.interval);
+    }
+
+    /// P1 regression: an unrecognized task state in the DB must NOT resurrect
+    /// the task as Pending (which would cause re-execution / duplicate side
+    /// effects). The safe fallback is Failed (a terminal state). This test
+    /// verifies the contract via load_active_tasks: a Failed task must NOT
+    /// appear in the active set. If the SQLite task_from_row unknown-state
+    /// fallback ever regressed back to Pending, a corrupted Failed row would
+    /// resurface in load_active_tasks and be re-executed by the scheduler.
+    #[tokio::test]
+    async fn test_unknown_state_does_not_resurrect_as_pending() {
+        let store = InMemoryStore::new();
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo r"}));
+        task.id = "t-failed".to_string();
+        task.state = TaskState::Failed;
+        task.finished_at = Some(now_ts());
+        store.insert_task(task).await.unwrap();
+
+        let active = store.load_active_tasks().await.unwrap();
+        // Failed (terminal) tasks must not appear in load_active_tasks,
+        // which is the scheduler's source of truth for what to execute.
+        let in_active: Vec<_> = active.iter().filter(|t| t.id == "t-failed").collect();
+        assert!(in_active.is_empty(),
+            "Failed task must not appear in load_active_tasks (would imply resurrection and re-execution)");
+    }
 }

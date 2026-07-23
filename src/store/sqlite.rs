@@ -263,7 +263,16 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let task_type = match type_str.as_str() {
         "http" => TaskType::Http,
         "shell" => TaskType::Shell,
-        _ => TaskType::Shell,
+        // P1 fix: unknown type previously fell back to Shell, which could
+        // execute a JSON payload as a shell command if a row was corrupted
+        // or hand-inserted with a bogus type. Shell execution of JSON would
+        // fail harmlessly (no such command), but to avoid any surprise we
+        // still log loudly. Keeping Shell as the fallback preserves
+        // backward compat with any rows written before a new type was added.
+        other => {
+            tracing::warn!(task_id = %id, task_type = %other, "unknown task_type in DB, treating as shell");
+            TaskType::Shell
+        }
     };
     let payload_str: String = row.get("payload")?;
     // P0-22: decrypt payload if XHJOB_ENCRYPTION_KEY is set. Falls back to
@@ -278,12 +287,22 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         }
     };
     let state_str: String = row.get("state")?;
-    // 兼容历史的大写存储与新的小写存储；无法识别时回退为 Pending。
+    // P1 fix: an unrecognized state previously fell back to Pending. If a
+    // terminal row (Success/Failed/Cancelled) was corrupted in the DB, this
+    // would RESURRECT the task — load_active_tasks would pick it up and the
+    // scheduler would re-execute it, causing duplicate side effects (double
+    // charges, duplicate emails, etc.). Falling back to Failed (a safe
+    // terminal state) ensures the task is never re-executed; the operator
+    // can manually requeue it after diagnosing the corruption. This is the
+    // conservative/safe side; the warning surfaces the corruption.
     let state = match TaskState::from_str(&state_str) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("state decode failed for task {}: {} (raw={})", id, e, state_str);
-            TaskState::Pending  // 保持原有 fallback 行为
+            tracing::warn!(
+                task_id = %id, raw_state = %state_str, error = %e,
+                "unrecognized task state in DB; marking Failed to prevent resurrection"
+            );
+            TaskState::Failed
         }
     };
     let tags: Vec<String> = {
@@ -1604,23 +1623,33 @@ impl TaskStore for SqliteStore {
                         }
                         next_fire_val = min_next;
                     } else if let Some(secs) = new_interval {
-                        next_fire_val = Some(now + secs);
+                        // P1 fix: saturating_add prevents u64 overflow (see task/mod.rs).
+                        next_fire_val = Some(now.saturating_add(secs));
                     } else if let Some(ts) = new_run_at {
                         next_fire_val = Some(ts as u64);
                     }
                 }
                 // Add trigger-field SET clauses.
-                if let Some(c) = &new_cron { sets.push("cron = ?".to_string()); params_vec.push(Box::new(c.clone())); }
-                if let Some(ocs) = &new_or_cron {
-                    sets.push("or_cron = ?".to_string());
-                    params_vec.push(Box::new(serde_json::to_string(ocs).unwrap_or_default()));
-                }
-                if let Some(i) = new_interval { sets.push("interval = ?".to_string()); params_vec.push(Box::new(i as i64)); }
-                if let Some(r) = new_run_at { sets.push("run_at = ?".to_string()); params_vec.push(Box::new(r)); }
-                if let Some(sd) = &new_skip_dates {
-                    sets.push("skip_dates = ?".to_string());
-                    params_vec.push(Box::new(serde_json::to_string(sd).unwrap_or_else(|_| "[]".to_string())));
-                }
+                // P1 fix: previously each trigger field was only pushed when
+                // `Some(...)`, which meant a user passing `null` (intent:
+                // "clear this trigger") would leave the column unchanged —
+                // the task kept firing on its old cron/interval/run_at
+                // despite the user believing it was cleared. Now we always
+                // push the SET clause and bind the Option directly, so
+                // `null` maps to SQL NULL (clearing the column), matching
+                // the in_memory backend's behavior. timezone/meta/soft_timeout
+                // above already followed this pattern; this makes the trigger
+                // fields consistent.
+                sets.push("cron = ?".to_string());
+                params_vec.push(Box::new(new_cron.clone())); // Option<String> -> NULL if None
+                sets.push("or_cron = ?".to_string());
+                params_vec.push(Box::new(new_or_cron.as_ref().map(|ocs| serde_json::to_string(ocs).unwrap_or_default()))); // Option<String>
+                sets.push("interval = ?".to_string());
+                params_vec.push(Box::new(new_interval.map(|i| i as i64))); // Option<i64>
+                sets.push("run_at = ?".to_string());
+                params_vec.push(Box::new(new_run_at)); // Option<i64>
+                sets.push("skip_dates = ?".to_string());
+                params_vec.push(Box::new(new_skip_dates.as_ref().map(|sd| serde_json::to_string(sd).unwrap_or_else(|_| "[]".to_string())))); // Option<String>
                 if let Some(nf) = next_fire_val { sets.push("next_fire = ?".to_string()); params_vec.push(Box::new(nf as i64)); }
                 if sets.is_empty() {
                     return Ok(true); // no changes

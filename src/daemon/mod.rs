@@ -108,6 +108,17 @@ pub fn remove_pid_file(service_name: &str, data_dir: Option<&str>) {
 
 /// Check if a process is alive (cross-platform).
 pub fn is_process_alive(pid: u32) -> bool {
+    // P0/P2 fix: pid==0 is never a real daemon process. On Unix,
+    // kill(0, 0) tests "can we signal the caller's process group" and
+    // always returns 0, so a PID file containing "0" would cause a
+    // false "running" report. Reject it up front. Also reject pids that
+    // exceed i32::MAX — they cannot be represented as a positive pid_t
+    // and `as i32` would produce a negative value (e.g. u32::MAX -> -1,
+    // which means "signal all processes I can reach" — catastrophic if
+    // running as root).
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // kill(pid, 0) returns 0 if process exists
@@ -163,6 +174,17 @@ pub fn status(service_name: &str, data_dir: Option<&str>) -> DaemonStatus {
 
 /// Send SIGTERM (Unix) or TerminateProcess (Windows) to the daemon.
 pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> Result<()> {
+    // P0 fix: defensive validation mirroring is_process_alive. A pid of 0
+    // or > i32::MAX must never reach kill(): kill(0, sig) would signal the
+    // caller's whole process group, and kill(-1, sig) (from u32::MAX as i32)
+    // would signal every process the caller can reach — catastrophic when
+    // the daemon runs as root. is_process_alive() already rejects these,
+    // but send_terminate can be reached independently, so guard here too.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(XhjobError::Io(std::io::Error::other(
+            format!("refusing to signal invalid pid {}", pid),
+        )));
+    }
     #[cfg(unix)]
     {
         let rc = unsafe { kill(pid as i32, 15 /* SIGTERM */) };

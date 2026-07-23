@@ -123,10 +123,35 @@ pub fn current() -> String {
     if let Some(name) = CURRENT_SERVICE.get() {
         return name.clone();
     }
-    std::env::var("XHJOB_SERVICE_NAME")
+    match std::env::var("XHJOB_SERVICE_NAME")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_name().to_string())
+    {
+        Some(raw) => {
+            // P1 fix: the env-var fallback path previously returned `raw`
+            // without calling validate(). Since the returned value is used
+            // to build filesystem paths (socket, pid, log, db), an
+            // attacker-controlled env var containing `../` or `/` could
+            // cause path traversal (writing logs/sockets outside the
+            // intended directory). Validate here and fall back to the
+            // default name if the env value is illegal.
+            match validate(&raw) {
+                Ok(validated) => validated,
+                Err(e) => {
+                    // tracing may not be initialized in all callers; use
+                    // eprintln as a fallback so the misconfiguration is
+                    // at least visible.
+                    eprintln!(
+                        "xhjob: WARNING XHJOB_SERVICE_NAME='{}' is invalid \
+                         ({}); falling back to default service name",
+                        raw, e
+                    );
+                    default_name().to_string()
+                }
+            }
+        }
+        None => default_name().to_string(),
+    }
 }
 
 /// Return the data directory for the current process, if explicitly set.
