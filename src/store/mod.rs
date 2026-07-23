@@ -31,6 +31,7 @@ impl TaskType {
             TaskType::Shell => "shell",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "http" => Ok(TaskType::Http),
@@ -76,6 +77,7 @@ impl TaskState {
     }
     /// 解析状态字符串。同时接受新的小写形式与历史的大写形式，
     /// 以便兼容旧数据库 / 旧调用方。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "pending" | "PENDING" => Ok(TaskState::Pending),
@@ -130,6 +132,21 @@ pub struct Task {
     pub task_type: TaskType,
     pub payload: serde_json::Value,
     pub cron: Option<String>,
+    /// or_cron (F-1): additional cron expressions; the task fires if ANY of
+    /// (cron + or_cron) matches. None / empty = no additional expressions.
+    /// Reference: APScheduler CronTrigger or-expr composition.
+    #[serde(default)]
+    pub or_cron: Option<Vec<String>>,
+    /// skip_dates (F-2): list of Unix timestamps whose calendar dates (in
+    /// the task timezone) should be skipped — triggers falling on those
+    /// dates are dropped (next_fire still rolls forward). Empty = no skips.
+    #[serde(default)]
+    pub skip_dates: Vec<i64>,
+    /// workdays_only (F-3): when true, the task only fires on weekdays
+    /// (Mon-Fri). Weekend triggers are dropped (next_fire still rolls
+    /// forward). Default false.
+    #[serde(default)]
+    pub workdays_only: bool,
     pub retry_max: u32,
     pub retry_delay: u64, // seconds
     pub timeout: u64, // seconds
@@ -325,6 +342,9 @@ impl Task {
             task_type,
             payload,
             cron: None,
+            or_cron: None,
+            skip_dates: Vec::new(),
+            workdays_only: false,
             retry_max: 0,
             retry_delay: 1,
             timeout: 30,
@@ -398,6 +418,15 @@ pub struct TaskSummary {
     pub task_type: TaskType,
     pub state: TaskState,
     pub cron: Option<String>,
+    /// or_cron (F-1): additional cron expressions (None = not set).
+    #[serde(default)]
+    pub or_cron: Option<Vec<String>>,
+    /// skip_dates (F-2): calendar dates to skip (empty = no skips).
+    #[serde(default)]
+    pub skip_dates: Vec<i64>,
+    /// workdays_only (F-3): fire only on Mon-Fri.
+    #[serde(default)]
+    pub workdays_only: bool,
     pub attempts: u32,
     pub priority: i32,
     pub next_fire: Option<u64>,
@@ -427,6 +456,9 @@ impl From<&Task> for TaskSummary {
             task_type: t.task_type.clone(),
             state: t.state,
             cron: t.cron.clone(),
+            or_cron: t.or_cron.clone(),
+            skip_dates: t.skip_dates.clone(),
+            workdays_only: t.workdays_only,
             attempts: t.attempts,
             priority: t.priority,
             next_fire: t.next_fire,
@@ -504,6 +536,7 @@ impl EventType {
             EventType::Interrupted => "interrupted",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "started" => Ok(EventType::Started),
@@ -604,7 +637,7 @@ pub trait TaskStore: Send + Sync {
     /// Cancel a task.
     /// - If state=Pending: transition to Cancelled (terminal).
     /// - If state=Running: set cancel_requested=true (running instance finishes, no retry/cron re-trigger).
-    /// Reference: Celery revoke.
+    ///   Reference: Celery revoke.
     fn cancel_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
     /// Delete result rows where (now - finished_at) > result_ttl, but only for tasks
     /// whose result_ttl > 0. Returns the number of deleted rows.
@@ -747,6 +780,14 @@ pub trait TaskStore: Send + Sync {
     /// Aggregate worker / queue statistics.
     /// Reference: Celery inspect stats.
     fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>>;
+
+    /// Modify any task field at runtime (F-5). Accepts a JSON patch object
+    /// whose keys map to Task fields. Only non-terminal tasks (Pending /
+    /// Paused / Running) can be modified. If a trigger field (cron, or_cron,
+    /// interval, run_at, timezone) is changed, next_fire is recomputed.
+    /// Immutable fields (id, owner, state, attempts, created_at) are ignored.
+    /// Reference: APScheduler modify_job.
+    fn modify_job(&self, id: &str, patch: &serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
 }
 
 /// Choose store backend based on persist flag.

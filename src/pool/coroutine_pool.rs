@@ -7,9 +7,9 @@
 //!
 //! NOTE on naming: Rust has no language-level "coroutine" — only `async/await`
 //! + `Future` compiled to state machines, polled by a runtime (tokio). The
-//! file/struct name `coroutine_pool` is kept for path stability, but the
-//! accurate term is "async task pool": M async tasks multiplexed onto N tokio
-//! worker threads (N = num_cpus) via cooperative `await` yield points.
+//!   file/struct name `coroutine_pool` is kept for path stability, but the
+//!   accurate term is "async task pool": M async tasks multiplexed onto N tokio
+//!   worker threads (N = num_cpus) via cooperative `await` yield points.
 
 use std::sync::Arc;
 use tokio::sync::Semaphore;

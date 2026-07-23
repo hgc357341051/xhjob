@@ -118,6 +118,18 @@ pub struct Event {
 pub async fn write_frame<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
     let json = serde_json::to_vec(msg)
         .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
+    // D-6: guard against silent truncation when the serialized JSON exceeds
+    // u32::MAX (4 GiB). The wire format encodes the length as a 4-byte
+    // big-endian u32, so any larger payload would wrap and corrupt the
+    // stream. The read side enforces an 8 MB cap, but we check here too
+    // before the `as u32` cast to fail loudly instead of silently.
+    if json.len() > u32::MAX as usize {
+        return Err(XhjobError::ipc(format!(
+            "frame too large: {} bytes (max {})",
+            json.len(),
+            u32::MAX
+        )));
+    }
     let len = json.len() as u32;
     w.write_all(&len.to_be_bytes()).await
         .map_err(|e| XhjobError::ipc(format!("write len: {}", e)))?;
@@ -152,6 +164,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r
 /// Uses boxed futures so the trait remains dyn-compatible.
 pub trait IpcListener: Send + Sync {
     /// Accept one connection. Returns an owned AsyncRead+AsyncWrite stream.
+    #[allow(clippy::type_complexity)]
     fn accept<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>>;
 }
 
@@ -239,11 +252,11 @@ pub fn default_ipc_timeout_secs() -> u64 {
 
 fn rand_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
+    
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos
+        .unwrap_or(0)
 }
 
 /// Generate a short trace id (8 hex chars derived from the current timestamp

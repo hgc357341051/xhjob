@@ -635,7 +635,7 @@ impl TaskQueue {
             });
         } else {
             // `async` (recommended) and `coroutine` (legacy alias) both route here.
-            let _ = coroutine_pool::global().spawn(counted_future);
+            drop(coroutine_pool::global().spawn(counted_future));
         }
 
         Ok(())

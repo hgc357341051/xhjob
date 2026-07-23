@@ -260,15 +260,25 @@ class TaskManager
      *               返回带 'error' 键的数组，调用方可通过 isset($r['error']) 判断。
      *               对于 HTTP 二进制响应（非 UTF-8），结果中包含 'body_b64' 键
      *               （base64 编码），调用方可通过 base64_decode($r['body_b64'])
-     *               恢复原始字节。使用 state() 检查 daemon 可达性（其会抛异常）。
+     *               恢复原始字节。
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function result(string $id): array
     {
         $raw = xhjob_result($id, $this->name, $this->dataDir);
+        // daemon 不可达时原生函数返回 "error: ..." 字符串（与 parseResponse 一致），
+        // 抛 ServiceNotRunningException，与 state() 行为对齐。
+        if (is_string($raw) && strncmp($raw, 'error:', 6) === 0) {
+            throw new ServiceNotRunningException(
+                'result 失败：' . trim(substr($raw, 6))
+                . " (id=$id, name={$this->name})"
+            );
+        }
         $parsed = $this->parseStateArray($raw);
-        // 原生函数在结果不存在时（ignoreResult=true / 任务未产出输出）
-        // 返回带 'error' 键的数组。这是预期的业务条件，不抛异常；
-        // 调用方通过 isset($r['error']) 或 empty($r['stdout']) 判断。
+        // 结果不存在时（ignoreResult=true / 任务未产出输出）返回带 'error' 键的数组。
+        // 这是预期的业务条件，不抛异常；调用方通过 isset($r['error']) 或
+        // empty($r['stdout']) 判断。
         return $parsed;
     }
 
@@ -390,12 +400,21 @@ class TaskManager
      * @param string $chainId 链 ID
      *
      * @return array|null 不存在时返回 null
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function chainState(string $chainId): ?array
     {
         $json = xhjob_chain_state($chainId, $this->name, $this->dataDir);
         if ($json === null || $json === '') {
             return null;
+        }
+        // daemon 不可达时原生函数返回 "error: ..." 前缀字符串
+        if (strncmp($json, 'error:', 6) === 0) {
+            throw new ServiceNotRunningException(
+                'chainState 失败：' . trim(substr($json, 6))
+                . " (chainId=$chainId, name={$this->name})"
+            );
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : null;
@@ -407,12 +426,21 @@ class TaskManager
      * @param string $groupId 组 ID
      *
      * @return array|null 不存在时返回 null
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function groupState(string $groupId): ?array
     {
         $json = xhjob_group_state($groupId, $this->name, $this->dataDir);
         if ($json === null || $json === '') {
             return null;
+        }
+        // daemon 不可达时原生函数返回 "error: ..." 前缀字符串
+        if (strncmp($json, 'error:', 6) === 0) {
+            throw new ServiceNotRunningException(
+                'groupState 失败：' . trim(substr($json, 6))
+                . " (groupId=$groupId, name={$this->name})"
+            );
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : null;
@@ -423,17 +451,26 @@ class TaskManager
      *
      * 返回 ChordRecord 关联数组，包含 id / header_task_ids /
      * callback_json / callback_task_id / state / created_at /
-     * updated_at 字段。chord 不存在或 daemon 不可达时返回 null。
+     * updated_at 字段。chord 不存在时返回 null。
      *
      * @param string $chordId chord ID
      *
      * @return array|null
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function chordState(string $chordId): ?array
     {
         $json = xhjob_chord_state($chordId, $this->name, $this->dataDir);
         if ($json === null || $json === '') {
             return null;
+        }
+        // daemon 不可达时原生函数返回 "error: ..." 前缀字符串
+        if (strncmp($json, 'error:', 6) === 0) {
+            throw new ServiceNotRunningException(
+                'chordState 失败：' . trim(substr($json, 6))
+                . " (chordId=$chordId, name={$this->name})"
+            );
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : null;
@@ -467,12 +504,17 @@ class TaskManager
      * @param string|null $eventType 事件类型过滤（started/succeeded/failed/...）
      *
      * @return array 事件数组
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function pullEvents(int $sinceTs = 0, ?string $eventType = null): array
     {
         $json = xhjob_pull_events($sinceTs, $eventType, $this->name, $this->dataDir);
         if (strncmp($json, 'error:', 6) === 0) {
-            return [];
+            throw new ServiceNotRunningException(
+                'pullEvents 失败：' . trim(substr($json, 6))
+                . " (name={$this->name})"
+            );
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : [];
@@ -484,12 +526,17 @@ class TaskManager
      * @param string $mode 查询模式：active / registered / scheduled / stats（默认）
      *
      * @return array
+     *
+     * @throws ServiceNotRunningException daemon 不可达时
      */
     public function inspect(string $mode = 'stats'): array
     {
         $json = xhjob_inspect($mode, $this->name, $this->dataDir);
         if (strncmp($json, 'error:', 6) === 0) {
-            return [];
+            throw new ServiceNotRunningException(
+                'inspect 失败：' . trim(substr($json, 6))
+                . " (mode=$mode, name={$this->name})"
+            );
         }
         $data = json_decode($json, true);
         return is_array($data) ? $data : [];

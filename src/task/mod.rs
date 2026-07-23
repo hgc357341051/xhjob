@@ -26,6 +26,17 @@ pub struct TaskBuilder {
     #[serde(default)]
     pub payload: serde_json::Value,
     pub cron: Option<String>,
+    /// or_cron (F-1): additional cron expressions; the task fires if ANY of
+    /// (cron + or_cron) matches. None / empty = no additional expressions.
+    #[serde(default)]
+    pub or_cron: Option<Vec<String>>,
+    /// skip_dates (F-2): list of Unix timestamps whose calendar dates (in
+    /// the task timezone) should be skipped. Empty = no skips.
+    #[serde(default)]
+    pub skip_dates: Vec<i64>,
+    /// workdays_only (F-3): when true, the task only fires on Mon-Fri.
+    #[serde(default)]
+    pub workdays_only: bool,
     #[serde(default)]
     pub retry_max: u32,
     #[serde(default = "default_retry_delay")]
@@ -219,6 +230,9 @@ impl Default for TaskBuilder {
             task_type: None,
             payload: serde_json::Value::Null,
             cron: None,
+            or_cron: None,
+            skip_dates: Vec::new(),
+            workdays_only: false,
             retry_max: 0,
             retry_delay: 1,
             timeout: 30,
@@ -361,6 +375,36 @@ impl TaskBuilder {
     /// Set cron expression (5-segment standard, or 6-segment with seconds).
     pub fn cron(mut self, expr: impl Into<String>) -> Self {
         self.cron = Some(expr.into());
+        self
+    }
+
+    /// or_cron (F-1): set additional cron expressions. The task fires if ANY
+    /// of (cron + or_cron) matches. Replaces any previously set list. An
+    /// empty vector clears the list. When `cron` is unset, the or_cron list
+    /// alone acts as the trigger set.
+    /// Exposed as `orCron(string ...$exprs)` in PHP (snake→camel auto-conversion).
+    /// Reference: APScheduler CronTrigger or-expr composition.
+    pub fn or_cron(mut self, exprs: Vec<String>) -> Self {
+        self.or_cron = Some(exprs);
+        self
+    }
+
+    /// skip_dates (F-2): set the list of Unix timestamps whose calendar dates
+    /// (in the task timezone) should be skipped — triggers falling on those
+    /// dates are dropped (next_fire still rolls forward). Replaces any
+    /// previously set list.
+    /// Exposed as `skipDates(int ...$dates)` in PHP (snake→camel auto-conversion).
+    pub fn skip_dates(mut self, dates: Vec<i64>) -> Self {
+        self.skip_dates = dates;
+        self
+    }
+
+    /// workdays_only (F-3): when true, the task only fires on weekdays
+    /// (Mon-Fri). Weekend triggers are dropped (next_fire still rolls
+    /// forward). Default false.
+    /// Exposed as `workdaysOnly()` in PHP (snake→camel auto-conversion).
+    pub fn workdays_only(mut self) -> Self {
+        self.workdays_only = true;
         self
     }
 
@@ -665,6 +709,9 @@ impl TaskBuilder {
         }
         let mut task = Task::new(task_type, self.payload);
         task.cron = self.cron;
+        task.or_cron = self.or_cron.clone();
+        task.skip_dates = self.skip_dates.clone();
+        task.workdays_only = self.workdays_only;
         task.retry_max = self.retry_max;
         task.retry_delay = self.retry_delay;
         task.timeout = self.timeout;
@@ -755,10 +802,17 @@ impl TaskBuilder {
             }
         }
         // Compute the initial next_fire based on scheduling priority:
-        //   runAt > cron > interval.
+        //   runAt > cron (incl. or_cron) > interval.
         // Emit warnings when multiple triggers are set simultaneously.
+        // F-1: or_cron provides additional cron expressions; the trigger set
+        // is the union of `cron` (if set) and `or_cron` (non-empty entries).
+        let cron_exprs: Vec<String> = task.cron.as_ref().cloned()
+            .into_iter()
+            .chain(task.or_cron.clone().unwrap_or_default().into_iter()
+                .filter(|s| !s.is_empty()))
+            .collect();
         if task.run_at.is_some() {
-            if task.cron.is_some() {
+            if !cron_exprs.is_empty() {
                 tracing::warn!(
                     "both runAt and cron are set; runAt takes priority, cron will be ignored"
                 );
@@ -774,24 +828,39 @@ impl TaskBuilder {
                 );
             }
             task.next_fire = Some(task.run_at.unwrap() as u64);
-        } else if let Some(expr) = &task.cron {
+        } else if !cron_exprs.is_empty() {
             if task.interval.is_some() {
                 tracing::warn!(
                     "both cron and every(interval) are set; cron takes priority, interval will be ignored"
                 );
             }
-            match crate::scheduler::cron::next_fire(expr, now_ts(), task.timezone.as_deref()) {
-                Ok(t) => {
-                    // Apply jitter: add a random offset in [0, jitter] to the
-                    // initial next_fire for cron tasks.
-                    if task.jitter > 0 {
-                        task.next_fire = Some(t + rand_jitter(task.jitter));
-                    } else {
-                        task.next_fire = Some(t);
+            // F-1: compute next_fire for each cron expression and take the
+            // minimum (the soonest occurrence across the trigger set).
+            let now = now_ts();
+            let tz = task.timezone.as_deref();
+            let mut min_next: Option<u64> = None;
+            for expr in &cron_exprs {
+                match crate::scheduler::cron::next_fire(expr, now, tz) {
+                    Ok(t) => {
+                        min_next = Some(match min_next {
+                            Some(m) => m.min(t),
+                            None => t,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(XhjobError::CronParse(format!(
+                            "invalid cron '{}': {}", expr, e
+                        )));
                     }
                 }
-                Err(e) => {
-                    return Err(XhjobError::CronParse(format!("invalid cron '{}': {}", expr, e)));
+            }
+            if let Some(t) = min_next {
+                // Apply jitter: add a random offset in [0, jitter] to the
+                // initial next_fire for cron tasks.
+                if task.jitter > 0 {
+                    task.next_fire = Some(t + rand_jitter(task.jitter));
+                } else {
+                    task.next_fire = Some(t);
                 }
             }
         } else if let Some(secs) = task.interval {

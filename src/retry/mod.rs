@@ -150,11 +150,11 @@ pub fn is_failure(task: &Task, result: &TaskResult) -> bool {
 /// - `retry_backoff=false`: fixed delay = `task.retry_delay`.
 /// - `retry_backoff=true`: exponential delay =
 ///   `min(task.retry_delay * 2^task.attempts, task.retry_delay * 60)`.
-/// `task.attempts` is the count BEFORE the upcoming retry (i.e. the number
-/// of prior failed attempts). For attempts=0 the delay equals `retry_delay`;
-/// for attempts=1 it equals `2 * retry_delay`; for attempts=2 it equals
-/// `4 * retry_delay`; and so on, capped at `60 * retry_delay`.
-/// Reference: Celery retry_backoff.
+///   `task.attempts` is the count BEFORE the upcoming retry (i.e. the number
+///   of prior failed attempts). For attempts=0 the delay equals `retry_delay`;
+///   for attempts=1 it equals `2 * retry_delay`; for attempts=2 it equals
+///   `4 * retry_delay`; and so on, capped at `60 * retry_delay`.
+///   Reference: Celery retry_backoff.
 pub fn backoff_delay(task: &Task) -> u64 {
     if !task.retry_backoff {
         return task.retry_delay;

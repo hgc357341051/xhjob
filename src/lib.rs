@@ -141,8 +141,7 @@ pub fn xhjob_status(name: Option<String>, data_dir: Option<String>) -> Vec<(Stri
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
-            let mut out: Vec<(String, String)> = Vec::new();
-            out.push(("running".to_string(), "false".to_string()));
+            let mut out: Vec<(String, String)> = vec![("running".to_string(), "false".to_string())];
             out.push(("error".to_string(), e));
             return out;
         }
@@ -197,8 +196,7 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
-            let mut out: Vec<(String, String)> = Vec::new();
-            out.push(("state".to_string(), "UNKNOWN".to_string()));
+            let mut out: Vec<(String, String)> = vec![("state".to_string(), "UNKNOWN".to_string())];
             out.push(("error".to_string(), e));
             return out;
         }
@@ -209,10 +207,7 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let info = rt.block_on(async move {
-        match outcome::query_state(&id, &service_name, data_dir.as_deref()).await {
-            Ok(info) => Some(info),
-            Err(_) => None,
-        }
+        (outcome::query_state(&id, &service_name, data_dir.as_deref()).await).ok()
     });
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(info) = info {
@@ -258,8 +253,7 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
-            let mut out: Vec<(String, String)> = Vec::new();
-            out.push(("error".to_string(), e));
+            let out: Vec<(String, String)> = vec![("error".to_string(), e)];
             return out;
         }
     };
@@ -269,10 +263,7 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let result = rt.block_on(async move {
-        match outcome::query_result(&id, &service_name, data_dir.as_deref()).await {
-            Ok(r) => Some(r),
-            Err(_) => None,
-        }
+        (outcome::query_result(&id, &service_name, data_dir.as_deref()).await).ok()
     });
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(r) = result {
@@ -526,6 +517,49 @@ pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir
     })
 }
 
+/// PHP: `xhjob_modify(string $id, string $patch_json, string $name = "default", string $data_dir = null): bool`
+/// Modify any task field at runtime (F-5). The patch JSON is an object whose
+/// keys map to Task fields (cron, interval, priority, tags, etc.).
+#[php_function]
+pub fn xhjob_modify(id: String, patch_json: String, name: Option<String>, data_dir: Option<String>) -> bool {
+    let service_name = match resolve_service_name(name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("xhjob_modify invalid service name: {}", e);
+            return false;
+        }
+    };
+    let data_dir = normalize_data_dir(data_dir);
+    let patch: serde_json::Value = match serde_json::from_str(&patch_json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("xhjob_modify invalid patch json: {}", e);
+            return false;
+        }
+    };
+    let rt = match pool::coroutine_pool::global_runtime() {
+        Some(rt) => rt,
+        None => pool::coroutine_pool::init_global_runtime(),
+    };
+    rt.block_on(async move {
+        let payload = serde_json::json!({ "id": id, "patch": patch });
+        match ipc_request("modify", payload, &service_name, data_dir.as_deref()).await {
+            Ok(resp) => {
+                if !resp.ok {
+                    return false;
+                }
+                resp.data.get("modified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            }
+            Err(e) => {
+                tracing::error!("xhjob_modify ipc: {}", e);
+                false
+            }
+        }
+    })
+}
+
 /// Fetch a single task definition by id, returning the full Task JSON (A12).
 /// Differs from `xhjob_state` (which returns the trimmed `StateInfo` view):
 /// `xhjob_get` returns every persisted field including configuration fields
@@ -617,7 +651,7 @@ pub fn xhjob_run_daemon(service_name: Option<String>, data_dir: Option<String>) 
     // the log file so tracing output is captured.
     #[cfg(unix)]
     {
-        let _ = reopen_std_streams_for_daemon();
+        reopen_std_streams_for_daemon();
     }
     daemon_main::daemon_main();
     true
@@ -752,6 +786,26 @@ impl Xhjob {
 
     pub fn cron(&mut self, expr: String) -> &mut Self {
         self.builder = std::mem::take(&mut self.builder).cron(expr);
+        self
+    }
+
+    /// or_cron (F-1): set additional cron expressions. The task fires if ANY
+    /// of (cron + or_cron) matches.
+    pub fn or_cron(&mut self, exprs: Vec<String>) -> &mut Self {
+        self.builder = std::mem::take(&mut self.builder).or_cron(exprs);
+        self
+    }
+
+    /// skip_dates (F-2): set the list of Unix timestamps whose calendar dates
+    /// (in the task timezone) should be skipped.
+    pub fn skip_dates(&mut self, dates: Vec<i64>) -> &mut Self {
+        self.builder = std::mem::take(&mut self.builder).skip_dates(dates);
+        self
+    }
+
+    /// workdays_only (F-3): when true, the task only fires on weekdays (Mon-Fri).
+    pub fn workdays_only(&mut self) -> &mut Self {
+        self.builder = std::mem::take(&mut self.builder).workdays_only();
         self
     }
 
@@ -1085,7 +1139,7 @@ pub fn xhjob_report_progress(
     name: Option<String>,
     data_dir: Option<String>,
 ) -> bool {
-    if percent < 0 || percent > 100 {
+    if !(0..=100).contains(&percent) {
         return false;
     }
     let service_name = match resolve_service_name(name) {

@@ -180,8 +180,7 @@ pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> R
             remove_pid_file(service_name, data_dir);
             Ok(())
         } else {
-            Err(XhjobError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(XhjobError::Io(std::io::Error::other(
                 format!("failed to send SIGTERM to pid {}", pid),
             )))
         }

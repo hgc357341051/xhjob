@@ -98,7 +98,6 @@ pub fn daemon_main() {
             // disk. Instead, let the runtime unwind naturally so Drop runs.
             // The daemon process is the top-level binary; returning from
             // block_on exits the process after the runtime is dropped.
-            return;
         }
     });
 }
@@ -221,15 +220,9 @@ async fn run_daemon() -> Result<()> {
         let mut sig_rx = install_unix_signal_handler();
         let shutdown_tx2 = shutdown_tx.clone();
         tokio::spawn(async move {
-            loop {
-                match sig_rx.recv().await {
-                    Some(sig) => {
-                        tracing::info!(signal = ?sig, "received signal, shutting down");
-                        let _ = shutdown_tx2.send(true);
-                        break;
-                    }
-                    None => break,
-                }
+            if let Some(sig) = sig_rx.recv().await {
+                tracing::info!(signal = ?sig, "received signal, shutting down");
+                let _ = shutdown_tx2.send(true);
             }
         });
     }
@@ -461,6 +454,7 @@ async fn handle_connection(
         "list" => handle_list_op(&store, req.payload).await,
         "requeue" => handle_requeue_op(&store, req.payload).await,
         "reschedule" => handle_reschedule_op(&store, req.payload).await,
+        "modify" => handle_modify_op(&store, req.payload).await,
         "get" => handle_get_op(&store, req.payload).await,
         "events" => handle_events_op(&store, req.payload).await,
         "chain" => handle_chain_op(&store, &queue, req.payload).await,
@@ -821,6 +815,28 @@ async fn handle_reschedule_op(
     }
     let rescheduled = store.reschedule_task(task_id, new_cron).await?;
     Ok(Response::success(0, serde_json::json!({"rescheduled": rescheduled})))
+}
+
+/// Handler for `modify` op (F-5): modify any task field at runtime.
+/// Accepts `{id, patch: {...}, owner?}` and applies the patch to the task.
+/// Only non-terminal tasks can be modified.
+async fn handle_modify_op(
+    store: &Arc<dyn TaskStore>,
+    payload: serde_json::Value,
+) -> Result<Response> {
+    let task_id = payload.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| XhjobError::ipc("missing id".to_string()))?;
+    let patch = payload.get("patch")
+        .ok_or_else(|| XhjobError::ipc("missing patch".to_string()))?;
+    // P0-17: ownership check — only the task's owner can access it.
+    if let Some(task) = store.load_task(task_id).await? {
+        if let Err(resp) = ownership_check(&task) {
+            return Ok(resp);
+        }
+    }
+    let modified = store.modify_job(task_id, patch).await?;
+    Ok(Response::success(0, serde_json::json!({"modified": modified})))
 }
 
 /// Handler for `get` op: fetch a single task definition by id. Returns the
@@ -1196,8 +1212,8 @@ async fn handle_pull_events_op(
 ///   - `"registered"` — cron / interval tasks (TaskSummary list)
 ///   - `"scheduled"`  — tasks with a future `next_fire` (TaskSummary list)
 ///   - `"stats"`      — aggregate WorkerStats (default)
-/// Returns `{"data": <array_or_object>}`.
-/// Reference: Celery inspect active / registered / scheduled / stats.
+///     Returns `{"data": <array_or_object>}`.
+///     Reference: Celery inspect active / registered / scheduled / stats.
 async fn handle_inspect_op(
     store: &Arc<dyn TaskStore>,
     payload: serde_json::Value,
@@ -1270,11 +1286,9 @@ fn install_unix_signal_handler() -> tokio::sync::mpsc::Receiver<i32> {
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM");
         let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT");
-        loop {
-            tokio::select! {
-                _ = sigterm.recv() => { let _ = tx.send(15).await; break; }
-                _ = sigint.recv() => { let _ = tx.send(2).await; break; }
-            }
+        tokio::select! {
+            _ = sigterm.recv() => { let _ = tx.send(15).await; }
+            _ = sigint.recv() => { let _ = tx.send(2).await; }
         }
     });
     rx

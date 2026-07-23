@@ -77,6 +77,15 @@ pub struct StateInfo {
     /// Reference: Celery update_state meta.
     #[serde(default)]
     pub progress_meta: Option<String>,
+    /// or_cron (F-1): additional cron expressions. None = not set.
+    #[serde(default)]
+    pub or_cron: Option<Vec<String>>,
+    /// skip_dates (F-2): calendar dates to skip (empty = no skips).
+    #[serde(default)]
+    pub skip_dates: Vec<i64>,
+    /// workdays_only (F-3): fire only on Mon-Fri.
+    #[serde(default)]
+    pub workdays_only: bool,
 }
 
 impl StateInfo {
@@ -112,6 +121,9 @@ impl StateInfo {
             coalesce: task.coalesce,
             progress: task.progress,
             progress_meta: task.progress_meta.clone(),
+            or_cron: task.or_cron.clone(),
+            skip_dates: task.skip_dates.clone(),
+            workdays_only: task.workdays_only,
         }
     }
 }

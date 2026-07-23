@@ -98,6 +98,120 @@ fn should_fire_due(next_fire: u64, now: u64, coalesce: bool, per_job_grace: u64)
     now.saturating_sub(next_fire) <= grace
 }
 
+/// Convert a Unix timestamp to calendar date components `(year, month, day,
+/// weekday_from_monday)` in the given timezone. `weekday_from_monday` is
+/// `0=Mon .. 6=Sun` (chrono's `num_days_from_monday()`). When `tz_str` is
+/// `None`, the system local timezone is used. Returns `None` when the
+/// timezone string is unparseable or the timestamp is out of range — callers
+/// treat `None` as "cannot determine, do not skip".
+fn date_components_in_tz(ts: i64, tz_str: Option<&str>) -> Option<(i32, u32, u32, u32)> {
+    use chrono::{Datelike, TimeZone};
+    match tz_str {
+        Some(tz_str) => {
+            let tz: Tz = tz_str.parse().ok()?;
+            let dt = tz.timestamp_opt(ts, 0).single()?;
+            Some((dt.year(), dt.month(), dt.day(), dt.weekday().num_days_from_monday()))
+        }
+        None => {
+            let dt = chrono::Local.timestamp_opt(ts, 0).single()?;
+            Some((dt.year(), dt.month(), dt.day(), dt.weekday().num_days_from_monday()))
+        }
+    }
+}
+
+/// F-2 / F-3: decide whether a trigger firing at `now` must be skipped
+/// because of `task.skip_dates` (calendar-date match in the task timezone)
+/// or `task.workdays_only` (weekend check). Returns `true` to skip.
+///
+/// When neither filter is active, returns `false` cheaply without touching
+/// chrono. When the task timezone is unparseable or `now` is out of range,
+/// returns `false` (fail-open: do not skip) so a bad timezone never silently
+/// suppresses all triggers.
+fn should_skip_trigger(task: &crate::store::Task, now: u64) -> bool {
+    if task.skip_dates.is_empty() && !task.workdays_only {
+        return false;
+    }
+    let tz = task.timezone.as_deref();
+    let now_date = match date_components_in_tz(now as i64, tz) {
+        Some(d) => d,
+        None => return false,
+    };
+    // F-2 skip_dates: compare by calendar date (year, month, day).
+    if !task.skip_dates.is_empty() {
+        for &skip_ts in &task.skip_dates {
+            if let Some(skip_date) = date_components_in_tz(skip_ts, tz) {
+                // Compare only (year, month, day); ignore weekday component.
+                if (now_date.0, now_date.1, now_date.2) == (skip_date.0, skip_date.1, skip_date.2) {
+                    return true;
+                }
+            }
+        }
+    }
+    // F-3 workdays_only: skip weekends. weekday_from_monday is 0=Mon..6=Sun,
+    // so Sat=5, Sun=6 are weekends (>= 5).
+    if task.workdays_only && now_date.3 >= 5 {
+        return true;
+    }
+    false
+}
+
+/// Returns true if the task has at least one active cron trigger (primary
+/// `cron` is set, or `or_cron` contains at least one non-empty expression).
+/// Used to give cron priority over interval in scan_once.
+fn has_cron_trigger(task: &crate::store::Task) -> bool {
+    if task.cron.is_some() {
+        return true;
+    }
+    task.or_cron
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|s| !s.is_empty()))
+}
+
+/// Collect the active cron expression set for a task: the primary `cron`
+/// (if set) followed by the non-empty entries of `or_cron`. Returns owned
+/// `String`s so the caller can iterate without borrowing `task`.
+fn collect_cron_exprs(task: &crate::store::Task) -> Vec<String> {
+    let mut out: Vec<String> = task.cron.as_ref().cloned().into_iter().collect();
+    if let Some(ocs) = &task.or_cron {
+        for s in ocs {
+            if !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Compute the soonest next occurrence across `exprs` starting after `from`.
+/// Returns the minimum timestamp, or `None` if every expression fails to
+/// produce a future fire time. The first parse error encountered is returned
+/// as `Err` so callers can log it. Expressions that fail to produce a future
+/// time (but parse) are skipped — only the parseable ones contribute to the
+/// minimum.
+fn min_next_fire_across(
+    exprs: &[String],
+    from: u64,
+    tz: Option<&str>,
+) -> std::result::Result<Option<u64>, XhjobError> {
+    let mut min_next: Option<u64> = None;
+    for expr in exprs {
+        match next_fire(expr, from, tz) {
+            Ok(t) => {
+                min_next = Some(match min_next {
+                    Some(m) => m.min(t),
+                    None => t,
+                });
+            }
+            Err(e) => {
+                return Err(XhjobError::CronParse(format!(
+                    "parse '{}': {}", expr, e
+                )));
+            }
+        }
+    }
+    Ok(min_next)
+}
+
 /// Cron scheduler: scans active cron tasks every second and triggers due ones.
 pub struct CronScheduler {
     store: Arc<dyn TaskStore>,
@@ -263,7 +377,17 @@ impl CronScheduler {
             if let Some(run_at_ts) = task.run_at {
                 let next = task.next_fire.unwrap_or(run_at_ts as u64);
                 if next <= now {
-                    due.push(task.id.clone());
+                    // F-2 / F-3: skip_dates / workdays_only. For a one-shot
+                    // runAt task, skipping still consumes the trigger (sentinel)
+                    // — the one-shot fire time has passed.
+                    if should_skip_trigger(&task, now) {
+                        tracing::debug!(
+                            task_id = %task.id,
+                            "SKIP_TRIGGER (runAt skip_dates/workdays_only); trigger dropped"
+                        );
+                    } else {
+                        due.push(task.id.clone());
+                    }
                     // Set next_fire to far-future sentinel so scan_once
                     // does not re-fire this one-shot task. process_one will
                     // transition it to Success after execution.
@@ -283,11 +407,25 @@ impl CronScheduler {
             // 重新触发。
             // Reference: APScheduler IntervalTrigger.
             if let Some(secs) = task.interval {
-                if task.cron.is_none() {
+                // F-1: cron takes priority over interval — this includes the
+                // or_cron trigger set, so an active cron/or_cron task never
+                // also fires via interval.
+                if !has_cron_trigger(&task) {
                     let next = task.next_fire
                         .unwrap_or_else(|| task.created_at.saturating_add(secs));
                     if next <= now {
-                        due.push(task.id.clone());
+                        // F-2 / F-3: skip_dates / workdays_only. Skipping does
+                        // NOT enqueue the task but still rolls next_fire
+                        // forward to now + interval (+ jitter) so the trigger
+                        // is not re-evaluated at the stale fire time.
+                        if should_skip_trigger(&task, now) {
+                            tracing::debug!(
+                                task_id = %task.id,
+                                "SKIP_TRIGGER (interval skip_dates/workdays_only); next_fire rolled forward"
+                            );
+                        } else {
+                            due.push(task.id.clone());
+                        }
                         let mut new_next = now + secs;
                         if task.jitter > 0 {
                             new_next += rand_jitter(task.jitter);
@@ -299,31 +437,51 @@ impl CronScheduler {
                     continue;
                 }
             }
-            if let Some(cron_expr) = &task.cron {
+            // F-1: cron trigger set = primary `cron` + non-empty `or_cron`
+            // expressions. The task fires if ANY expression is due (the stored
+            // next_fire holds the soonest occurrence across the set). Rolling
+            // forward recomputes the min next occurrence across all expressions.
+            let cron_exprs = collect_cron_exprs(&task);
+            if !cron_exprs.is_empty() {
                 let tz_ref = task.timezone.as_deref();
-                // Check if next_fire is due
+                // Check if next_fire is due. When next_fire is missing,
+                // recompute as the min across all expressions.
                 let next = match task.next_fire {
                     Some(t) => t,
-                    None => {
-                        // Compute next fire if missing
-                        match next_fire(cron_expr, now, tz_ref) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    cron = %cron_expr,
-                                    error = %e,
-                                    "failed to compute next_fire during scan"
-                                );
-                                continue;
-                            }
+                    None => match min_next_fire_across(&cron_exprs, now, tz_ref) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                "no future fire time for any cron expression during scan"
+                            );
+                            continue;
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "failed to compute next_fire during scan"
+                            );
+                            continue;
+                        }
+                    },
                 };
                 if next <= now {
                     let fire = should_fire_due(next, now, task.coalesce, task.misfire_grace_time);
                     if fire {
-                        due.push(task.id.clone());
+                        // F-2 / F-3: skip_dates / workdays_only. Skipping does
+                        // NOT enqueue the task but still rolls next_fire
+                        // forward so the trigger is not re-evaluated at the
+                        // stale fire time.
+                        if should_skip_trigger(&task, now) {
+                            tracing::debug!(
+                                task_id = %task.id,
+                                "SKIP_TRIGGER (cron skip_dates/workdays_only); next_fire rolled forward"
+                            );
+                        } else {
+                            due.push(task.id.clone());
+                        }
                     } else {
                         let grace = if task.misfire_grace_time > 0 { task.misfire_grace_time } else { MISFIRE_GRACE_TIME_SECS };
                         tracing::debug!(
@@ -344,21 +502,31 @@ impl CronScheduler {
                     }
                     // Either way, roll next_fire forward to the next occurrence
                     // so we don't keep re-evaluating the stale fire time.
-                    if let Ok(mut new_next) = next_fire(cron_expr, now + 1, tz_ref) {
-                        // Apply jitter (A9): add a random offset in [0, jitter]
-                        // to spread out cron triggers and avoid thundering-herd.
-                        if task.jitter > 0 {
-                            new_next += rand_jitter(task.jitter);
+                    // F-1: take the min next occurrence across all expressions.
+                    match min_next_fire_across(&cron_exprs, now + 1, tz_ref) {
+                        Ok(Some(mut new_next)) => {
+                            // Apply jitter (A9): add a random offset in [0, jitter]
+                            // to spread out cron triggers and avoid thundering-herd.
+                            if task.jitter > 0 {
+                                new_next += rand_jitter(task.jitter);
+                            }
+                            if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
+                                tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (cron roll-forward) failed");
+                            }
                         }
-                        if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
-                            tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (cron roll-forward) failed");
+                        Ok(None) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                "no future fire time for any cron expression during roll-forward"
+                            );
                         }
-                    } else {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            cron = %cron_expr,
-                            "failed to roll next_fire forward during scan"
-                        );
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "failed to roll next_fire forward during scan"
+                            );
+                        }
                     }
                 }
             }

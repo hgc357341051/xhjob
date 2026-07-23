@@ -124,6 +124,9 @@ impl TaskStore for InMemoryStore {
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
             guard.remove(&id);
+            // Drop the tasks write guard before awaiting the results lock to
+            // avoid holding two locks across an await boundary.
+            drop(guard);
             let mut rg = self.results.write().await;
             rg.remove(&id);
             Ok(())
@@ -147,6 +150,9 @@ impl TaskStore for InMemoryStore {
             let mut guard = self.tasks.write().await;
             guard.remove(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
+            // Drop the tasks write guard before awaiting the results lock to
+            // avoid holding two locks across an await boundary.
+            drop(guard);
             let mut rg = self.results.write().await;
             rg.remove(&id);
             Ok(())
@@ -195,15 +201,23 @@ impl TaskStore for InMemoryStore {
 
     fn cleanup_expired_results(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
         Box::pin(async move {
-            let tasks = self.tasks.read().await;
-            let mut results = self.results.write().await;
             let now = crate::store::now_ts();
+            // Snapshot the (result_ttl, finished_at) we need to consult, then
+            // drop the tasks read guard before awaiting the results write lock
+            // to avoid holding two locks across an await boundary.
+            let task_info: HashMap<String, (u64, Option<u64>)> = {
+                let tasks = self.tasks.read().await;
+                tasks.values()
+                    .map(|t| (t.id.clone(), (t.result_ttl, t.finished_at)))
+                    .collect()
+            };
+            let mut results = self.results.write().await;
             let mut to_remove = Vec::new();
             for (id, _result) in results.iter() {
-                if let Some(task) = tasks.get(id) {
-                    if task.result_ttl > 0 {
-                        if let Some(finished_at) = task.finished_at {
-                            if now > finished_at.saturating_add(task.result_ttl) {
+                if let Some((ttl, finished_at)) = task_info.get(id) {
+                    if *ttl > 0 {
+                        if let Some(fa) = finished_at {
+                            if now > fa.saturating_add(*ttl) {
                                 to_remove.push(id.clone());
                             }
                         }
@@ -625,6 +639,101 @@ impl TaskStore for InMemoryStore {
                 }
             }
             Ok(stats)
+        })
+    }
+
+    fn modify_job(&self, id: &str, patch: &serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+        let id = id.to_string();
+        let patch = patch.clone();
+        Box::pin(async move {
+            let mut guard = self.tasks.write().await;
+            let task = match guard.get_mut(&id) {
+                Some(t) => t,
+                None => return Ok(false),
+            };
+            if task.state.is_terminal() {
+                return Ok(false);
+            }
+            let now = crate::store::now_ts();
+            let mut trigger_changed = false;
+            if let Some(obj) = patch.as_object() {
+                for (key, val) in obj {
+                    match key.as_str() {
+                        "cron" => {
+                            task.cron = val.as_str().map(|s| s.to_string());
+                            trigger_changed = true;
+                        }
+                        "or_cron" => {
+                            task.or_cron = val.as_array().map(|arr| {
+                                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                            });
+                            trigger_changed = true;
+                        }
+                        "interval" => {
+                            task.interval = val.as_u64();
+                            trigger_changed = true;
+                        }
+                        "run_at" => {
+                            task.run_at = val.as_i64();
+                            trigger_changed = true;
+                        }
+                        "timezone" => {
+                            task.timezone = val.as_str().map(|s| s.to_string());
+                            trigger_changed = true;
+                        }
+                        "priority" => { if let Some(p) = val.as_i64() { task.priority = p as i32; } }
+                        "max_executions" => { if let Some(m) = val.as_u64() { task.max_executions = m as u32; } }
+                        "paused" => { if let Some(p) = val.as_bool() { task.paused = p; } }
+                        "timeout" => { if let Some(t) = val.as_u64() { task.timeout = t; } }
+                        "soft_timeout" => { task.soft_timeout = val.as_u64(); }
+                        "retry_max" => { if let Some(r) = val.as_u64() { task.retry_max = r as u32; } }
+                        "retry_delay" => { if let Some(r) = val.as_u64() { task.retry_delay = r; } }
+                        "retry_backoff" => { if let Some(b) = val.as_bool() { task.retry_backoff = b; } }
+                        "expires" => { if let Some(e) = val.as_u64() { task.expires = e; } }
+                        "jitter" => { if let Some(j) = val.as_u64() { task.jitter = j; } }
+                        "coalesce" => { if let Some(c) = val.as_bool() { task.coalesce = c; } }
+                        "misfire_grace_time" => { if let Some(m) = val.as_u64() { task.misfire_grace_time = m; } }
+                        "tags" => {
+                            if let Some(arr) = val.as_array() {
+                                task.tags = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                            }
+                        }
+                        "meta" => { task.meta = val.as_str().map(|s| s.to_string()); }
+                        "skip_dates" => {
+                            if let Some(arr) = val.as_array() {
+                                task.skip_dates = arr.iter().filter_map(|v| v.as_i64()).collect();
+                            }
+                            trigger_changed = true;
+                        }
+                        "workdays_only" => { if let Some(w) = val.as_bool() { task.workdays_only = w; } }
+                        // Immutable fields (id, owner, state, attempts, created_at) are ignored.
+                        _ => {}
+                    }
+                }
+            }
+            // Recompute next_fire if a trigger field changed.
+            if trigger_changed {
+                let cron_exprs: Vec<String> = task.cron.as_ref().cloned().into_iter()
+                    .chain(task.or_cron.clone().unwrap_or_default().into_iter().filter(|s| !s.is_empty()))
+                    .collect();
+                if !cron_exprs.is_empty() {
+                    let mut min_next: Option<u64> = None;
+                    for expr in &cron_exprs {
+                        match crate::scheduler::cron::next_fire(expr, now, task.timezone.as_deref()) {
+                            Ok(t) => { min_next = Some(min_next.map_or(t, |m| m.min(t))); }
+                            Err(e) => {
+                                return Err(XhjobError::CronParse(format!("invalid cron '{}': {}", expr, e)));
+                            }
+                        }
+                    }
+                    task.next_fire = min_next;
+                } else if let Some(secs) = task.interval {
+                    task.next_fire = Some(now + secs);
+                } else if let Some(ts) = task.run_at {
+                    task.next_fire = Some(ts as u64);
+                }
+            }
+            Ok(true)
         })
     }
 }

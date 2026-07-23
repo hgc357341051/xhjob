@@ -128,8 +128,8 @@ pub async fn refresh_state(
     let mut failed = 0u32;
     let mut results: Vec<serde_json::Value> = Vec::new();
     for tid in &record.header_task_ids {
-        match store.load_task(tid).await? {
-            Some(t) => match t.state {
+        if let Some(t) = store.load_task(tid).await? {
+            match t.state {
                 TaskState::Success => {
                     succeeded += 1;
                     // Collect the header task's result so the callback can
@@ -151,9 +151,8 @@ pub async fn refresh_state(
                 }
                 TaskState::Failed | TaskState::Expired | TaskState::Cancelled => failed += 1,
                 _ => {}
-            },
-            None => {} // task not found — treat as pending
-        }
+            }
+        } // else: task not found — treat as pending
     }
 
     let total = record.header_task_ids.len() as u32;

@@ -350,6 +350,10 @@ class Client
      */
     private function callWithRetry(callable $fn, $fallback = null)
     {
+        // 哨兵式判定：区分"未传 fallback"与"显式传 null 作为 fallback"。
+        // 仅当调用方未提供 fallback（func_num_args < 2）时才抛出异常；
+        // 显式传 null（如 get / chainState / groupState）视为有效的兜底返回值。
+        $hasFallback = func_num_args() >= 2;
         $attempts = 0;
         $maxAttempts = $this->retries + 1;
         $lastException = null;
@@ -375,10 +379,16 @@ class Client
                 }
             }
         }
-        // 重试用尽：若调用方提供了 fallback 则返回，否则抛出最后一个异常
-        if ($lastException !== null && $fallback === null && func_num_args() < 2) {
-            throw $lastException;
+        // 重试用尽：若调用方提供了 fallback 则记录原始异常并返回兜底值，否则抛出最后一个异常
+        if ($hasFallback) {
+            if ($lastException !== null) {
+                trigger_error(
+                    'xhjob callWithRetry fallback after retries: ' . $lastException->getMessage(),
+                    E_USER_WARNING
+                );
+            }
+            return $fallback;
         }
-        return $fallback;
+        throw $lastException ?? new ServiceNotRunningException('unknown error after retries');
     }
 }
