@@ -74,8 +74,8 @@
 - [x] 错误率通过率 100%
 
 ## 编译并提交到远程主分支
-- [ ] `cargo build --release --features persist` 产出 `target/release/libxhjob.so`
-- [ ] `git add` 包含所有修改代码 + `.so` + 新增文件
-- [ ] `git commit` 创建提交
-- [ ] `git push origin main` 推送到远程主分支成功
+- [x] `cargo build --release --features persist` 产出 `target/release/libxhjob.so`（11640256 字节）
+- [x] `git add` 包含所有修改代码 + `.so` + 新增文件（11 files changed, 1458 insertions）
+- [x] `git commit` 创建提交（commit hash: 5e79fdc）
+- [ ] `git push origin main` 推送到远程主分支成功（阻塞：HTTPS 需 GitHub 凭据，当前环境无 credential helper / token / SSH key）
 - [ ] 记录最终 commit hash
