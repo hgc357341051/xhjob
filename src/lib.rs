@@ -1545,6 +1545,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(xhjob_list))
         .function(wrap_function!(xhjob_requeue))
         .function(wrap_function!(xhjob_reschedule))
+        .function(wrap_function!(xhjob_modify))
         .function(wrap_function!(xhjob_get))
         .function(wrap_function!(xhjob_run_daemon))
         .function(wrap_function!(xhjob_events))

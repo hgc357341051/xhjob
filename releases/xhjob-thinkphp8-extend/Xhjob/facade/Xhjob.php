@@ -43,6 +43,9 @@ use think\Facade;
  * @method static array|null chainState(string $chainId)
  * @method static array|null groupState(string $groupId)
  * @method static array|null chordState(string $chordId)
+ * @method static bool reportProgress(string $id, int $percent, ?string $meta = null)
+ * @method static array pullEvents(int $sinceTs = 0, ?string $eventType = null)
+ * @method static array inspect(string $mode = 'stats')
  * @method static bool waitForState(string $id, string $expectedState, int $timeoutSec = 30)
  * @method static array|null waitForResult(string $id, int $timeoutSec = 30)
  */

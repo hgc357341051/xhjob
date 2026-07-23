@@ -171,16 +171,30 @@ echo "\n--- Step 7：验证任务隔离（跨服务不可见）---\n";
 // 等待任务执行
 usleep(1500000);
 
+// 收集 queue-svc 的全部任务 ID，用于跨服务隔离泄漏检测。
+// 注意：queue-svc 的 chain / group 子任务从未打 'queue-svc' tag，
+// 旧实现基于 tag 的断言恒通过、无法检出泄漏，且 tags 若为 JSON 字符串
+// 还会触发 in_array() TypeError；改为基于 id 比对的有效检测。
+$queueTaskIds = [];
+foreach ($queueMgr->list() as $t) {
+    $qid = $t['id'] ?? null;
+    if ($qid !== null && $qid !== '') {
+        $queueTaskIds[$qid] = true;
+    }
+}
+
 if ($cronTaskId !== null) {
     $cronList = $cronMgr->list();
     $cronHasCronTask = false;
-    $cronHasQueueTask = false;
+    $leakedIds = [];
     foreach ($cronList as $t) {
-        if (($t['id'] ?? '') === $cronTaskId) $cronHasCronTask = true;
-        if (isset($t['tags']) && in_array('queue-svc', $t['tags'] ?? [])) $cronHasQueueTask = true;
+        $tid = $t['id'] ?? '';
+        if ($tid === $cronTaskId) $cronHasCronTask = true;
+        if (isset($queueTaskIds[$tid])) $leakedIds[] = $tid;
     }
+    $cronHasQueueTask = !empty($leakedIds);
     step('cron-svc 能看到自己的 cron 任务', $cronHasCronTask, "count=" . count($cronList));
-    step('cron-svc 看不到 queue-svc 的 chain/group 任务', !$cronHasQueueTask, "queue-task-in-cron=" . ($cronHasQueueTask ? 'yes' : 'no'));
+    step('cron-svc 看不到 queue-svc 的 chain/group 任务', !$cronHasQueueTask, "leaked=" . ($cronHasQueueTask ? implode(',', $leakedIds) : 'none'));
 }
 
 if (isset($chainId) && $chainId !== null && !str_starts_with($chainId, 'error:')) {
