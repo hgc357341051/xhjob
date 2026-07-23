@@ -48,3 +48,26 @@ Route::group('xhjob', function () {
     Route::get('groupState', 'XhjobTask/groupState');
     Route::get('demo', 'XhjobTask/demo');
 });
+
+// +----------------------------------------------------------------------
+// | Xhjob 生产环境业务模拟 HTTP 触发路由
+// | 路由前缀 /xhjob_prod，对应 app\controller\XhjobProduction
+// | 使用独立服务实例 tp-prod-http，与 CLI 测试隔离
+// +----------------------------------------------------------------------
+Route::group('xhjob_prod', function () {
+    Route::get('index', 'XhjobProduction/index');
+    Route::get('state', 'XhjobProduction/state');
+    Route::get('result', 'XhjobProduction/result');
+    Route::get('chainState', 'XhjobProduction/chainState');
+    Route::get('chordState', 'XhjobProduction/chordState');
+    Route::post('order', 'XhjobProduction/order');
+    Route::post('report', 'XhjobProduction/report');
+    Route::post('etl', 'XhjobProduction/etl');
+    Route::post('cleanup', 'XhjobProduction/cleanup');
+    Route::post('notify', 'XhjobProduction/notify');
+    Route::post('delayed', 'XhjobProduction/delayed');
+    Route::post('rateLimit', 'XhjobProduction/rateLimit');
+    Route::post('persist', 'XhjobProduction/persist');
+    Route::post('restart', 'XhjobProduction/restart');
+    Route::post('stop', 'XhjobProduction/stop');
+});

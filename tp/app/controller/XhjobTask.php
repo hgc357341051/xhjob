@@ -160,7 +160,7 @@ class XhjobTask extends BaseController
     {
         $id  = $this->request->param('id');
         $mgr = new TaskManager();
-        return $this->json($mgr->get($id));
+        return $this->json($mgr->get((string) $id));
     }
 
     /**
@@ -172,7 +172,7 @@ class XhjobTask extends BaseController
     {
         $id  = $this->request->param('id');
         $mgr = new TaskManager();
-        return $this->json($mgr->state($id));
+        return $this->json($mgr->state((string) $id));
     }
 
     /**
@@ -184,7 +184,7 @@ class XhjobTask extends BaseController
     {
         $id  = $this->request->param('id');
         $mgr = new TaskManager();
-        return $this->json($mgr->result($id));
+        return $this->json($mgr->result((string) $id));
     }
 
     /**
@@ -197,7 +197,7 @@ class XhjobTask extends BaseController
         $id       = $this->request->param('id');
         $sinceTs  = intval($this->request->param('since_ts', 0));
         $mgr      = new TaskManager();
-        return $this->json($mgr->logs($id, $sinceTs));
+        return $this->json($mgr->logs((string) $id, $sinceTs));
     }
 
     // -----------------------------------------------------------------

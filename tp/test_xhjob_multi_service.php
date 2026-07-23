@@ -176,8 +176,17 @@ if ($cronTaskId !== null) {
     $cronHasCronTask = false;
     $cronHasQueueTask = false;
     foreach ($cronList as $t) {
-        if (($t['id'] ?? '') === $cronTaskId) $cronHasCronTask = true;
-        if (isset($t['tags']) && in_array('queue-svc', $t['tags'] ?? [])) $cronHasQueueTask = true;
+        if (($t['id'] ?? '') === $cronTaskId) {
+            $cronHasCronTask = true;
+        } else {
+            // cron-svc 仅创建过一个 cron 任务（$cronTaskId），
+            // 列表中任何其它任务都说明发生了跨服务隔离泄漏。
+            // （原实现用 in_array('queue-svc', tags) 判断，但
+            // queue-svc 的 chain/group 子任务并未打 'queue-svc' 标签，
+            // 导致该断言恒为 true、无法检出泄漏；同时若 list 返回的
+            // tags 为 JSON 字符串还会触发 in_array 的 TypeError。）
+            $cronHasQueueTask = true;
+        }
     }
     step('cron-svc 能看到自己的 cron 任务', $cronHasCronTask, "count=" . count($cronList));
     step('cron-svc 看不到 queue-svc 的 chain/group 任务', !$cronHasQueueTask, "queue-task-in-cron=" . ($cronHasQueueTask ? 'yes' : 'no'));
