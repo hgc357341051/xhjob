@@ -1,197 +1,184 @@
----
-title: 快速开始
-parent: 入门
-nav_order: 11
----
-
 # 快速开始
 
-本页带你用最短路径跑通 xhjob：下载扩展 → 加载 → 启动 daemon → 派发第一个 shell 任务 → 派发第一个 cron 任务。
+## 概述
 
-## 前置条件
+本篇帮助你在 5 分钟内完成 xhjob 扩展加载、daemon 启动，并投递第一个 shell 任务与第一个 cron 任务。
 
-| 项 | 要求 | 说明 |
-|----|------|------|
-| PHP | 8.0 及以上 | 扩展基于 ext-php-rs，需要 PHP 8.x ABI |
-| 系统 | Linux x86_64 | 预编译 `.so` 仅提供 linux-x86_64；其他平台需自行从源码编译 |
-| Shell | bash | shell 任务通过 `/bin/sh -c` 执行，bash 是默认环境 |
-| 权限 | 对运行目录可读写 | 默认 `/run/xhjob`（root 拥有，0o700）；普通用户请通过 `XHJOB_DATA_DIR` 指向可写目录 |
+xhjob 由两部分组成：
 
-确认 PHP 版本与架构：
+- **PHP 扩展（.so）**：提供 27 个顶层函数（snake_case）与 `Xhjob` 链式 builder 类（方法名 camelCase），是 PHP 进程与 daemon 通信的 IPC 客户端。
+- **daemon（独立 Rust 进程）**：由 `xhjob_start()` 拉起，负责调度、执行、持久化。PHP 进程（CLI 或 FPM）只连同一个 daemon。
 
-```bash
-# 查看 PHP 版本（需 8.0+）
-php -v
+## 函数签名 / 方法签名
 
-# 确认是 x86_64 架构
-uname -m   # 输出应为 x86_64
-```
-
-## 下载预编译扩展
-
-预编译的 `.so` 文件随仓库发布，按 PHP 版本选择对应文件。例如 PHP 8.2 对应：
-
-```
-releases/xhjob-php8.2-linux-x86_64.so
-```
-
-下载或拷贝到本地任意目录（例如 `/opt/xhjob/xhjob.so`），然后通过 `-d extension=` 临时加载并验证：
-
-```bash
-# 用 -d extension= 临时加载扩展，-m 列出已加载模块，grep 过滤 xhjob
-php -d extension=/opt/xhjob/xhjob.so -m | grep xhjob
-# 预期输出：xhjob
-```
-
-如果看到 `xhjob` 字样，说明扩展已成功加载。
-
-> 永久加载请参考 [安装与配置](install-config/) 的「扩展加载三种方式」一节，把 `.so` 写入 `php.ini` 或 `PHP_INI_SCAN_DIR` 扫描目录。
-
-## 启动 daemon
-
-xhjob 的任务调度由**独立的 daemon 进程**完成（Rust 实现，通过 Unix socket 与 PHP 进程通信）。派发任务前必须先启动 daemon。
-
-最简单的方式是用全局函数 `xhjob_start()`，它会在返回 `true` 前等待 **PID 文件写入 AND IPC socket 可连接**双条件就绪：
+快速开始用到的核心 API：
 
 ```php
-<?php
-// 启动 daemon（幂等：已运行则直接返回 true）
-$ok = xhjob_start('default');   // 参数：服务名，默认 'default'
-var_dump($ok);                  // bool(true) 表示 daemon 已就绪
+// 顶层函数（snake_case）
+xhjob_start(?string $name = null, ?string $data_dir = null): bool
+xhjob_status(?string $name = null, ?string $data_dir = null): array
+xhjob_dispatch(string $task_json, ?string $name = null, ?string $data_dir = null): string
+xhjob_state(string $id, ?string $name = null, ?string $data_dir = null): array
+xhjob_result(string $id, ?string $name = null, ?string $data_dir = null): array
+xhjob_get(string $id, ?string $name = null, ?string $data_dir = null): ?string
+xhjob_stop(?string $name = null, ?string $data_dir = null): bool
 ```
-
-或者使用 `Xhjob\XhjobService` 封装类（推荐，自带等待与异常处理）：
 
 ```php
-<?php
-require 'vendor/autoload.php';
-
-use Xhjob\XhjobService;
-
-// 构造时传入服务名（默认 'default'）与可选数据目录
-$svc = new XhjobService('default');
-$pid = $svc->start();   // 返回 daemon 进程的 PID（>0 表示成功）
-echo "daemon pid = {$pid}\n";
+// Xhjob 类（链式 builder，方法名 camelCase，全部返回 &mut Self，除 task() 与 dispatch()）
+Xhjob::task(): Xhjob                 // 静态构造
+    ->service(string $name): Xhjob
+    ->viaShell(string $cmd): Xhjob
+    ->cron(string $expr): Xhjob
+    ->persist(bool $val): Xhjob
+    ->timeout(int $secs): Xhjob
+    ->tag(string $tag): Xhjob
+    ->dispatch(): string             // 终结，返回 task_id
 ```
 
-确认状态：
+## 参数说明
 
-```bash
-# 通过 PHP 查询 daemon 状态
-php -d extension=/opt/xhjob/xhjob.so -r 'var_dump(xhjob_status("default"));'
-```
+| API | 参数 | 说明 |
+|-----|------|------|
+| `xhjob_start` | `$name` | 服务名，命名空间化 sock/pid/log/db；省略为 `default` |
+| `xhjob_start` | `$data_dir` | 统一数据目录；省略则走各 `XHJOB_*_DIR` env 与 fallback |
+| `xhjob_dispatch` | `$task_json` | 任务 JSON 字符串（由 builder 序列化） |
+| `xhjob_dispatch` | 返回 | 成功返回 `task_id`，失败返回 `error: ...` 前缀字符串 |
+| `xhjob_state` | `$id` | 任务 ID |
+| `xhjob_get` | 返回 | 结果就绪返回字符串，未就绪返回 `null` |
+| `Xhjob::viaShell` | `$cmd` | shell 命令字符串 |
+| `Xhjob::cron` | `$expr` | 标准 5 字段 cron 表达式 |
+| `Xhjob::persist` | `bool` | `true` 持久化到 store，daemon 重启不丢调度 |
 
-## 第一个 shell 任务
+## 返回值
 
-下面派发一个一次性 shell 任务，并轮询查询其状态。
-
-```php
-<?php
-require 'vendor/autoload.php';
-
-use Xhjob\TaskBuilder;
-use Xhjob\XhjobService;
-
-// 1. 确保 daemon 已运行（未运行则启动）
-(new XhjobService('default'))->ensureRunning();
-
-// 2. 派发一个 shell 任务：执行 echo hi，超时 10 秒
-$id = TaskBuilder::shell('echo hi')
-    ->timeout(10)
-    ->dispatch();
-echo "task id = {$id}\n";
-
-// 3. 轮询查询状态，直到进入终态
-while (true) {
-    $state = xhjob_state($id);          // 返回状态信息数组
-    $s = $state['state'] ?? 'UNKNOWN';  // pending / running / success / failed
-    echo "state = {$s}\n";
-    if (in_array($s, ['success', 'failed'], true)) {
-        break;
-    }
-    usleep(500000); // 500ms 轮询一次
-}
-
-// 4. 读取最终结果
-$result = xhjob_result($id);
-var_dump($result);
-```
-
-状态取值说明：
-
-| state | 含义 |
-|-------|------|
-| `pending` | 已入队，等待调度 |
-| `running` | 正在执行 |
-| `success` | 执行成功（终态） |
-| `failed` | 执行失败或超时（终态） |
-
-## 第一个 cron 任务
-
-cron 任务需要 `persist(true)`，使其写入 SQLite 持久化存储，daemon 重启后仍能继续按计划触发。
-
-```php
-<?php
-require 'vendor/autoload.php';
-
-use Xhjob\TaskBuilder;
-use Xhjob\XhjobService;
-
-(new XhjobService('default'))->ensureRunning();
-
-// 每分钟执行一次 echo cron，启用持久化
-$id = TaskBuilder::shell('echo cron')
-    ->cron('*/1 * * * *')   // 标准 5 字段 cron 表达式
-    ->persist(true)         // 写入 SQLite，daemon 重启不丢
-    ->dispatch();
-echo "cron task id = {$id}\n";
-
-// 查看 cron 任务的累计执行次数
-$state = xhjob_state($id);
-echo "execution_count = {$state['execution_count']}\n";
-```
-
-> `persist(true)` 依赖 `--all-features` 编译的 SQLite 支持。若使用的预编译 `.so` 未开启该 feature，请参考 [安装与配置](install-config/) 中 `XHJOB_PERSIST` 一节。
+- `xhjob_start` / `xhjob_stop`：`bool`，`true` 表示操作成功。
+- `xhjob_status`：键值对数组，包含 `running`（bool），运行时含 `pid`，非法时含 `error`。
+- `xhjob_dispatch`：`string`，`task_id` 或 `error: <msg>`。
+- `xhjob_state`：键值对数组。
+- `xhjob_result`：键值对数组。
+- `xhjob_get`：`?string`，结果字符串或 `null`。
+- `Xhjob::dispatch()`：`string`，`task_id`（失败时同样以 `error:` 前缀返回）。
 
 ## 注意事项
 
-### daemon 是独立进程
+- **daemon 是独立进程**：`xhjob_start()` 会拉起一个 Rust daemon，PHP 进程本身不执行任务，只通过 Unix socket IPC 下发。
+- **CLI 与 FPM 共享同一 daemon**：只要服务名与数据目录一致，CLI 脚本与 FPM 请求连的是同一个 daemon，任务互通。
+- **扩展加载失败排查**：用 `php -m` 确认；常见原因是 .so 与 PHP API/ABI 版本不匹配，必须按 PHP 8.x 次版本选 .so（如 8.2 选 `xhjob-php8.2-linux-x86_64.so`）。
+- **IPC 超时**：默认 `XHJOB_IPC_TIMEOUT_SECS=5`；daemon 未启动或 socket 不可达时，dispatch 会在超时后返回 `error: ...`。
 
-daemon 由 `xhjob_start` 通过 Unix double-fork + setsid 守护化为独立 Rust 进程，**不随 PHP 请求结束而退出**。派发任务前必须确保其已启动：
+## 代码演示
 
-- 函数式：`xhjob_start('default')` / `xhjob_stop('default')` / `xhjob_restart('default')` / `xhjob_status('default')`
-- 面向对象：`XhjobService::start()` / `stop()` / `restart()` / `status()` / `healthCheck()` / `ensureRunning()` / `ensureStopped()`
+### 0. 前置条件
 
-`xhjob_start` 返回 `true` 之前会等待 **PID 文件写入 AND socket 可连接**双条件，避免「PID 已写但 socket 未就绪」的竞态导致首次 dispatch 失败。
+- PHP **8.0+**（按次版本选 .so，如 8.2 选 `xhjob-php8.2-linux-x86_64.so`）
+- Linux **x86_64**
+- `bash`
 
-### CLI 与 FPM 都可调用
+### 1. 下载并加载扩展
 
-同一个 daemon 可被 CLI 脚本和 PHP-FPM Web 请求共用——只要它们使用**相同的服务名 + 数据目录**，就会连到同一个 daemon。例如：
+从 `releases/` 目录下载对应 PHP 版本的 .so，临时加载验证：
 
-- CLI 脚本：`php -d extension=xhjob.so cron_runner.php`
-- FPM 请求：在 Web 控制器里调用 `TaskBuilder::shell(...)->dispatch()`
+```bash
+# 临时加载（不改 php.ini），确认模块出现
+php -d extension=/path/to/xhjob-php8.2-linux-x86_64.so -m | grep xhjob
 
-两者派发的任务都进入同一 daemon 的调度队列。
+# 验证函数存在
+php -d extension=/path/to/xhjob-php8.2-linux-x86_64.so \
+    -r 'echo function_exists("xhjob_dispatch") ? "ok" : "no";'
+# 输出: ok
+```
 
-### 扩展加载失败排查
+### 2. 第一个 shell 任务
 
-如果 `php -m | grep xhjob` 没有输出，常见原因与对策：
+```php
+<?php
+// 1) 启动 daemon（独立进程）
+if (!xhjob_start()) {
+    fwrite(STDERR, "failed to start daemon\n");
+    exit(1);
+}
 
-| 现象 | 原因 | 对策 |
-|------|------|------|
-| `Warning: dl(): ...` | `dl()` 在新 SAPI（如 PHP-FPM、新 CLI）下被禁用 | 不要用 `dl()`，改用 `extension=xhjob.so` ini 指令或 `php -d extension=xhjob.so` |
-| `PHP Startup: Unable to load dynamic library` | ABI 版本不匹配 | `.so` 的 PHP 版本必须与运行时一致（PHP 8.2 的 `.so` 只能用于 PHP 8.2） |
-| 路径找不到 | `extension=` 用了相对路径 | 使用绝对路径，或把 `.so` 放进 `extension_dir` |
-| `undefined symbol` | 依赖库缺失 | 预编译 `.so` 已静态链接核心依赖；若仍报错请确认 glibc 版本满足要求 |
+$status = xhjob_status();
+if (empty($status['running'])) {
+    fwrite(STDERR, "daemon not running: " . json_encode($status) . "\n");
+    exit(1);
+}
+echo "daemon started, pid=" . ($status['pid'] ?? '-') . "\n";
 
-**优先用以下两种方式加载**（均不依赖 `dl()`）：
+// 2) 用 Xhjob builder 构建并投递一个 shell 任务
+$taskId = Xhjob::task()
+    ->service('default')
+    ->viaShell('echo hello && date -Is')
+    ->timeout(30)
+    ->tag('demo')
+    ->dispatch();
 
-1. `php.ini` 中写 `extension=xhjob.so`（或绝对路径）
-2. 命令行临时加载：`php -d extension=/path/to/xhjob.so ...`
+if (str_starts_with($taskId, 'error:')) {
+    fwrite(STDERR, "dispatch failed: {$taskId}\n");
+    exit(1);
+}
+echo "task_id = {$taskId}\n";
 
-`dl()` 仅在部分旧 CLI SAPI 下可用，且在新 SAPI 受限，**不要在生产环境依赖它**。
+// 3) 轮询直到结果就绪（xhjob_get 返回 null 表示尚未完成）
+$deadline = time() + 30;
+$result = null;
+while (time() < $deadline) {
+    $result = xhjob_get($taskId);
+    if ($result !== null) {
+        break;
+    }
+    // 也可顺便观察状态变化：print_r(xhjob_state($taskId));
+    usleep(200_000);
+}
 
-## 下一步
+if ($result === null) {
+    fwrite(STDERR, "timeout waiting for result\n");
+    exit(1);
+}
+echo "result = {$result}\n";
 
-- 了解整体设计：[架构概览](architecture/)
-- 完整环境变量与配置：[安装与配置](install-config/)
+// 4) 取结构化结果
+print_r(xhjob_result($taskId));
+```
+
+运行：
+
+```bash
+php -d extension=/path/to/xhjob-php8.2-linux-x86_64.so first_task.php
+```
+
+### 3. 第一个 cron 任务
+
+```php
+<?php
+// 每分钟执行一次健康检查，持久化（daemon 重启后调度不丢）
+$cronId = Xhjob::task()
+    ->viaShell('curl -fsS https://example.com/health')
+    ->cron('*/1 * * * *')
+    ->persist(true)
+    ->timeout(30)
+    ->tag('healthcheck')
+    ->dispatch();
+
+if (str_starts_with($cronId, 'error:')) {
+    fwrite(STDERR, "cron dispatch failed: {$cronId}\n");
+    exit(1);
+}
+echo "cron task_id = {$cronId}\n";
+
+print_r(xhjob_state($cronId));
+
+// 不再需要时停止 daemon
+// xhjob_stop();
+```
+
+> ThinkPHP8 扩展包提供独立的 `TaskBuilder` PHP 类（PHP 端独立实现，方法名用 `withId` 等），用法与 `Xhjob` 类一致，可按需替换。注意：`Xhjob` 类的方法是 `id()`（Rust snake_case 自动转 camelCase），`TaskBuilder` 是 `withId()`，两者来源不同，不要混淆。
+
+## 生产建议
+
+- **常驻 daemon**：生产环境用 systemd / supervisor 托管 daemon（或由首个 FPM 请求触发 `xhjob_start()`），避免每次请求拉起。
+- **显式服务名**：多租户/多业务用 `XHJOB_SERVICE_NAME` 隔离 sock/pid/log/db，避免相互干扰。
+- **数据目录落盘**：设 `XHJOB_DATA_DIR` 或 `XHJOB_DB_DIR` 到持久磁盘，SQLite store 才能在重启后恢复。
+- **结果轮询用 `xhjob_get`**：它返回 `null` 表示未就绪，比反复解析 `xhjob_state` 更轻量；不要在 FPM 请求里忙等长任务，改用事件流 `xhjob_events` 异步通知。
+- **加载方式**：生产用 `php.ini` 的 `extension=` 永久加载，而非 `php -d`。

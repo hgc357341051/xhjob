@@ -1,180 +1,267 @@
+# 定时任务
+
+> 生产实战篇 · cron 表达式 · 时区 · 持久化 · 崩溃恢复 · 执行次数限制 · 漏触发合并 · 节假日 / 工作日
+
+定时任务是后台调度中最常见的形态：每天凌晨跑报表、每 5 分钟同步数据、工作日 9 点发日报。Xhjob 把 cron 调度内建到 daemon，不需要外部 crontab，任务定义、状态、执行历史全部在 daemon 的 store 内可查可控。本文档覆盖生产级 cron 任务所需的全部配置项：时区、持久化、崩溃恢复、执行次数限制、漏触发合并、节假日 / 工作日过滤。
+
+本文档按 **架构说明 → 完整可运行代码 → 注意事项 → 生产建议** 的结构展开。
+
 ---
-title: 生产实战：定时任务
-parent: 生产实战
-nav_order: 52
+
+## 架构说明
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      daemon (Rust)                           │
+│                                                              │
+│  ┌──────────────┐   每 tick 扫描    ┌──────────────────────┐ │
+│  │  scheduler   │ ─────────────────► │  cron trigger 匹配   │ │
+│  │  (cron 注册表)│                    │  · 5/6 字段表达式     │ │
+│  └──────┬───────┘                    │  · withTimezone 时区  │ │
+│         │                            │  · skipDates / workdays│ │
+│         │ next_fire 到点              │  · coalesce 合并      │ │
+│         ▼                            └──────────┬───────────┘ │
+│  ┌──────────────┐                               │             │
+│  │  max_pending │ ◄─────────────────────────────┘             │
+│  │    队列      │                                             │
+│  └──────┬───────┘                                             │
+│         │                                                     │
+│         ▼                                                     │
+│  ┌──────────────┐    persist=true 时任务定义 + 状态 + 结果     │
+│  │  pool + exec │    落 SQLite WAL，daemon 重启后自动恢复      │
+│  └──────────────┘    acksLate=true 时 Running 任务重派         │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │  store (SQLite WAL)                                      │ │
+│  │  · tasks 表：cron / next_fire / max_executions / state   │ │
+│  │  · events 表：started / succeeded / missed / ...         │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+cron 任务的生命周期：
+
+1. **注册**：`TaskBuilder::shell(...)->cron('0 9 * * 1-5')->persist(true)->dispatch()` 把任务写入 daemon 的 cron 注册表，调度器计算第一次 `next_fire`。
+2. **触发**：scheduler 每 tick（默认 1 秒）扫描所有注册的 cron 任务，匹配到点且未被 `skipDates` / `workdaysOnly` 过滤的任务，推入 `max_pending` 队列。
+3. **执行**：pool 取出任务执行，结果与状态写入 store。
+4. **循环**：执行完成后（或被 `maxInstances` 跳过后），调度器重算下一次 `next_fire`，直到达到 `maxExecutions` 或 `endAt` 边界。
+
+> cron 任务与一次性 `runAt` 任务不同：cron 注册后**常驻**调度器，按周期反复触发，除非显式 `remove` 或达到 `maxExecutions`。
+
 ---
 
-# 生产实战：定时任务
+## 完整可运行代码
 
-本篇给出一个**生产级定时任务**的完整端到端写法：每天早上 9 点跑报表，仅工作日执行、跳过法定节假日、漏触发合并为一次、崩溃后自动恢复、最多执行 1000 次后停止。涵盖 cron 表达式、时区、持久化、延迟确认、执行次数上限、合并、节假日跳过、仅工作日等全部可靠性配置。
+### 端到端示例：工作日数据汇总 + 节假日跳过 + 持久化 + 崩溃恢复
 
-## 两种 Builder API
-
-xhjob 提供两种链式 Builder，本篇定时任务因需用到 `skipDates` / `workdaysOnly`，采用**原生扩展 `Xhjob` 类**（全局命名空间）演示：
-
-| API | 命名空间 | 适用 | 是否支持 skipDates / workdaysOnly |
-|------|------|------|------|
-| 原生 `Xhjob` 类 | 全局（扩展导出） | 通用 PHP（CLI / FPM） | 支持（`skipDates()` / `workdaysOnly()`） |
-| `Xhjob\TaskBuilder` | `Xhjob\`（thinkphp8-extend 包装层） | ThinkPHP 8 集成 / 纯 PHP | 支持常用子集（cron / withTimezone / persist / acksLate / maxExecutions / coalesce 等），暂未暴露 skipDates / workdaysOnly |
-
-两种 API 底层都走同一个 daemon，常用方法名一致（`cron` / `withTimezone` / `persist` / `acksLate` / `maxExecutions` / `coalesce` / `withRetry` / `retryBackoff` / `misfireGraceTime` / `jitter`）。原生 `Xhjob` 类入口为 `Xhjob::task()`，链式配置后调 `dispatch()` 返回 task_id。
-
-## 完整端到端示例
+下面是一个完整的生产级 cron 任务：工作日凌晨 2 点跑数据汇总，跳过法定节假日，最多执行 1000 次，持久化 + 延迟确认（daemon 重启后自动重派未完成的任务）。
 
 ```php
 <?php
-// === 生产级定时任务：每日 09:00 跑报表 ===
-// 先确保 daemon 已启动（幂等）
-xhjob_start('cron-svc', '/var/lib/xhjob');
+// bin/register-cron.php  （部署时执行一次，注册 cron 任务到 daemon）
+use Xhjob\TaskBuilder;
 
-// 法定节假日（Unix 时间戳，取当天 00:00:00 Asia/Shanghai）
-// 实际从节假日 API / 配置表加载
+$name    = 'cron-svc';
+$dataDir = '/var/lib/xhjob';
+
+// 1. 确保 daemon 在运行
+if ((xhjob_status($name, $dataDir)['running'] ?? 'false') !== 'true') {
+    xhjob_start($name, $dataDir);
+}
+
+// 2. 法定节假日（Unix 时间戳 0 点），按任务时区 Asia/Shanghai 计算
 $holidays = [
-    strtotime('2026-01-01 00:00:00'),   // 元旦
-    strtotime('2026-02-17 00:00:00'),   // 春节
-    strtotime('2026-04-04 00:00:00'),   // 清明
-    strtotime('2026-05-01 00:00:00'),   // 劳动节
-    strtotime('2026-06-19 00:00:00'),   // 端午
-    strtotime('2026-09-25 00:00:00'),   // 中秋
-    strtotime('2026-10-01 00:00:00'),   // 国庆
+    strtotime('2026-01-01 00:00:00'),  // 元旦
+    strtotime('2026-02-17 00:00:00'),  // 春节
+    strtotime('2026-04-04 00:00:00'),  // 清明
+    strtotime('2026-05-01 00:00:00'),  // 劳动节
+    strtotime('2026-06-19 00:00:00'),  // 端午
+    strtotime('2026-09-25 00:00:00'),  // 中秋
+    strtotime('2026-10-01 00:00:00'),  // 国庆
 ];
 
-// 原生 Xhjob 类：支持全部调度字段，单链搞定
-$taskId = Xhjob::task()
-    ->service('cron-svc')                       // 绑定命名服务
-    ->dataDir('/var/lib/xhjob')                 // 数据目录
-    ->viaShell('php /app/jobs/daily-report.php') // shell 任务
-    ->cron('0 9 * * *')                         // 每天 09:00 触发（5 字段）
-    ->withTimezone('Asia/Shanghai')             // 时区：必须设置，否则用系统本地
-    ->workdaysOnly()                            // 仅工作日（Mon-Fri），周末不触发
-    ->skipDates($holidays)                      // 节假日跳过（按日历日期匹配）
-    ->coalesce(true)                            // 漏触发合并为 1 次（而非补跑多次）
-    ->misfireGraceTime(600)                     // 容忍迟到 10 分钟，超期则视为 misfire
-    ->maxExecutions(1000)                       // 最多执行 1000 次后自动停止（0=无限）
-    ->persist(true)                             // 持久化（SqliteStore + WAL），重启不丢
-    ->acksLate(true)                            // 完成后才 ack，daemon 崩溃后重投
-    ->acksOnFailure(false)                      // 失败时不 ack，便于重试
-    ->withRetry(3, 60)                          // 失败重试 3 次，间隔 60 秒
-    ->retryBackoff(true)                        // 指数退避：60,120,240... 上限 60*60
-    ->timeout(1800)                             // 单次执行硬超时 30 分钟
-    ->softTimeout(1740)                         // 软超时 29 分钟，先 SIGTERM 再 SIGKILL
-    ->maxInstances(1)                           // 同任务最大并发 1（防重复跑）
-    ->jitter(5)                                 // 随机抖动 5 秒，避免整点惊群
-    ->tag('report')                             // 标签：便于检索
-    ->tag('critical')
-    ->dispatch();                               // 返回 task_id
+// 3. 注册 cron 任务
+$taskId = TaskBuilder::shell(
+        'php /app/bin/daily-summary.php --date=$(date +%F) --idempotent'
+    )
+    ->withId('daily-summary')          // 稳定 ID，部署脚本可重复执行覆盖
+    ->replaceExisting(true)            // 同 id 覆盖旧定义
+    ->cron('0 2 * * 1-5')              // 工作日凌晨 2:00（5 字段）
+    ->withTimezone('Asia/Shanghai')    // 显式时区，不依赖系统本地
+    ->workdaysOnly()                   // 仅周一至周五（与 cron 的 1-5 冗余但更明确）
+    ->skipDates($holidays)             // 跳过节假日
+    ->persist(true)                    // 落 SQLite，daemon 重启不丢任务定义
+    ->acksLate(true)                   // 崩溃恢复：Running 任务重启后重派
+    ->maxExecutions(1000)              // 最多跑 1000 次后自动停止（约 4 年）
+    ->coalesce(true)                   // 宕机期间多次 cron 只补一次
+    ->misfireGraceTime(3600)           // 漏触发 1 小时内仍补跑，超时记 missed
+    ->withRetry(3, 5)                  // 单次执行失败重试 3 次
+    ->retryBackoff(true)               // 指数退避
+    ->timeout(1800)                    // 单次硬超时 30 分钟
+    ->softTimeout(1500)                // 软超时 25 分钟，给业务收尾
+    ->maxInstances(1)                  // 防重叠：前一轮没跑完不派新一轮
+    ->tag('report')->tag('daily')
+    ->dispatch($name, $dataDir);
 
-echo "定时任务已创建: {$taskId}\n";
+if (str_starts_with($taskId, 'error:')) {
+    throw new RuntimeException('注册失败：' . substr($taskId, 6));
+}
+echo "cron 任务已注册: {$taskId}\n";
 
-// 查询状态
-$state = xhjob_state($taskId, 'cron-svc', '/var/lib/xhjob');
-print_r($state);
+// 4. 验证：查 registered 模式确认任务进入 cron 注册表
+$registered = xhjob_inspect('registered', $name, $dataDir);
+if (!str_starts_with($registered, 'error:')) {
+    $list = json_decode($registered, true) ?: [];
+    foreach ($list as $t) {
+        if (($t['id'] ?? '') === 'daily-summary') {
+            printf("  next_fire=%s timezone=%s\n",
+                $t['next_fire'] ?? '-',
+                $t['timezone'] ?? '-'
+            );
+        }
+    }
+}
 ```
 
-## 配置项逐项说明
+### 6 字段秒级 cron
 
-| 方法 | 作用 | 本例取值 |
-|------|------|------|
-| `cron('0 9 * * *')` | 5 字段 cron 表达式，每天 09:00 触发 | `0 9 * * *` |
-| `withTimezone('Asia/Shanghai')` | cron 求值时区，**必须设置**否则用系统本地时区 | `Asia/Shanghai` |
-| `workdaysOnly()` | 仅 Mon-Fri 触发，周末跳过 | 开启 |
-| `skipDates([...])` | 跳过指定日历日期（按任务时区的年月日匹配） | 节假日时间戳数组 |
-| `coalesce(true)` | 漏触发合并：多次错过只补跑 1 次 | 开启 |
-| `misfireGraceTime(600)` | 容忍迟到的宽限时间（秒），超期视为 misfire | 600 |
-| `maxExecutions(1000)` | 最大执行次数，达到后转 Success 终态；0=无限 | 1000 |
-| `persist(true)` | 持久化任务状态到 SQLite + WAL，daemon 重启后恢复 | 开启 |
-| `acksLate(true)` | 完成后才 ack；daemon 在 Running 期间崩溃，重启后重置为 Pending 重投 | 开启 |
-| `acksOnFailure(false)` | 失败时不 ack，配合 acksLate 便于重试 | 关闭 |
-| `withRetry(3, 60)` | 最多重试 3 次，基础间隔 60 秒 | 3, 60 |
-| `retryBackoff(true)` | 指数退避：`min(60*2^(n-1), 60*60)` | 开启 |
-| `maxInstances(1)` | 同任务最大并发实例数，防重复执行 | 1 |
-| `jitter(5)` | 随机抖动 5 秒，避免整点惊群 | 5 |
-
-### 漏触发合并（coalesce）工作流
-
-当 daemon 因重启 / 阻塞错过了多次触发（例如每天 9 点的任务，daemon 在 9:00-11:00 宕机）：
-
-- `coalesce(true)` + `misfireGraceTime(600)`：在宽限期（10 分钟）内恢复，只补跑 **1 次**，不补跑中间所有错过的次数。
-- `coalesce(false)`：超出宽限期则直接跳过本次触发（`next_fire` 后滚到下一个匹配点）。
-
-### 崩溃恢复（acksLate + persist）
-
-1. 任务到点被调度执行，进入 `Running` 状态，**此时未 ack**。
-2. daemon 在任务 Running 期间崩溃 / 被强制重启。
-3. daemon 重启后扫描持久化存储：`acksLate=true` 且状态为 `Running` 的任务被**自动重置为 `Pending`** 并重新触发。
-4. 普通任务（`acksLate=false`）的 Running 状态保持，不会重投（视为已确认）。
-
-> 崩溃恢复要求任务**幂等**——重复执行不产生副作用（如报表可重复生成、订单用状态机去重）。
-
-## cron 表达式：5 字段与 6 字段（秒级）
-
-xhjob 的 cron 基于 `cron 0.12`，**内部要求 6 个字段**（秒 分 时 日 月 周）。用户传 5 字段时，扩展自动在前面补 `0` 秒字段：
-
-```rust
-// src/scheduler/cron.rs
-// cron 0.12 requires 6 fields (sec min hour day month weekday).
-// If the user supplied 5 fields we prepend a `0` seconds field.
-```
-
-| 字段数 | 示例 | 含义 |
-|------|------|------|
-| 5 字段 | `0 9 * * *` | 每天 09:00:00（自动补秒=0） |
-| 5 字段 | `0 9 * * 1-5` | 工作日 09:00:00 |
-| 6 字段 | `*/30 * * * * *` | 每 30 秒触发一次（秒级精度） |
-| 6 字段 | `0 0 9 * * *` | 每天 09:00:00（显式秒=0） |
+Xhjob 支持 6 字段表达式（`秒 分 时 日 月 周`），用于秒级高频触发。当表达式按空格切分后字段数 ≥ 6 时按 6 字段解析；不足 6 字段时自动在前面补 `0` 秒字段。
 
 ```php
-// 秒级 cron：每 30 秒健康检查
-Xhjob::task()
-    ->service('cron-svc')
-    ->viaShell('curl -s https://api.example.com/health')
-    ->cron('*/30 * * * * *')      // 6 字段，秒级
+<?php
+use Xhjob\TaskBuilder;
+
+// 每 30 秒采一次心跳
+TaskBuilder::shell('curl -sf http://127.0.0.1/healthz > /dev/null')
+    ->cron('30 * * * * *')             // 6 字段：秒=30，每分钟第 30 秒
     ->withTimezone('Asia/Shanghai')
-    ->maxExecutions(0)            // 无限
+    ->maxInstances(1)                  // 防堆积
+    ->ignoreResult(true)               // 心跳不关心结果
+    ->dispatch();
+
+// 每 10 秒
+TaskBuilder::shell('php /app/bin/metrics-collect.php')
+    ->cron('*/10 * * * * *')           // 6 字段：秒位 */10
+    ->rateLimit(6, 60)                 // 兜底限流：60 秒内最多 6 次
     ->dispatch();
 ```
 
-## 多 cron 表达式（or_cron）
-
-`orCron([...])` 追加额外 cron 表达式，任务在**任一**表达式匹配时触发（并集）：
+### persist + acksLate 崩溃恢复验证
 
 ```php
-Xhjob::task()
-    ->viaShell('php /app/jobs/cleanup.php')
-    ->cron('0 2 * * *')                         // 主表达式：每天 02:00
-    ->orCron(['0 14 * * *', '0 22 * * 6'])      // 额外：每天 14:00 与 周六 22:00
+<?php
+// bin/verify-recovery.php
+// 演示：cron 任务执行中 daemon 被 SIGKILL → 重启后 Running 任务自动重派
+
+$name = 'cron-svc';
+$dataDir = '/var/lib/xhjob';
+
+// 注册一个 30 秒执行的长任务（每分钟触发一次）
+$taskId = TaskBuilder::shell('echo start; sleep 30; echo done')
+    ->cron('* * * * *')
     ->withTimezone('Asia/Shanghai')
-    ->dispatch();
+    ->persist(true)
+    ->acksLate(true)                   // 关键：崩溃后重派
+    ->maxInstances(1)
+    ->timeout(120)
+    ->dispatch($name, $dataDir);
+
+echo "registered: {$taskId}\n";
+sleep(5);                              // 等任务进入 Running
+
+$state = xhjob_state($taskId, $name, $dataDir);
+echo "before crash: state={$state['state']}\n";
+
+// 模拟 daemon 崩溃（生产中是 kill -9 / OOM）
+xhjob_stop($name, $dataDir);
+echo "daemon stopped (task persisted in SQLite)\n";
+
+// 重启 daemon
+xhjob_start($name, $dataDir);
+echo "daemon restarted, running recovery:\n";
+echo "  - stale pid cleanup (starttime 双校验)\n";
+echo "  - reset_running_to_pending (acksLate=true 的 Running 任务)\n";
+echo "  - lease check (worker 已死 → 重派)\n";
+
+// 轮询确认任务恢复执行
+$deadline = time() + 60;
+while (time() < $deadline) {
+    $s = xhjob_state($taskId, $name, $dataDir);
+    echo "after restart: state={$s['state']}\n";
+    if (in_array($s['state'], ['success', 'failed', 'interrupted'], true)) {
+        break;
+    }
+    sleep(3);
+}
+
+// 查事件流：应有 succeeded，无重复执行（lease_held=0）
+$events = json_decode(xhjob_pull_events(time() - 120, null, $name, $dataDir), true) ?: [];
+foreach ($events as $ev) {
+    if ($ev['task_id'] === $taskId) {
+        printf("  [%s] %s\n", $ev['ts'], $ev['event_type']);
+    }
+}
 ```
+
+### 查询与运维
+
+```php
+<?php
+// bin/cron-ops.php  （运维脚本）
+$name = 'cron-svc';
+$dataDir = '/var/lib/xhjob';
+
+// 查所有注册的 cron / interval 任务
+$registered = json_decode(xhjob_inspect('registered', $name, $dataDir), true) ?: [];
+printf("已注册定时任务: %d 个\n", count($registered));
+foreach ($registered as $t) {
+    printf("  id=%s cron=%s next=%s tz=%s exec=%s/%s\n",
+        $t['id'] ?? '-',
+        $t['cron'] ?? $t['interval'] ?? '-',
+        $t['next_fire'] ?? '-',
+        $t['timezone'] ?? 'system',
+        $t['execution_count'] ?? '0',
+        $t['max_executions'] ?? '∞'
+    );
+}
+
+// 临时修改 cron 频率（不重建任务，保留 id 与历史）
+xhjob_reschedule('daily-summary', '*/15 * * * *', $name, $dataDir);
+
+// 维护窗口：暂停所有 report 标签的任务
+$list = json_decode(xhjob_list($name, null, 'report', $dataDir), true)['tasks'] ?? [];
+foreach ($list as $t) {
+    xhjob_pause($t['id'], $name, $dataDir);
+}
+// 维护结束后
+foreach ($list as $t) {
+    xhjob_resume($t['id'], $name, $dataDir);
+}
+```
+
+---
 
 ## 注意事项
 
-| 关注点 | 说明 |
-|------|------|
-| **cron 6 字段支持秒级** | 传 5 字段自动补 `0` 秒；需秒级精度时显式写 6 字段（如 `*/30 * * * * *`）。 |
-| **时区必须设置** | `withTimezone` 未设置时，cron 求值用 daemon 进程的**系统本地时区**。容器 / 服务器时区与业务时区不一致时（如容器 UTC、业务 Asia/Shanghai），会触发时间错位。生产环境务必显式 `withTimezone('Asia/Shanghai')`。 |
-| **persist 需 --all-features** | 持久化（SqliteStore + WAL）依赖 `persist` cargo feature。编译扩展时需 `cargo build --features persist`（或 `--all-features`）；运行时还需 `XHJOB_POOL_MODE` 之外设 `XHJOB_PERSIST=1`。未启用 feature 时 `persist(true)` 退化为 InMemoryStore，daemon 重启后任务丢失。 |
-| **skipDates 按日历日期匹配** | `skipDates` 接收 Unix 时间戳数组，但匹配时只比较**任务时区的年月日**（不比较时分秒）。传当天任意时间戳均可，建议传当天 00:00:00。 |
-| **workdaysOnly 与 cron 1-5** | `workdaysOnly()` 与 cron 周字段 `1-5` 效果相近，但 `workdaysOnly` 是在触发求值后的二次过滤，可与任意 cron 表达式组合（如 `0 9 * * *` + `workdaysOnly`）。 |
-| **maxInstances 防重复** | 长任务（如 30 分钟报表）若上一轮未跑完又到下一轮触发点，`maxInstances(1)` 会阻止重复执行，配合 `coalesce` 合并漏触发。 |
-| **持久化 + acksLate 需幂等** | 崩溃恢复会重投 Running 任务，业务必须幂等。 |
+- **时区必须显式设置**：`withTimezone('Asia/Shanghai')` 缺省时调度器用**系统本地时区**（`/etc/localtime` / `TZ`）。容器环境时区经常漂移（基础镜像默认 UTC），不设时区会导致 cron 触发点偏移 8 小时。生产环境**每个 cron 任务都必须显式设时区**。
+- **cron 6 字段支持秒级**：5 字段（`分 时 日 月 周`）与 6 字段（`秒 分 时 日 月 周`）都支持。按空格切分后字段数 ≥ 6 走 6 字段解析，不足 6 字段自动在前面补 `0` 秒位。秒级高频任务务必配 `maxInstances(1)` + `rateLimit` 防堆积。
+- **`persist(true)` 需 `--all-features` 编译**：持久化是编译时 feature。用 `cargo build --release --all-features`（或 `--features persist`）编译扩展与 daemon。否则 `persist(true)` 被接受但**静默回退到 InMemoryStore**，daemon 一死任务定义全丢，`acksLate` 也失效。部署后用 `xhjob_inspect('stats')` 校验 `store_backend` 是否为 `sqlite`。
+- **`coalesce(true)` 合并漏触发**：daemon 宕机期间多次 cron 到点（如停机 1 小时，每分钟的任务漏了 60 次），开启 coalesce 只补跑**一次**，不补 60 次。关闭则每次漏触发都补跑（可能打爆队列）。默认 `coalesce=true`。
+- **`misfireGraceTime` 与 `coalesce` 配合**：`misfireGraceTime`（秒）定义漏触发的容忍窗口，0 = 用全局默认 60s。超过宽限期的漏触发记 `missed` 事件不再补跑。`coalesce=true` 时窗口内多次漏触发合并为一次。
+- **`maxExecutions` 限制总执行次数**：达到上限后任务转 `success` 终态不再触发。`0` = 无限。适合「只跑 N 次就停」的限时活动任务。注意是**成功执行次数**累计，`max_instances_reached` 跳过的不计入。
+- **`acksLate(true)` 必须幂等**：daemon SIGKILL 后重启会把 Running 任务重置为 Pending 重派，可能产生**重复执行**。业务脚本必须幂等（UPSERT / 去重键），否则会重复发报表、重复扣款。详见 [持久化与崩溃恢复](persistence-recovery.md)。
+- **`skipDates` 时间戳按任务时区**：`skipDates` 接收 Unix 时间戳数组，按任务 `withTimezone` 的时区解释为「当天」。传 `2026-01-01 00:00:00 Asia/Shanghai` 的时间戳会跳过整个 1 月 1 日。务必用 `strtotime` 在目标时区下计算。
+- **`workdaysOnly()` 仅周一至周五**：等价于 cron 周位 `1-5`。如果 cron 表达式已写 `1-5`，再加 `workdaysOnly()` 是冗余的（双重过滤），不会冲突。中国大陆的调休（周末上班）无法用 `workdaysOnly` 表达，需用 `skipDates` 的反向逻辑（或自行在工作日里排除节假日、在周末里手动派发）。
 
-## 运维查询
+---
 
-```bash
-# 查看所有 cron 注册任务
-php -r 'print_r(xhjob_inspect("registered", "cron-svc", "/var/lib/xhjob"));'
+## 生产建议
 
-# 查看任务下次触发时间
-php -r 'print_r(xhjob_inspect("scheduled", "cron-svc", "/var/lib/xhjob"));'
-
-# 查看任务状态与执行次数
-php -r 'print_r(xhjob_state("TASK_ID", "cron-svc", "/var/lib/xhjob"));'
-
-# 重新调度（改 cron 表达式）
-php -r 'var_dump(xhjob_reschedule("TASK_ID", "0 10 * * *", "cron-svc", "/var/lib/xhjob"));'
-
-# 暂停 / 恢复
-php -r 'var_dump(xhjob_pause("TASK_ID", "cron-svc", "/var/lib/xhjob"));'
-php -r 'var_dump(xhjob_resume("TASK_ID", "cron-svc", "/var/lib/xhjob"));'
-```
+- **部署脚本幂等注册**：cron 任务用 `withId('稳定业务名')` + `replaceExisting(true)`，部署脚本可重复执行，每次覆盖为最新定义，不会产生重复任务。不要用自动生成的 UUID 注册 cron，否则每次部署都会多一个。
+- **daemon 由 systemd 托管**：cron 调度依赖 daemon 常驻。systemd unit 配 `Restart=on-failure` + `RestartSec=2s`，让 daemon 崩溃后 2 秒内自愈。`persist(true)` + `acksLate(true)` 保证恢复后任务定义与在途任务都不丢。
+- **监控 `missed` 事件**：`xhjob_pull_events(time() - 3600, 'missed')` 拉取最近 1 小时的漏触发事件。频繁 missed 说明 daemon 频繁宕机或 `misfireGraceTime` 太短，应排查稳定性。
+- **长任务防重叠**：耗时可能超过 cron 周期的任务（如 5 分钟跑一次但可能跑 8 分钟），必须设 `maxInstances(1)`。前一轮未完成时新一轮被跳过并记 `max_instances_reached` 事件，监控此事件频率可判断任务是否长期超时。
+- **节假日表外置**：`skipDates` 不要硬编码在部署脚本里。维护一份节假日 JSON（如 `/etc/xhjob/holidays.json`），部署脚本读取后注入，每年初更新一次。
+- **cron 与 `every` 的选择**：固定间隔用 `every($secs)` 更直观（如 `every(300)` = 每 5 分钟）；复杂时间点用 `cron`（如 `0 9 * * 1-5`）。两者同时设置时 `cron` 优先。秒级高频用 `every` 比 6 字段 cron 更易读。
+- **定期清理终态任务**：cron 任务长期累积会撑大 SQLite 表。对已 `success` / `cancelled` 且超过 `resultTtl` 的任务，定期 `xhjob_remove` 清理。可注册一个专门的清理 cron（如每天凌晨 4 点跑 `bin/cleanup.php`）。
+- **时区一致性**：所有 cron 任务统一用一个时区（通常 `Asia/Shanghai`），避免跨时区团队混乱。跨地域部署时按地域拆分 `service_name`，每个服务用各自时区。

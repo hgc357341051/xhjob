@@ -8,11 +8,23 @@
 
 ## 阶段二：搭建 Docsify 骨架
 - [ ] Task 2: 创建 Docsify 入口与配置
-  - [ ] SubTask 2.1: 创建 `docs/index.html`——引入 docsify.js（CDN unpkg）+ search 插件 + prism 代码高亮插件 + emoji 插件；配置 `repo`、`loadSidebar: true`、`coverpage: true`、`subMaxLevel: 3`、`search` 选项（placeholder/noData/depth）、`auto2top: true`、`name: 'Xhjob'`
-  - [ ] SubTask 2.2: 创建 `docs/.nojekyll`（空文件，告知 GitHub Pages 静态模式不忽略 `_` 开头文件）
-  - [ ] SubTask 2.3: 创建 `docs/_coverpage.md`——封面页：项目名 Xhjob + 一句话简介 + 核心特性列表 + 「快速开始」按钮链接 + GitHub 仓库链接
-  - [ ] SubTask 2.4: 创建 `docs/_sidebar.md`——6 分组左侧导航（入门/API 参考/核心能力/进阶/生产实战/排障），每项链接到对应 markdown 文件
-  - [ ] SubTask 2.5: 创建 `docs/README.md`——Docsify 默认首页（项目介绍 + 核心特性 + 快速开始代码 + 部署方式说明三选一：本地预览 / GitHub Pages 静态模式 / 静态服务器）
+  - [ ] SubTask 2.1: 创建 `docs/index.html`——引入 docsify.js（CDN unpkg）+ search 插件 + prism 代码高亮插件（PHP/Rust/Bash/JSON 语言组件）+ emoji 插件 + copy-to-clipboard 插件；配置 `repo`、`loadSidebar: true`、`coverpage: true`、`subMaxLevel: 3`、`search`（placeholder/noData/depth/maxAge）、`auto2top: true`、`name: 'Xhjob'`、`logo: 'assets/img/logo.svg'`、`themeColor: '#3B82F6'`、`extPlugin: ['assets/css/custom.css']`
+  - [ ] SubTask 2.2: 创建 `docs/.nojekyll`（空文件）
+  - [ ] SubTask 2.3: 创建 `docs/assets/img/logo.svg`——项目 Logo（X 字母 + 任务队列几何图形，主色 #3B82F6）
+  - [ ] SubTask 2.4: 创建 `docs/assets/css/custom.css`——完整自定义主题（见 Task 2b 详述）
+  - [ ] SubTask 2.5: 创建 `docs/_coverpage.md`——封面页（Logo + 标题 + 副标题 + 徽章行 `PHP 8.0+`/`Rust`/`Apache-2.0`/`Linux` + 三个 CTA 按钮：快速开始/API 参考/GitHub + 背景渐变由 custom.css 控制）
+  - [ ] SubTask 2.6: 创建 `docs/_sidebar.md`——6 分组导航（带 emoji 分组标题 🚀入门/📚API参考/⚙️核心能力/🔬进阶/🏭生产实战/🛠️排障 + 分隔线 `---`）
+  - [ ] SubTask 2.7: 创建 `docs/README.md`——Docsify 默认首页（项目介绍 + 核心特性卡片网格 6-8 张 + 快速开始代码 + 三种部署方式 + 技术栈说明）
+
+- [ ] Task 2b: 编写 `docs/assets/css/custom.css` 完整样式
+  - [ ] SubTask 2b.1: CSS 变量定义（亮色：--primary:#3B82F6, --primary-dark:#1E40AF, --accent:#F59E0B, --bg:#FFFFFF, --text:#1F2937, --code-bg:#F3F4F6 等；暗色：--bg:#0F172A, --text:#E2E8F0, --code-bg:#1E293B 等）
+  - [ ] SubTask 2b.2: 封面页样式（全屏渐变背景 linear-gradient(135deg,#3B82F6,#8B5CF6)、居中 flex 布局、标题超大字号、徽章 inline-flex 圆角、CTA 按钮实心/描边两种样式）
+  - [ ] SubTask 2b.3: 特性卡片网格样式（CSS Grid 响应式：repeat(auto-fill,minmax(280px,1fr))、卡片阴影 box-shadow、hover transform translateY(-4px) 过渡动画）
+  - [ ] SubTask 2b.4: 代码块增强（prism 主题覆盖、复制按钮定位右上角、hover 显示、点击反馈、横向滚动 overflow-x:auto）
+  - [ ] SubTask 2b.5: 表格美化（表头主色背景+白字、斑马纹 nth-child(even)、hover 行高亮、border-collapse+圆角 overflow hidden、移动端 overflow-x:auto）
+  - [ ] SubTask 2b.6: 导航侧边栏样式（分组标题大写字母间距+主色、子项缩进 padding-left、当前页 active 高亮左边框、折叠展开箭头）
+  - [ ] SubTask 2b.7: 主题切换按钮（右上角固定定位、三态按钮 ☀️/🌙/🖥️、localStorage 持久化、`[data-theme]` 属性切换）
+  - [ ] SubTask 2b.8: 移动端响应式（@media max-width:768px：侧边栏 transform translateX 隐藏+汉堡菜单、卡片单列、表格/代码横向滚动、封面字号 clamp 缩小）
 
 ## 阶段三：入门篇
 - [ ] Task 3: 编写「快速开始」`docs/quickstart.md`

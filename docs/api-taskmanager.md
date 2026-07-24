@@ -1,696 +1,904 @@
----
-title: TaskManager API
-parent: API 参考
-nav_order: 23
----
-
 # TaskManager API
 
-`Xhjob\TaskManager` 是 xhjob PHP 扩展的任务管理门面，封装 `xhjob_dispatch` / `xhjob_state` / `xhjob_result` / `xhjob_list` 等原生函数，提供 `create` / `state` / `result` / `stop` / `restart` / `waitForState` 等高层 API。
+`Xhjob\TaskManager` 是 ThinkPHP 8 扩展包提供的高层任务管理门面，封装 `xhjob_dispatch` / `xhjob_state` / `xhjob_result` / `xhjob_list` 等全局函数，提供 `create` / `state` / `result` / `stop` / `waitForState` 等面向对象 API。
 
-{: .note }
-本类位于命名空间 `Xhjob`，源文件 `Xhjob/TaskManager.php`。构造时绑定服务名与数据目录，后续所有调用自动透传这两个参数，无需每次重复传入。
+> 源码：`releases/xhjob-thinkphp8-extend/Xhjob/TaskManager.php`，命名空间 `Xhjob`。
 
 ## 设计要点
 
-- **服务名 + 数据目录绑定**：构造时一次性绑定，所有方法复用。
-- **错误归一化**：原生函数返回的 `error:` 前缀字符串 / 带 `error` 键的数组，在门面层统一转换为异常（`ServiceNotRunningException` / `TaskNotFoundException` / `InvalidTaskConfigException`）。
-- **状态数组归一化**：`parseStateArray()` 兼容 `[[k, v], ...]` 键值对形式与 `['k' => 'v']` 关联数组形式，保证后续扩展升级兼容。
+- 构造时绑定 **服务名** 与 **数据目录**，后续所有方法自动透传这两个参数，无需每次重复传入。
+- 把底层 `xhjob_*` 函数的 `error:` 前缀 / `error` 键 / `false` 等异构错误约定，统一收敛为 **异常**（`InvalidTaskConfigException` / `ServiceNotRunningException` / `TaskNotFoundException`）或 **可判定的返回值**（`null` / `false` / 带 `error` 键的数组）。
+- 提供两个轮询等待方法 `waitForState` / `waitForResult`，封装常见的"派发后等结果"模式。
 
-## 异常类型
+## 错误契约
 
-| 异常类 | 触发场景 |
+| 方法类别 | 失败行为 |
 | --- | --- |
-| `Xhjob\Exception\InvalidTaskConfigException` | 任务配置非法 / dispatch 返回 error |
-| `Xhjob\Exception\ServiceNotRunningException` | daemon 不可达 / 查询失败 |
-| `Xhjob\Exception\TaskNotFoundException` | 任务不存在（仅 `remove` 抛此异常） |
+| 创建类（create / createChain / createGroup / createChord / update） | 抛 `InvalidTaskConfigException`（底层 `error:` 前缀转换而来） |
+| 查询类（get / list / state / result / logs / chainState / groupState / chordState / pullEvents / inspect） | daemon 不可达抛 `ServiceNotRunningException` |
+| `result()` 无结果记录 | 返回带 `error` 键的数组（**业务条件，不抛异常**） |
+| `get()` / `chainState()` / `groupState()` / `chordState()` 不存在 | 返回 `null` |
+| `remove()` 任务不存在 | 抛 `TaskNotFoundException` |
+| `stop` / `restart` / `pause` / `resume` / `reschedule` / `reportProgress` | 返回 `bool`，`false` 即失败，不抛异常 |
+| `waitForState` / `waitForResult` | 临时错误（如 daemon 重启中）继续轮询，超时返回 `false` / `null` |
 
-## 构造与基本信息
+### 异常类型（4 个，命名空间 `Xhjob\Exception`）
 
-### __construct
+| 异常 | 继承 | 抛出场景 |
+| --- | --- | --- |
+| `XhjobException` | `\Exception` | 基类，所有 Xhjob 异常的根 |
+| `InvalidTaskConfigException` | `XhjobException` | 创建类方法：配置非法 / daemon 返回 `error:` |
+| `ServiceNotRunningException` | `XhjobException` | 查询类方法：daemon 不可达 / 任务不存在（state 视为不可达） |
+| `TaskNotFoundException` | `XhjobException` | `remove()` 失败；`update()` 内部捕获以容忍旧任务不存在 |
+
+```php
+<?php
+use Xhjob\Exception\XhjobException;
+use Xhjob\Exception\InvalidTaskConfigException;
+use Xhjob\Exception\ServiceNotRunningException;
+use Xhjob\Exception\TaskNotFoundException;
+
+try {
+    // ... 调用 TaskManager 方法
+} catch (InvalidTaskConfigException $e) {
+    // 创建类失败
+} catch (ServiceNotRunningException $e) {
+    // daemon 不可达
+} catch (TaskNotFoundException $e) {
+    // 任务不存在
+} catch (XhjobException $e) {
+    // 兜底
+}
+```
+
+---
+
+## 构造与 getter（3）
+
+### `__construct`
 
 ```php
 public function __construct(string $name = 'default', ?string $dataDir = null)
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `string` | `'default'` | 服务名 |
-| `$dataDir` | `?string` | `null` | 数据目录，null 用默认 |
+**参数**
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$name` | `string` | 服务名，默认 `default` |
+| `$dataDir` | `?string` | 数据目录，`null` = 平台默认 |
+
+**返回值**：无（构造方法）。
+
+**错误契约**：不抛异常（服务名合法性延迟到实际调用底层函数时校验）。
+
+**注意事项**：绑定的 `$name` / `$dataDir` 会透传给后续所有方法。
+
+**代码演示**
 
 ```php
+<?php
 use Xhjob\TaskManager;
 
-$mgr = new TaskManager('default', '/var/lib/xhjob');
+$mgr = new TaskManager('cron-svc', '/var/lib/xhjob');
 ```
 
-### getName
+**生产建议**：ThinkPHP 中通过 ServiceProvider 注册单例 `xhjob.manager`，用 `xhjob_manager()` 获取；多服务场景各自 new 独立实例。
 
-获取服务名。
+---
+
+### `getName`
 
 ```php
 public function getName(): string
 ```
 
-```php
-echo $mgr->getName(); // default
-```
+**参数**：无。
 
-### getDataDir
+**返回值**：`string`。构造时绑定的服务名。
 
-获取数据目录。
+**错误契约**：不抛异常。
+
+**代码演示**：`echo $mgr->getName(); // cron-svc`
+
+---
+
+### `getDataDir`
 
 ```php
 public function getDataDir(): ?string
 ```
 
-```php
-var_dump($mgr->getDataDir()); // string(15) "/var/lib/xhjob"
-```
+**参数**：无。
+
+**返回值**：`?string`。构造时绑定的数据目录（未设为 `null`）。
+
+**错误契约**：不抛异常。
+
+**代码演示**：`$dir = $mgr->getDataDir();`
 
 ---
 
-## 一、创建任务
+## 创建（5）
 
-### create
+> 均可能抛 `InvalidTaskConfigException`（配置非法或 daemon 返回 `error:`）。
 
-创建单个任务，等价于 `xhjob_dispatch`。
+### `create`
 
 ```php
 public function create(TaskBuilder $b): string
 ```
 
+**参数**
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `$b` | `TaskBuilder` | 任务构建器 |
+| `$b` | `TaskBuilder` | 任务构建器（普通任务） |
 
-**返回值**：`string`，`task_id`。
+**返回值**：`string`。task_id。
 
-**异常**：daemon 返回 `error: ...` 时抛 `InvalidTaskConfigException`。
+**错误契约**：底层 `xhjob_dispatch` 返回 `error:` 前缀时抛 `InvalidTaskConfigException('dispatch 失败：<error> (name=<service>)')`。
+
+**注意事项**：内部调用 `$b->toJson()` 生成 JSON 后传给 `xhjob_dispatch`；等价于 `$b->dispatch($this->name, $this->dataDir)`，但把异常类型统一为 `InvalidTaskConfigException`（`TaskBuilder::dispatch` 也是抛此异常，行为一致）。
+
+**代码演示**
 
 ```php
+<?php
 use Xhjob\TaskBuilder;
 
 $id = $mgr->create(
-    TaskBuilder::shell('echo hi')->cron('0 * * * *')->withRetry(3, 2)
+    TaskBuilder::shell('echo hi')->withRetry(3, 2)
 );
 ```
 
-### createChain
+**生产建议**：业务层封装 `create` 调用并捕获异常，转换为业务错误码。
 
-创建任务链，等价于 `xhjob_chain`。
+---
+
+### `createChain`
 
 ```php
 public function createChain(array $builders): string
 ```
 
-| 参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `$builders` | `array` | `TaskBuilder` 实例数组 |
+**参数**：`$builders` — `TaskBuilder` 实例数组。
 
-**返回值**：`string`，`chain_id`。
+**返回值**：`string`。chain_id。
 
-**异常**：daemon 返回 `error: ...` 时抛 `InvalidTaskConfigException`。
+**错误契约**：底层 `xhjob_chain` 返回 `error:` 时抛 `InvalidTaskConfigException('chain 失败：<error> (name=<service>)')`。
+
+**注意事项**：内部把各 builder `toArray()` 后 `json_encode` 成任务数组传给 `xhjob_chain`。
+
+**代码演示**
 
 ```php
+<?php
 $chainId = $mgr->createChain([
-    TaskBuilder::shell('echo "line1\nline2"'),
-    TaskBuilder::shell('grep line2'),
+    TaskBuilder::shell('step1.sh'),
+    TaskBuilder::shell('step2.sh'),
 ]);
 ```
 
-### createGroup
+**生产建议**：chain 步骤不宜过多；任一步失败中断整链。
 
-创建任务组，等价于 `xhjob_group`。
+---
+
+### `createGroup`
 
 ```php
 public function createGroup(array $builders): string
 ```
 
-**返回值**：`string`，`group_id`。
+**参数**：`$builders` — `TaskBuilder` 实例数组。
+
+**返回值**：`string`。group_id。
+
+**错误契约**：底层 `xhjob_group` 返回 `error:` 时抛 `InvalidTaskConfigException('group 失败：<error> ...')`。
+
+**注意事项**：并行派发；终态 `success` / `partial_failed` / `failed`。
+
+**代码演示**
 
 ```php
+<?php
 $groupId = $mgr->createGroup([
-    TaskBuilder::http('GET', 'https://a.test'),
-    TaskBuilder::http('GET', 'https://b.test'),
+    TaskBuilder::http('GET', 'https://a'),
+    TaskBuilder::http('GET', 'https://b'),
 ]);
 ```
 
-### createChord
+**生产建议**：批量任务用 `rateLimit` 限流。
 
-创建 chord（header + body 回调），等价于 `xhjob_chord`。并行执行所有 header 任务，全部成功后执行 callback，callback 的 meta 携带所有 header 结果。任一 header 失败时 chord 转 `partial_failed` 终态，不派发 callback。参考 Celery chord。
+---
+
+### `createChord`
 
 ```php
 public function createChord(array $headerBuilders, TaskBuilder $callback): string
 ```
 
+**参数**
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `$headerBuilders` | `array` | header `TaskBuilder` 实例数组 |
-| `$callback` | `TaskBuilder` | 回调 `TaskBuilder`（body） |
+| `$headerBuilders` | `array` | header `TaskBuilder` 数组（并行） |
+| `$callback` | `TaskBuilder` | 回调 `TaskBuilder` |
 
-**返回值**：`string`，`chord_id`。
+**返回值**：`string`。chord_id。
+
+**错误契约**：底层 `xhjob_chord` 返回 `error:` 时抛 `InvalidTaskConfigException('chord 失败：<error> ...')`。
+
+**注意事项**：header 全部成功后才派发 callback（callback 的 `meta` 携带所有 header 结果）；任一 header 失败则 chord 转 `partial_failed`，不派发 callback。
+
+**代码演示**
 
 ```php
+<?php
 $chordId = $mgr->createChord(
-    [TaskBuilder::shell('echo 1'), TaskBuilder::shell('echo 2')],
-    TaskBuilder::shell('echo done')
+    [TaskBuilder::shell('shard-1.sh'), TaskBuilder::shell('shard-2.sh')],
+    TaskBuilder::shell('merge.sh')
 );
 ```
 
-### update
+**生产建议**：Map-Reduce 场景的理想原语。
 
-更新任务（先 remove 再以指定 id 重建）。
+---
+
+### `update`
 
 ```php
 public function update(string $id, TaskBuilder $b): string
 ```
+
+**参数**
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `$id` | `string` | 旧任务 ID |
 | `$b` | `TaskBuilder` | 新任务构建器 |
 
-**返回值**：`string`，新任务 ID（与传入 `$id` 相同）。
+**返回值**：`string`。新任务 ID（与传入 `$id` 相同，因内部强制 `withId($id)`）。
 
-{: .note }
-实现细节：先尝试 `remove($id)`（不存在时捕获 `TaskNotFoundException` 忽略），再以旧 id 重建（自动调用 `withId($id)->replaceExisting(true)` 以防 daemon 中残留同 id）。
+**错误契约**：`remove($id)` 抛 `TaskNotFoundException` 时被**静默捕获**（旧任务不存在视为正常）；后续 `create` 失败抛 `InvalidTaskConfigException`。
 
-**异常**：重建时 dispatch 失败抛 `InvalidTaskConfigException`。
+**注意事项**
+- 实现：先 `remove($id)`（不存在静默吞 `TaskNotFoundException`），再 `$b->withId($id)->replaceExisting(true)` 重建。
+- 启用 `replaceExisting(true)` 以防 daemon 中残留同 id 任务。
+
+**代码演示**
 
 ```php
-// 把已有任务改成新的 cron
-$newId = $mgr->update($oldId, TaskBuilder::shell('new-cmd')->cron('0 3 * * *'));
-// $newId === $oldId
+<?php
+use Xhjob\TaskBuilder;
+
+// 把现有 cron 任务改成新表达式
+$newId = $mgr->update('nightly-cleanup', TaskBuilder::shell('cleanup.sh')->cron('0 4 * * *'));
+// $newId === 'nightly-cleanup'
 ```
+
+**生产建议**：动态修改任务配置用 `update`（保留 id）；仅改 cron 用更轻量的 `reschedule`。
 
 ---
 
-## 二、查询任务
+## 查询（5）
 
-### get
+> daemon 不可达时抛 `ServiceNotRunningException`。
 
-获取任务详情（完整 Task JSON 解码后的关联数组）。
+### `get`
 
 ```php
 public function get(string $id): ?array
 ```
 
-| 参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `$id` | `string` | 任务 ID |
+**参数**：`$id` — 任务 ID。
 
-**返回值**：`?array`。任务不存在返回 `null`；成功返回完整配置关联数组。
+**返回值**：`?array`。任务存在时返回完整任务定义关联数组（`json_decode` 结果）；不存在返回 `null`。
 
-**异常**：daemon 不可达（返回 `error: ...`）时抛 `ServiceNotRunningException`。
+**错误契约**：底层 `xhjob_get` 返回 `null` / 空串 → 返回 `null`；返回 `error:` 前缀 → 抛 `ServiceNotRunningException('get 失败：<error> (id=..., name=...)')`。
+
+**注意事项**：返回的是任务定义（配置快照），不是执行结果——执行结果用 `result()`。
+
+**代码演示**
 
 ```php
-$task = $mgr->get($id);
-if ($task === null) {
+<?php
+$def = $mgr->get($id);
+if ($def === null) {
     echo "任务不存在\n";
-} else {
-    echo "cron={$task['cron']} retry_max={$task['retry_max']}\n";
 }
 ```
 
-### list
+**生产建议**：用于任务配置审计；判断是否在运行用 `state()`。
 
-列出任务，可按状态 / 标签过滤。
+---
+
+### `list`
 
 ```php
 public function list(?string $stateFilter = null, ?string $tag = null): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$stateFilter` | `?string` | `null` | 状态过滤（pending/running/success/...） |
-| `$tag` | `?string` | `null` | 标签过滤 |
+**参数**
 
-**返回值**：`array`，任务数组（`{"tasks":[...]}` 解码后的数组）。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$stateFilter` | `?string` | 状态过滤，如 `pending` / `running` / `success` / `failed` |
+| `$tag` | `?string` | 标签过滤 |
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`array`。任务数组（`json_decode` 结果，非法时返回 `[]`）。
+
+**错误契约**：底层 `xhjob_list` 返回 `error:` 前缀 → 抛 `ServiceNotRunningException('list 失败：<error> (name=...)')`。
+
+**注意事项**：`$stateFilter` 与 `$tag` 可同时使用（AND 语义）。
+
+**代码演示**
 
 ```php
-$pending = $mgr->list('pending');
-$billing = $mgr->list(null, 'billing');
-foreach ($pending as $t) {
+<?php
+$failed = $mgr->list('failed');
+foreach ($failed as $t) {
     echo $t['id'] . "\n";
 }
 ```
 
-### state
+**生产建议**：监控面板按 `failed` 拉取告警；避免全量拉取大响应。
 
-查询任务状态（关联数组）。
+---
+
+### `state`
 
 ```php
 public function state(string $id): array
 ```
 
-**返回值**：`array`，包含 `state` / `attempts` / `created_at` / `started_at` / `finished_at` / `last_error` / `execution_count` / `max_executions` / `paused` / `progress` / `worker_pid` 等字段（详见 `xhjob_state` 字段表）。
+**参数**：`$id` — 任务 ID。
 
-**异常**：daemon 不可达或任务不存在（原生函数返回带 `error` 键的数组）时抛 `ServiceNotRunningException`。
+**返回值**：`array`。含 `state` / `attempts` / `created_at` 等 30+ 字段（详见 [PHP 函数参考 / xhjob_state](api-functions.md#xhjob_state)）。
+
+**错误契约**：底层 `xhjob_state` 返回带 `error` 键的数组（daemon 不可达 / 任务不存在）→ 抛 `ServiceNotRunningException('state 失败：<error> (id=..., name=...)')`。**不再静默吞错**。
+
+**注意事项**：所有值为字符串，数值字段需 `(int)` 转换；`tags` 是 JSON 字符串需 `json_decode`。
+
+**代码演示**
 
 ```php
-$s = $mgr->state($id);
-printf("state=%s attempts=%s\n", $s['state'], $s['attempts']);
-if ($s['state'] === 'failed') {
-    echo "错误：{$s['last_error']}\n";
+<?php
+try {
+    $s = $mgr->state($id);
+    printf("state=%s attempts=%d\n", $s['state'], (int)$s['attempts']);
+} catch (ServiceNotRunningException $e) {
+    // daemon 不可达
 }
 ```
 
-### result
+**生产建议**：轮询时关注 `state` 是否进入终态（`success` / `failed` / `cancelled` / `expired` / `interrupted`）。
 
-查询任务执行结果。
+---
+
+### `result`
 
 ```php
 public function result(string $id): array
 ```
 
-**返回值**：`array`。Shell 任务含 `stdout` / `stderr` / `exit_code`；HTTP 任务含 `body`（或二进制时的 `body_b64`）/ `status_code`。
+**参数**：`$id` — 任务 ID。
 
-**注意事项**：
-- 当结果不存在时（`ignoreResult=true` 或任务未产出输出），返回带 `error` 键的数组——这是预期业务条件，**不抛异常**，调用方通过 `isset($r['error'])` 判断。
-- 对 HTTP 二进制响应（非 UTF-8），结果含 `body_b64` 键，调用方可通过 `base64_decode($r['body_b64'])` 恢复原始字节。
+**返回值**：`array`。含 `body` / `body_b64` / `status_code` / `stdout` / `stderr` / `exit_code`（按任务类型与产出情况出现）。
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**错误契约**
+- daemon 不可达（底层返回 `error:` 字符串）→ 抛 `ServiceNotRunningException('result 失败：<error> (id=..., name=...)')`。
+- **无结果记录**（`ignoreResult=true` / 任务未产出输出）→ 返回带 `error` 键的数组，**这是预期的业务条件，不抛异常**；调用方用 `isset($r['error'])` 判断。
+
+**注意事项**
+- HTTP 二进制响应含 `body_b64`（base64），用 `base64_decode` 恢复。
+- 取结果前建议先 `state()` 确认已进入终态。
+
+**代码演示**
 
 ```php
+<?php
 $r = $mgr->result($id);
 if (isset($r['error'])) {
-    echo "无结果：{$r['error']}\n";
-} elseif (isset($r['body_b64'])) {
-    $bytes = base64_decode($r['body_b64']);
-    echo "二进制响应，长度=" . strlen($bytes) . "\n";
-} else {
-    echo "exit_code={$r['exit_code']}\n{$r['stdout']}";
+    echo "无结果：{$r['error']}\n";  // 业务条件，非异常
+    return;
 }
+echo $r['stdout'] ?? $r['body'] ?? '';
 ```
 
-### logs
+**生产建议**：区分"无结果"（业务条件）与"daemon 不可达"（异常）；前者用 `isset($r['error'])`，后者用 try/catch。
 
-查询任务事件日志（按 `task_id` 过滤的事件）。
+---
+
+### `logs`
 
 ```php
 public function logs(string $id, int $sinceTs = 0): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$sinceTs` | `int` | `0` | 起始时间戳（Unix 秒），0 = 全部 |
+**参数**
 
-**返回值**：`array`，事件数组（元素为 `{task_id, event_type, payload, ts}`）。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$sinceTs` | `int` | 起始时间戳（Unix 秒），默认 0 = 全部 |
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`array`。事件数组（`json_decode` 结果，非法时返回 `[]`）。
+
+**错误契约**：底层 `xhjob_events` 返回 `error:` 前缀 → 抛 `ServiceNotRunningException('logs 失败：<error> (id=..., name=...)')`。
+
+**注意事项**：内部调用 `xhjob_events($sinceTs, $id, ...)`，按 `task_id` 过滤事件。
+
+**代码演示**
 
 ```php
-$events = $mgr->logs($id, time() - 3600); // 最近 1 小时
-foreach ($events as $e) {
-    echo "{$e['ts']} {$e['event_type']}\n";
+<?php
+$events = $mgr->logs($id, time() - 3600);
+foreach ($events as $ev) {
+    printf("[%d] %s\n", $ev['ts'], $ev['event_type']);
 }
 ```
 
+**生产建议**：排障时拉取任务全生命周期事件；`sinceTs` 做增量拉取。
+
 ---
 
-## 三、控制任务
+## 控制（6）
 
-以下方法均返回 `bool`，失败仅返回 `false`（不抛异常）。
-
-### stop
-
-停止（取消）任务，等价于 `xhjob_cancel`。
+### `stop`
 
 ```php
 public function stop(string $id): bool
 ```
 
+**参数**：`$id` — 任务 ID。
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：不抛异常；`false` 即失败。
+
+**注意事项**：内部调用 `xhjob_cancel`——Pending 转 `cancelled` 终态，Running 任务收到取消信号转 `cancelled`。
+
+**代码演示**
+
 ```php
-if ($mgr->stop($id)) {
-    echo "已取消\n";
+<?php
+if (!$mgr->stop($id)) {
+    error_log('取消失败：任务可能已终态');
 }
 ```
 
-### restart
+**生产建议**：业务取消用 `stop`（保留记录），定期清理用 `remove`。
 
-重启（重新入队）任务，等价于 `xhjob_requeue`。
+---
+
+### `restart`
 
 ```php
 public function restart(string $id): bool
 ```
 
+**参数**：`$id` — 任务 ID。
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：不抛异常。
+
+**注意事项**：内部调用 `xhjob_requeue`——仅对终态任务（`cancelled` / `failed` / `expired`）有效，重置 `attempts=0`、`next_fire=now`，回到 `pending`。运行中 / pending 任务返回 `false`。
+
+**代码演示**
+
 ```php
-$mgr->restart($id); // 将终态任务重新入队回 Pending
+<?php
+if ($mgr->restart($id)) {
+    echo "已重新入队\n";
+}
 ```
 
-### pause
+**生产建议**：修复后强制重试失败任务；与 `acksOnFailure(false)` 的无限重试任务配合人工干预。
 
-暂停任务，等价于 `xhjob_pause`。
+---
+
+### `pause`
 
 ```php
 public function pause(string $id): bool
 ```
 
-```php
-$mgr->pause($id);
-```
+**参数**：`$id`。
 
-### resume
+**返回值**：`bool`。
 
-恢复任务，等价于 `xhjob_resume`。
+**错误契约**：不抛异常。
+
+**注意事项**：暂停后调度器跳过触发；运行中实例不中断。
+
+**代码演示**：`$mgr->pause($id);` 维护窗口结束后 `$mgr->resume($id);`
+
+**生产建议**：维护窗口批量暂停 cron 任务。
+
+---
+
+### `resume`
 
 ```php
 public function resume(string $id): bool
 ```
 
-```php
-$mgr->resume($id);
-```
+**参数**：`$id`。
 
-### remove
+**返回值**：`bool`。
 
-删除任务，等价于 `xhjob_remove`。
+**错误契约**：不抛异常。
+
+**注意事项**：恢复被 `pause` 暂停的任务。
+
+**代码演示**：见 `pause`。
+
+**生产建议**：恢复后用 `state` 确认 `paused=false` 与 `next_fire` 已重算。
+
+---
+
+### `remove`
 
 ```php
 public function remove(string $id): bool
 ```
 
-**返回值**：`bool`，成功返回 `true`。
+**参数**：`$id`。
 
-**异常**：任务不存在或删除失败时抛 `TaskNotFoundException`。
+**返回值**：`bool`。成功返回 `true`。
+
+**错误契约**：底层 `xhjob_remove` 返回 `false` → 抛 `TaskNotFoundException('任务不存在或删除失败 (id=..., name=...)')`。
+
+**注意事项**：删除任务定义，不影响运行中实例；与 `stop`（cancel）的区别是 remove 彻底删除记录。
+
+**代码演示**
 
 ```php
+<?php
+use Xhjob\Exception\TaskNotFoundException;
+
 try {
     $mgr->remove($id);
 } catch (TaskNotFoundException $e) {
-    echo "任务已不存在\n";
+    // 任务已不存在，可忽略
 }
 ```
 
-### reschedule
+**生产建议**：定时清理已完成任务避免 SQLite 表膨胀；`update` 内部依赖此方法并容忍不存在。
 
-重新调度任务（修改 cron 表达式），等价于 `xhjob_reschedule`。
+---
+
+### `reschedule`
 
 ```php
 public function reschedule(string $id, string $cron): bool
 ```
 
+**参数**
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `$id` | `string` | 任务 ID |
-| `$cron` | `string` | 新的 cron 表达式 |
+| `$cron` | `string` | 新的 5 字段 cron 表达式 |
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：不抛异常；`false` 即失败（cron 非法 / 任务不存在 / 非 cron 任务）。
+
+**注意事项**：仅修改 cron 并重算 `next_fire`，不改其他配置。
+
+**代码演示**
 
 ```php
-$mgr->reschedule($id, '0 8 * * *'); // 改成每天 8 点
+<?php
+$mgr->reschedule($id, '*/15 * * * *');
 ```
+
+**生产建议**：动态调频用 `reschedule`，比 `update`（remove + 重建）更轻量且保留历史。
 
 ---
 
-## 四、编排状态
+## 编排状态（3）
 
-### chainState
+> daemon 不可达时抛 `ServiceNotRunningException`。
 
-查询任务链状态。
+### `chainState`
 
 ```php
 public function chainState(string $chainId): ?array
 ```
 
-**返回值**：`?array`。链不存在返回 `null`；成功返回 `ChainRecord` 关联数组（`{chain_id, tasks, current_step, state, created_at, updated_at}`）。
+**参数**：`$chainId`。
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`?array`。chain 存在时返回 `ChainRecord` 关联数组（`chain_id` / `tasks` / `current_step` / `state` / `created_at` / `updated_at`）；不存在返回 `null`。
+
+**错误契约**：底层返回 `null` / 空串 → 返回 `null`；返回 `error:` 前缀 → 抛 `ServiceNotRunningException('chainState 失败：<error> (chainId=..., name=...)')`。
+
+**代码演示**
 
 ```php
+<?php
 $rec = $mgr->chainState($chainId);
 if ($rec !== null) {
     echo "step={$rec['current_step']} state={$rec['state']}\n";
 }
 ```
 
-### groupState
+**生产建议**：`failed` 时按 `current_step` 定位失败步骤。
 
-查询任务组状态。
+---
+
+### `groupState`
 
 ```php
 public function groupState(string $groupId): ?array
 ```
 
-**返回值**：`?array`。组不存在返回 `null`；成功返回 `GroupRecord` 关联数组（`{group_id, tasks, state, created_at, updated_at}`）外加实时 `summary`（`{total, succeeded, failed, pending}`）。
+**参数**：`$groupId`。
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`?array`。group 存在时返回 `GroupRecord` 关联数组；不存在返回 `null`。
+
+**错误契约**：底层返回 `error:` 前缀 → 抛 `ServiceNotRunningException('groupState 失败：<error> (groupId=..., name=...)')`。
+
+**代码演示**
 
 ```php
+<?php
 $rec = $mgr->groupState($groupId);
-if ($rec !== null) {
-    print_r($rec['summary']);
-}
+echo $rec['state'] ?? 'unknown';
 ```
 
-### chordState
+**生产建议**：`partial_failed` 时遍历子任务 state 定位失败项。
 
-查询 chord 状态。
+---
+
+### `chordState`
 
 ```php
 public function chordState(string $chordId): ?array
 ```
 
-**返回值**：`?array`。chord 不存在返回 `null`；成功返回 `ChordRecord` 关联数组（`{id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at}`）。
+**参数**：`$chordId`。
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`?array`。chord 存在时返回 `ChordRecord` 关联数组（含 `id` / `header_task_ids` / `callback_json` / `callback_task_id` / `state` / `created_at` / `updated_at`）；不存在返回 `null`。
+
+**错误契约**：底层返回 `error:` 前缀 → 抛 `ServiceNotRunningException('chordState 失败：<error> (chordId=..., name=...)')`。
+
+**代码演示**
 
 ```php
+<?php
 $rec = $mgr->chordState($chordId);
-if ($rec !== null) {
-    echo "state={$rec['state']}\n";
-}
+echo $rec['state'] ?? 'unknown';
 ```
+
+**生产建议**：`partial_failed` 时检查 `header_task_ids` 中各 header 任务的 `last_error`。
 
 ---
 
-## 五、进度上报与事件拉取
+## 进度 / 事件（3）
 
-### reportProgress
-
-上报任务进度。参考 Celery `update_state(state='PROGRESS', meta=...)`。
+### `reportProgress`
 
 ```php
 public function reportProgress(string $id, int $percent, ?string $meta = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$percent` | `int` | — | 进度百分比 **0-100**，越界返回 `false` |
-| `$meta` | `?string` | `null` | 任意 JSON 元数据 |
+**参数**
 
-**返回值**：`bool`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$percent` | `int` | 进度百分比，**必须 0-100** |
+| `$meta` | `?string` | 任意 JSON 元数据 |
+
+**返回值**：`bool`。成功返回 `true`；`$percent` 越界（非 0-100）底层直接返回 `false`（不联系 daemon）。
+
+**错误契约**：不抛异常；`false` 即失败（含越界 / 服务名非法 / IPC 失败）。
+
+**注意事项**：参考 Celery `update_state(state='PROGRESS', meta=...)`；进度值可通过 `state()` 的 `progress` / `progress_meta` 字段读回。
+
+**代码演示**
 
 ```php
-$mgr->reportProgress($id, 50, json_encode(['step' => 'halfway']));
-$mgr->reportProgress($id, 100);                  // 完成
-var_dump($mgr->reportProgress($id, 150));        // false（越界）
+<?php
+$mgr->reportProgress($id, 50, json_encode(['chunk' => 5]));
 ```
 
-### pullEvents
+**生产建议**：进度上报按 5%-10% 步进，避免 IPC 压力；越界值被静默丢弃，调用方需自行校验。
 
-拉取任务事件，可按 `event_type` 过滤。
+---
+
+### `pullEvents`
 
 ```php
 public function pullEvents(int $sinceTs = 0, ?string $eventType = null): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$sinceTs` | `int` | `0` | 起始时间戳（Unix 秒），0 = 全部 |
-| `$eventType` | `?string` | `null` | 事件类型过滤（started/succeeded/failed/...） |
+**参数**
 
-**返回值**：`array`，事件数组。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$sinceTs` | `int` | 起始时间戳（Unix 秒），默认 0 = 全部 |
+| `$eventType` | `?string` | 事件类型过滤（`started` / `succeeded` / `failed` / ...） |
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**返回值**：`array`。事件数组（`json_decode` 结果，非法时返回 `[]`）。
+
+**错误契约**：底层 `xhjob_pull_events` 返回 `error:` 前缀 → 抛 `ServiceNotRunningException('pullEvents 失败：<error> (name=...)')`。
+
+**注意事项**：按 `event_type` 过滤全局事件流（与 `logs` 按 `task_id` 过滤不同）。
+
+**代码演示**
 
 ```php
-// 只看最近 1 小时的失败事件
-$failed = $mgr->pullEvents(time() - 3600, 'failed');
-foreach ($failed as $e) {
-    echo "{$e['task_id']} failed at {$e['ts']}\n";
+<?php
+$fails = $mgr->pullEvents(time() - 600, 'failed');
+foreach ($fails as $ev) {
+    // 推送告警
 }
 ```
 
-### inspect
+**生产建议**：告警网关按 `eventType=failed` 定时拉取，配合 `sinceTs` 增量消费。
 
-聚合检查 daemon 状态。参考 Celery `inspect active / registered / scheduled / stats`。
+---
+
+### `inspect`
 
 ```php
 public function inspect(string $mode = 'stats'): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$mode` | `string` | `'stats'` | 查询模式：active / registered / scheduled / stats |
+**参数**
 
-**`$mode` 取值**：
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$mode` | `string` | 查询模式：`active` / `registered` / `scheduled` / `stats`（默认） |
 
-| 模式 | 含义 |
-| --- | --- |
-| `active` | 当前运行中的任务 |
-| `registered` | cron / interval 注册任务 |
-| `scheduled` | 有未来 `next_fire` 的任务 |
-| `stats` | 聚合 WorkerStats（默认） |
+**返回值**：`array`。`active`/`registered`/`scheduled` 返回数组，`stats` 返回对象（`json_decode` 结果，非法时返回 `[]`）。
 
-**返回值**：`array`。
+**错误契约**：底层 `xhjob_inspect` 返回 `error:` 前缀 → 抛 `ServiceNotRunningException('inspect 失败：<error> (mode=..., name=...)')`。
 
-**异常**：daemon 不可达时抛 `ServiceNotRunningException`。
+**注意事项**：`active` 当前运行任务；`registered` cron/interval 任务；`scheduled` 有未来 `next_fire` 的任务；`stats` 聚合 `WorkerStats`。
+
+**代码演示**
 
 ```php
-$running = $mgr->inspect('active');
-$stats   = $mgr->inspect('stats');          // 默认模式
-echo "running tasks: " . count($running) . "\n";
+<?php
+$stats = $mgr->inspect('stats');
+print_r($stats);
 ```
+
+**生产建议**：监控面板用 `stats` 看全局负载，`active` 看实时并发，`scheduled` 预判未来调度压力。
 
 ---
 
-## 六、轮询等待
+## 轮询等待（2）
 
-### waitForState
-
-轮询等待任务进入期望状态。
+### `waitForState`
 
 ```php
 public function waitForState(string $id, string $expectedState, int $timeoutSec = 30): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$expectedState` | `string` | — | 期望状态（pending/running/success/...） |
-| `$timeoutSec` | `int` | `30` | 超时秒数 |
+**参数**
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$expectedState` | `string` | 期望状态（如 `success` / `running`） |
+| `$timeoutSec` | `int` | 超时秒数，默认 30 |
 
 **返回值**：`bool`。在超时前进入期望状态返回 `true`；超时或进入非期望终态返回 `false`。
 
-**注意事项**：
-- 轮询间隔 300ms；`state()` 临时错误（如 daemon 重启中）时退避 500ms 继续轮询。
-- **终态**：`success` / `failed` / `cancelled` / `expired` / `interrupted`。一旦进入终态且非期望，立即返回 `false`，不再等待。
+**错误契约**：不抛异常。轮询期间 `state()` 抛异常（如 daemon 重启中）会被捕获，`usleep(500000)` 后继续轮询。
+
+**注意事项**
+- 终态集合：`failed` / `cancelled` / `expired` / `interrupted` / `success`。**进入终态且非期望时提前返回 `false`**，不再继续轮询。
+- 重试间隔 500ms（`usleep(500000)`，临时错误时）与 300ms（正常轮询时）。
+
+**代码演示**
 
 ```php
+<?php
 if ($mgr->waitForState($id, 'success', 60)) {
-    echo "任务成功完成\n";
+    echo "任务成功\n";
 } else {
-    echo "超时或进入非成功终态\n";
+    echo "任务未在 60s 内成功（失败 / 取消 / 超时）\n";
 }
 ```
 
-### waitForResult
+**生产建议**：派发后用 `waitForState` 同步等结果；超时阈值按业务 SLA 设置，避免长时阻塞。
 
-轮询等待任务结果。仅在任务进入终态后返回结果数组，超时返回 `null`。
+---
+
+### `waitForResult`
 
 ```php
 public function waitForResult(string $id, int $timeoutSec = 30): ?array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$timeoutSec` | `int` | `30` | 超时秒数 |
+**参数**
 
-**返回值**：`?array`。进入终态（`success` / `failed` / `cancelled` / `expired` / `interrupted`）后返回 `result()` 结果；超时返回 `null`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$timeoutSec` | `int` | 超时秒数，默认 30 |
+
+**返回值**：`?array`。任务进入终态后返回 `result()` 结果数组；超时返回 `null`。
+
+**错误契约**：不抛异常。轮询期间 `state()` 抛异常会被捕获继续轮询；终态后调 `result()` 若抛 `ServiceNotRunningException` 会向上传播（终态判定与结果读取间的瞬态窗口）。
+
+**注意事项**
+- 终态集合：`success` / `failed` / `cancelled` / `expired` / `interrupted`。
+- 进入终态后调用 `result()`；若结果不存在（`ignoreResult=true`）则返回带 `error` 键的数组（非 `null`）。
+
+**代码演示**
 
 ```php
+<?php
 $r = $mgr->waitForResult($id, 120);
 if ($r === null) {
-    echo "等待结果超时\n";
+    echo "超时未完成\n";
+} elseif (isset($r['error'])) {
+    echo "无结果：{$r['error']}\n";
 } else {
-    echo "exit_code={$r['exit_code']}\n{$r['stdout']}";
+    echo "exit_code=" . ($r['exit_code'] ?? '-') . "\n";
+    echo $r['stdout'] ?? '';
 }
 ```
+
+**生产建议**：同步业务流程用 `waitForResult`；异步通知场景不要阻塞，改用 `pullEvents` 事件驱动。
 
 ---
 
 ## 完整示例
 
-### 创建并等待结果
-
 ```php
+<?php
 use Xhjob\TaskManager;
 use Xhjob\TaskBuilder;
+use Xhjob\Exception\InvalidTaskConfigException;
+use Xhjob\Exception\ServiceNotRunningException;
 
-$mgr = new TaskManager('default', '/var/lib/xhjob');
+$mgr = new TaskManager('cron-svc', '/var/lib/xhjob');
 
-// 创建一次性 shell 任务
-$id = $mgr->create(
-    TaskBuilder::shell('echo hello && sleep 2')
-        ->timeout(30)
-        ->withRetry(1, 2)
-);
+// 1. 创建并等待结果
+try {
+    $id = $mgr->create(
+        TaskBuilder::shell('process-order.sh')
+            ->withRetry(3, 5)
+            ->timeout(120)
+            ->withMeta(json_encode(['order_id' => 42]))
+    );
 
-// 等待成功（最多 30 秒）
-if ($mgr->waitForState($id, 'success', 30)) {
-    $r = $mgr->result($id);
-    echo "stdout: {$r['stdout']}";
-}
-```
-
-### 进度上报 + 轮询
-
-```php
-// 业务侧任务执行中上报进度（任务 ID 通常由派发方注入）
-$mgr->reportProgress($id, 25, json_encode(['phase' => 'init']));
-$mgr->reportProgress($id, 50, json_encode(['phase' => 'processing']));
-$mgr->reportProgress($id, 75, json_encode(['phase' => 'finalizing']));
-$mgr->reportProgress($id, 100);
-
-// 另一进程轮询进度
-while (!$mgr->waitForState($id, 'success', 5)) {
-    $s = $mgr->state($id);
-    echo "progress={$s['progress']}%\n";
-    if ($s['state'] === 'failed') {
-        break;
+    $result = $mgr->waitForResult($id, 180);
+    if ($result === null) {
+        throw new RuntimeException("订单处理超时 (id=$id)");
     }
-}
-```
-
-### 任务组并行 + 状态汇总
-
-```php
-$groupId = $mgr->createGroup([
-    TaskBuilder::http('GET', 'https://a.test')->timeout(10),
-    TaskBuilder::http('GET', 'https://b.test')->timeout(10),
-    TaskBuilder::http('GET', 'https://c.test')->timeout(10),
-]);
-
-// 轮询组状态直到完成
-while (true) {
-    $rec = $mgr->groupState($groupId);
-    $sum = $rec['summary'];
-    echo "total={$sum['total']} done={$sum['succeeded']} failed={$sum['failed']}\n";
-    if ($sum['pending'] == 0) {
-        break;
+    if (($result['exit_code'] ?? 1) !== 0) {
+        throw new RuntimeException("订单处理失败: " . ($result['stderr'] ?? ''));
     }
-    usleep(500000);
+} catch (InvalidTaskConfigException $e) {
+    throw new RuntimeException('派发失败：' . $e->getMessage());
 }
-echo "group state: {$rec['state']}\n";
-```
 
-### Chord 聚合回调
+// 2. 批量失败任务重试
+try {
+    $failed = $mgr->list('failed');
+    foreach ($failed as $t) {
+        $mgr->restart($t['id']);
+    }
+} catch (ServiceNotRunningException $e) {
+    error_log('daemon 不可达：' . $e->getMessage());
+}
 
-```php
-$chordId = $mgr->createChord(
-    [
-        TaskBuilder::http('GET', 'https://a.test/1'),
-        TaskBuilder::http('GET', 'https://a.test/2'),
-    ],
-    TaskBuilder::shell('process-aggregate.sh')  // callback.meta 携带 header 结果
-);
+// 3. 更新现有任务的 cron
+$mgr->update('nightly-report', TaskBuilder::shell('report.sh')->cron('0 4 * * *'));
 
-// 等待 chord 完成
-$mgr->waitForState($chordId, 'success', 120);
-$rec = $mgr->chordState($chordId);
-echo "callback_task_id={$rec['callback_task_id']}\n";
-```
-
-### 在线修改任务
-
-```php
-// 修改 cron + 优先级
-$mgr->update($id, TaskBuilder::shell('new-cmd')->cron('0 4 * * *')->priority(10));
-// 或仅改 cron
-$mgr->reschedule($id, '0 6 * * *');
+// 4. 监控 daemon 并发
+$stats = $mgr->inspect('stats');
+$active = $mgr->inspect('active');
+echo "active=" . count($active) . "\n";
 ```

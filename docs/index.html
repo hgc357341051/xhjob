@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xhjob · PHP 异步任务调度扩展</title>
+  <meta name="description" content="Rust + ext-php-rs 实现的 PHP 异步任务调度扩展使用文档">
+  <link rel="icon" href="assets/img/logo.svg" type="image/svg+xml">
+  <!-- docsify 主题（vue）-->
+  <link rel="stylesheet" href="//cdn.jsdelivr.net/npm/docsify@4/themes/vue.css">
+  <!-- 自定义主题样式 -->
+  <link rel="stylesheet" href="assets/css/custom.css">
+</head>
+<body>
+  <div id="app">加载中...</div>
+
+  <!-- 主题切换按钮（右上角固定）-->
+  <div id="theme-toggle" class="theme-toggle" title="切换主题">
+    <button data-theme-mode="light" title="亮色">☀️</button>
+    <button data-theme-mode="dark" title="暗色">🌙</button>
+    <button data-theme-mode="auto" title="跟随系统">🖥️</button>
+  </div>
+
+  <!-- 移动端汉堡菜单按钮 -->
+  <button id="sidebar-toggle" class="sidebar-toggle" aria-label="切换导航">☰</button>
+
+  <script>
+    window.$docsify = {
+      name: 'Xhjob',
+      logo: 'assets/img/logo.svg',
+      repo: 'https://github.com/hgc357341051/xhjob',
+      themeColor: '#3B82F6',
+      loadSidebar: true,
+      coverpage: true,
+      auto2top: true,
+      subMaxLevel: 3,
+      maxLevel: 4,
+      search: {
+        placeholder: '搜索文档...',
+        noData: '没有找到结果',
+        depth: 3,
+        maxAge: 86400000
+      },
+      copyCode: {
+        buttonText: '复制',
+        errorText: '复制失败',
+        successText: '已复制'
+      },
+      plugins: []
+    };
+  </script>
+
+  <!-- docsify 核心 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify@4/lib/docsify.min.js"></script>
+  <!-- 全文搜索插件 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify@4/lib/plugins/search.min.js"></script>
+  <!-- emoji 插件 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify@4/lib/plugins/emoji.min.js"></script>
+  <!-- 代码复制按钮插件 -->
+  <script src="//cdn.jsdelivr.net/npm/docsify-copy-code@2/dist/docsify-copy-code.min.js"></script>
+  <!-- prism 代码高亮：PHP / Rust / Bash / JSON -->
+  <script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-php.min.js"></script>
+  <script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-rust.min.js"></script>
+  <script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-bash.min.js"></script>
+  <script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-json.min.js"></script>
+
+  <!-- 主题切换逻辑 -->
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var btns = document.querySelectorAll('#theme-toggle button');
+      var KEY = 'xhjob-docs-theme';
+
+      function apply(mode) {
+        if (mode === 'auto') {
+          var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          root.setAttribute('data-theme', dark ? 'dark' : 'light');
+        } else {
+          root.setAttribute('data-theme', mode);
+        }
+        btns.forEach(function (b) {
+          b.classList.toggle('active', b.getAttribute('data-theme-mode') === mode);
+        });
+      }
+
+      var saved = localStorage.getItem(KEY) || 'auto';
+      apply(saved);
+
+      btns.forEach(function (b) {
+        b.addEventListener('click', function () {
+          var mode = b.getAttribute('data-theme-mode');
+          localStorage.setItem(KEY, mode);
+          apply(mode);
+        });
+      });
+
+      // 跟随系统变化时实时切换
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+        if (localStorage.getItem(KEY) === 'auto' || !localStorage.getItem(KEY)) apply('auto');
+      });
+
+      // 移动端侧边栏切换
+      var toggle = document.getElementById('sidebar-toggle');
+      if (toggle) {
+        toggle.addEventListener('click', function () {
+          document.body.classList.toggle('sidebar-open');
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

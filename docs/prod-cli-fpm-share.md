@@ -1,348 +1,385 @@
+# CLI 与 FPM 共用服务连接
+
+> 生产实战篇 · 同一 daemon 多客户端接入 · 路径解析优先级 · 多服务隔离 · PID 复用防护 · IPC 超时兜底
+
+Xhjob 的 daemon 是一个独立的 Rust 长驻进程，PHP 侧无论是 CLI 还是 FPM 都只是 IPC 客户端。只要 CLI 与 FPM 指向**同一个 service_name + data_dir**，它们就会连到同一个 Unix socket、同一个 daemon、同一份 SQLite DB，从而实现「FPM 请求派发任务、CLI 查询状态 / 运维操作」的协作模式。本文档说明共用原理、路径解析、多服务隔离、PID 复用防护与 IPC 超时兜底。
+
+本文档按 **架构说明 → 完整可运行代码 → 注意事项 → 生产建议** 的结构展开。
+
 ---
-title: 生产实战：CLI 与 FPM 共用服务连接
-parent: 生产实战
-nav_order: 53
+
+## 架构说明
+
+### 共用原理
+
+```
+                    ┌─────────────────┐
+                    │   FPM worker    │
+                    │  (Web 请求)     │
+                    └────────┬────────┘
+                             │ dispatch / state / result
+                             │ (IPC 客户端)
+                             ▼
+   service_name=default      ┌──────────────────────┐      service_name=billing
+   data_dir=/var/lib/xhjob   │   Unix socket        │      data_dir=/var/lib/xhjob
+   ┌──────────────────┐      │   /run/xhjob/        │      ┌──────────────────┐
+   │   CLI 运维脚本   │ ═══► │   default.sock       │ ◄═══ │   CLI worker     │
+   │  (cron-ops.php)  │      │                      │      │  (result-worker) │
+   └──────────────────┘      │   ┌──────────────┐   │      └──────────────────┘
+                             │   │  daemon      │   │
+                             │   │  (Rust, 单例)│   │
+                             │   │  pid=default │   │
+                             │   └──────┬───────┘   │
+                             │          │           │
+                             │   ┌──────▼───────┐   │
+                             │   │ SQLite DB    │   │
+                             │   │ default.db   │   │
+                             │   └──────────────┘   │
+                             └──────────────────────┘
+```
+
+核心要点：
+
+- **daemon 是独立进程**：不是 FPM 的子进程，也不是 CLI 的子进程。它由 `xhjob_start` 通过 spawn + re-exec 拉起后脱离调用方，独立常驻。
+- **CLI 与 FPM 都是 IPC 客户端**：两者通过同一个 Unix socket 连同一个 daemon，调用同一套 `xhjob_*` 函数。daemon 不区分请求来自 CLI 还是 FPM。
+- **同一 service_name + data_dir → 同一 socket / pid / db**：这是「共用」的唯一前提。socket 文件名为 `<name>.sock`，PID 文件 `<name>.pid`，DB 文件 `<name>.db`，都由 service_name 命名空间化。
+
+### 启动 daemon 的两种方式
+
+| 方式 | 触发者 | 适用场景 | 推荐度 |
+|------|--------|----------|--------|
+| **CLI `xhjob_start` 长驻** | systemd unit / 部署脚本调用 `xhjob_start($name, $dataDir)` | 生产环境常驻 | ⭐ 推荐 |
+| **FPM 请求内 `ensureRunning` 拉起** | FPM worker 首次派发前惰性调用 `XhjobService::ensureRunning()` | 开发 / 测试 / 无 systemd 环境 | 不推荐生产 |
+
+`xhjob_start` 以 spawn + re-exec 方式拉起独立守护进程，调用方（FPM / CLI 短生命周期进程）会**立即返回**，不会阻塞。若 daemon 已在运行（PID 存活且 starttime 匹配），直接返回 `true`，不重复启动。
+
+> 生产环境**强烈建议**用 systemd 托管 daemon（方式一），FPM 请求只做 IPC 客户端。FPM 请求内 `ensureRunning` 拉起在 daemon 死锁时会让 FPM worker 阻塞在 spawn 上，且无法保证 daemon 随机器启动。
+
+### 路径解析优先级
+
+daemon 的 socket / pid / log / db 文件位置由「显式 data_dir 参数 → 环境变量 → 平台默认」三级解析。**注意 sock_dir 与 pid/log/db 的 fallback 链不同**：
+
+| 目录 | 解析优先级（从高到低） |
+|------|----------------------|
+| sock_dir | 显式 `data_dir` 参数 → `XHJOB_SOCK_DIR` → `XHJOB_DATA_DIR` → `/run/xhjob`（若 /run 存在）→ `/var/run/xhjob`（若 /var/run 存在）→ `/tmp`（兜底） |
+| pid_dir | 显式 `data_dir` 参数 → `XHJOB_PID_DIR` → `XHJOB_DATA_DIR` → `/tmp`（**不走 /run 链**） |
+| log_dir | 显式 `data_dir` 参数 → `XHJOB_LOG_DIR` → `XHJOB_DATA_DIR` → `/tmp`（**不走 /run 链**） |
+| db_dir | 显式 `data_dir` 参数 → `XHJOB_DB_DIR` → `XHJOB_DATA_DIR` → `/tmp`（**不走 /run 链**） |
+
+> 关键差异：仅 sock_dir 走 `/run` → `/var/run` → `/tmp` 三级链；pid / log / db 找不到时只 fallback 到 `/tmp`。生产环境应**显式设置各分项目录**避免歧义。
+
+### 多服务隔离
+
+不同的 `service_name` 完全独立：各自有独立的 daemon 进程、独立的 socket / pid / db 文件。服务名决定文件命名空间（`<name>.sock` / `<name>.pid` / `<name>.log` / `<name>.db`），互不干扰。
+
+```
+service_name=cron-svc    → cron-svc.sock / cron-svc.pid / cron-svc.db   (daemon A)
+service_name=billing     → billing.sock    / billing.pid    / billing.db (daemon B)
+service_name=report      → report.sock     / report.pid     / report.db  (daemon C)
+```
+
+服务名校验规则：`^[a-zA-Z][a-zA-Z0-9_-]{0,31}$`（首字符字母，长度 1-32，含字母 / 数字 / 下划线 / 连字符）。非法值**静默回退到 `default`**，不报错。
+
 ---
 
-# 生产实战：CLI 与 FPM 共用服务连接
+## 完整可运行代码
 
-本篇解答一个在生产部署中最常见的问题：**Web 请求（PHP-FPM）和命令行脚本（CLI）如何连到同一个 xhjob daemon？** 答案是——只要二者使用相同的 `service_name` + `data_dir`，就会解析到同一组 socket / pid / db / log 文件，从而连到同一个 daemon 进程。daemon 本身是一个**独立的 Rust 进程**（Unix 下 double-fork + setsid 脱离父进程），CLI 和 FPM 都只是它的 **IPC 客户端**。
-
-## 共用原理
-
-```
-                    ┌──────────────────────────────────────────────────┐
-                    │  独立 Rust daemon 进程（double-fork + setsid）    │
-                    │  service_name='app-svc'  data_dir='/var/lib/xhjob'│
-                    │  ┌────────────┐  ┌────────────┐  ┌────────────┐  │
-                    │  │ scheduler  │  │ executor   │  │ store      │  │
-                    │  │ (cron/...) │  │ (pool)     │  │ (SQLite)   │  │
-                    │  └─────┬──────┘  └────────────┘  └────────────┘  │
-                    │        │                                         │
-                    │  ┌─────▼──────────────────────────┐              │
-                    │  │ IPC listener                   │              │
-                    │  │ /var/lib/xhjob/xhjob.app-svc.sock              │
-                    │  └─────▲──────────────────────────┘              │
-                    └────────┼─────────────────────────────────────────┘
-                             │ Unix domain socket（短连接，length-prefixed JSON）
-            ┌────────────────┼────────────────┐
-            │                │                │
-   ① FPM 请求（dispatch）  ② CLI 查状态      ③ CLI worker（轮询 result）
-   xhjob_dispatch(...)      xhjob_state(...)  xhjob_result(...)
-   同名 + 同 data_dir        同名 + 同 data_dir 同名 + 同 data_dir
-```
-
-关键事实：
-
-- daemon 是**独立进程**，不依附于拉起它的 PHP 进程。即使拉起它的 FPM 请求 / CLI 脚本退出，daemon 仍继续运行。
-- 所有 `xhjob_*` PHP 函数（`dispatch` / `state` / `result` / `start` / `stop` …）都是 **IPC 客户端**：通过 Unix domain socket（Windows 为 Named Pipe）向 daemon 发一次短连接请求。
-- 客户端解析 socket 路径的依据**只有两个**：`service_name` 与 `data_dir`。CLI 和 FPM 传入相同的值，就会解析到同一个 socket 文件，连到同一个 daemon。
-
-源码依据（`src/ipc/mod.rs`）：
-
-```rust
-/// Unix: `<dir>/xhjob.{name}.sock`
-/// Windows: `\\.\pipe\xhjob-{name}`（data_dir 在 Windows 上被忽略）
-pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String { ... }
-```
-
-## daemon 是独立进程：double-fork + setsid
-
-daemon 不是 PHP 进程内的线程，而是一个**全新拉起的 PHP 子进程**（重新 re-exec 当前 PHP binary），其内部通过扩展启动钩子直接进入 `daemon_main()`。这样做的核心原因：PHP 进程可能已初始化 tokio runtime（来自此前的 `xhjob_dispatch` / `xhjob_state` 调用），而 tokio runtime 状态**不是 fork-safe** 的，所以不能在进程内 `fork + setsid`。
-
-启动流程（`src/daemon/unix.rs::spawn_via_double_fork`）：
-
-1. 定位当前 PHP binary（`current_exe` → `$_` → PATH `php`）。
-2. 构造 `-r` 代码字符串：`xhjob_run_daemon('<service_name>', '<data_dir>');`。**service_name 与 data_dir 通过命令行参数传递**，不依赖 env var——因为某些 PHP SAPI / 版本管理器（如 phpenv）shim 在 re-exec 时会清理 `Command::env()` 注入的环境变量，命令行参数则会被保留。
-3. 通过 `pre_exec` 钩子调用 `setsid()`，使子进程成为新会话组长，脱离任何 tty。
-4. 子进程以 `-d extension=xhjob.so -r <code>` 启动，扩展启动时检测到 `XHJOB_DAEMON_MODE=1`，直接调用 `daemon_main()`，并写入 PID 文件（双行格式，见下文）。
-
-```rust
-// 关键：service_name + data_dir 编码进 -r 命令行参数，跨 re-exec 存活
-let code = format!("xhjob_run_daemon('{}', '{}');", escaped_name, escaped_dir);
-let mut cmd = Command::new(&exe);
-cmd.arg("-d").arg("extension=xhjob.so");
-cmd.arg("-r").arg(&code);
-cmd.env("XHJOB_DAEMON_MODE", "1");          // env 仅作向后兼容兜底
-unsafe {
-    cmd.pre_exec(|| { /* setsid() 脱离 tty */ });
-}
-let _child = cmd.spawn()?;
-```
-
-> 这就是为什么 `xhjob_server.php` 启动 daemon 后可以 `exit(0)` 而 daemon 依然存活——daemon 是 detached grandchild，与启动它的 PHP 进程已无父子关系。
-
-## 启动 daemon 的两种方式
-
-### 方式一：CLI 长驻启动（推荐生产用法）
-
-用一个独立 CLI 脚本 / systemd unit 启动 daemon，FPM 与 CLI 都只做客户端调用。这是**最干净的生产拓扑**：daemon 生命周期与 Web 流量解耦，FPM 重启不影响 daemon。
-
-```php
-<?php
-// === /opt/xhjob/bin/start-daemon.php ===
-// 由 systemd 调用：php /opt/xhjob/bin/start-daemon.php
-use Xhjob\XhjobService;
-
-$svc = new XhjobService('app-svc', '/var/lib/xhjob');
-$svc->ensureRunning();          // 幂等：已运行则直接返回
-$status = $svc->status();
-echo "daemon ready, pid={$status['pid']}\n";
-```
-
-`XhjobService::ensureRunning()` 内部先查 `status()`，未运行才 `start()`；`start()` 调 `xhjob_start` 后轮询等待 daemon 真正进入 running 状态（含 IPC socket 就绪），再返回 PID。
-
-### 方式二：FPM 请求内拉起（首次访问自举）
-
-FPM 请求内调用 `ensureRunning()`，若 daemon 未运行则由 FPM worker 拉起。daemon 拉起后即脱离 FPM，FPM 请求可继续派发任务。适用于不想单独维护 daemon 启动入口的小型部署。
-
-```php
-<?php
-// === FPM 请求内 ===
-use Xhjob\XhjobService;
-use Xhjob\TaskBuilder;
-
-$svc = new XhjobService('app-svc', '/var/lib/xhjob');
-$svc->ensureRunning();          // 未运行则拉起，已运行则跳过
-
-$taskId = TaskBuilder::shell('php /app/jobs/process.php ' . escapeshellarg($payload))
-    ->timeout(300)
-    ->dispatch('app-svc', '/var/lib/xhjob');   // 客户端 IPC，立即返回 task_id
-```
-
-> 方式二的风险：FPM worker 拉起 daemon 会增加首次请求延迟（百毫秒级），且若 FPM 被批量重启，多个 worker 可能并发尝试拉起同一 daemon。`daemon::start` 内部用 PID 文件 + `DaemonAlreadyRunning` 做互斥，但仍建议生产用方式一。
-
-### 跨进程模式：`xhjob_server.php`
-
-仓库提供的 `tp/xhjob_server.php` 演示了**跨进程**启动：脚本启动 daemon → 等待健康检查 → 打印 `READY` → `exit(0)`，daemon 必须在脚本退出后仍独立运行。这是验证 daemon 独立性的最小用例。
-
-```bash
-# 启动（脚本退出后 daemon 仍运行）
-php -d extension=xhjob.so tp/xhjob_server.php --service=app-svc --data-dir=/var/lib/xhjob
-# 输出：READY pid=12345 service=app-svc data_dir=/var/lib/xhjob
-
-# 另一个进程查状态（连到同一个 daemon）
-php -d extension=xhjob.so tp/xhjob_server.php --service=app-svc --data-dir=/var/lib/xhjob --status
-
-# 停止
-php -d extension=xhjob.so tp/xhjob_server.php --service=app-svc --data-dir=/var/lib/xhjob --stop
-```
-
-## 路径解析优先级
-
-CLI 与 FPM 要连同一个 daemon，**必须解析到同一个 socket 文件**。socket / pid / db / log 文件的目录按以下优先级解析（从高到低）：
-
-| 优先级 | 来源 | 适用文件 | 说明 |
-|--------|------|---------|------|
-| 1 | 显式参数 | 全部 | `xhjob_*($name, $dataDir)` 或 `new XhjobService($name, $dataDir)` 传入的 `data_dir` |
-| 2 | 细分 env（Unix） | sock / pid / log | `XHJOB_SOCK_DIR` / `XHJOB_PID_DIR` / `XHJOB_LOG_DIR`，分别覆盖对应文件类型 |
-| 3 | `XHJOB_DATA_DIR` | 全部 | 统一数据目录，设置后所有运行时文件置于其下 |
-| 4 | 平台默认 | 全部 | Unix：`/run/xhjob` > `/var/run/xhjob` > `/tmp`；Windows：`%TEMP%` |
-
-源码依据（`src/ipc/mod.rs::ipc_path` 与 `src/daemon/mod.rs::resolve_dir_path`）：
-
-```rust
-// ipc_path 的目录解析顺序
-let dir = if let Some(d) = data_dir { ... }            // ① 显式参数
-          else if let Ok(d) = env::var("XHJOB_SOCK_DIR") { ... }  // ② 细分 env
-          else if let Ok(d) = env::var("XHJOB_DATA_DIR") { ... }  // ③ 统一 env
-          else { fallback_sock_dir() };                // ④ 平台默认
-
-// fallback_sock_dir：/run/xhjob > /var/run/xhjob > /tmp
-if Path::new("/run").exists() { "/run/xhjob" }
-else if Path::new("/var/run").exists() { "/var/run/xhjob" }
-else { "/tmp" }
-```
-
-文件命名规则：
-
-| 文件 | Unix 路径 | Windows 路径 |
-|------|----------|-------------|
-| IPC socket | `<dir>/xhjob.<name>.sock` | `\\.\pipe\xhjob-<name>` |
-| PID 文件 | `<dir>/xhjob.<name>.pid` | `%TEMP%\xhjob.<name>.pid` |
-| 日志文件 | `<dir>/xhjob.<name>.log` | `%TEMP%\xhjob.<name>.log` |
-| SQLite DB | `<dir>/xhjob.<name>.db` | `%TEMP%\xhjob.<name>.db` |
-
-> **`/run/xhjob` 与 `/var/run/xhjob` 在创建时设为 `0o700` 权限**，防止 symlink 攻击与同名占位。`/tmp` 是全局可写且带 sticky bit，存在 symlink / 名称占位风险，仅作最后兜底。**生产环境务必显式指定 `data_dir`，不要落到 `/tmp`。**
-
-## 多服务隔离
-
-不同 `service_name` 完全独立——每个服务名对应独立的 daemon 进程、独立的 socket / pid / db / log 文件。同一台机器可同时运行多个互不干扰的 daemon。
-
-服务名校验规则（`src/service/mod.rs::validate`）：`^[a-zA-Z][a-zA-Z0-9_-]{0,31}$`——字母开头，仅含字母 / 数字 / 下划线 / 短横线，最长 32 字符。
-
-```php
-<?php
-// 两个独立服务：业务队列与定时任务互不干扰
-$queueSvc = new XhjobService('queue-svc', '/var/lib/xhjob');
-$cronSvc  = new XhjobService('cron-svc',  '/var/lib/xhjob');
-
-$queueSvc->ensureRunning();      // queue-svc daemon
-$cronSvc->ensureRunning();       // cron-svc daemon（独立进程、独立 DB）
-
-// 派发到各自的服务
-TaskBuilder::shell('php /app/jobs/process.php')->dispatch('queue-svc', '/var/lib/xhjob');
-TaskBuilder::shell('php /app/jobs/report.php')->cron('0 9 * * *')->dispatch('cron-svc', '/var/lib/xhjob');
-```
-
-对应的运行时文件：
-
-| 服务 | socket | pid | db |
-|------|--------|-----|-----|
-| `queue-svc` | `/var/lib/xhjob/xhjob.queue-svc.sock` | `xhjob.queue-svc.pid` | `xhjob.queue-svc.db` |
-| `cron-svc` | `/var/lib/xhjob/xhjob.cron-svc.sock` | `xhjob.cron-svc.pid` | `xhjob.cron-svc.db` |
-
-## PID 文件双行格式：防 PID 复用
-
-daemon 启动时写 PID 文件，采用**双行格式**：第一行 PID，第二行 starttime（Linux `/proc/<pid>/stat` 第 22 字段，单位 clock ticks）。
-
-```
-12345
-4567890
-```
-
-读取 PID 文件时（`src/daemon/mod.rs::read_pid`）：
-
-1. 解析第一行 PID，第二行 starttime（可选，兼容旧版单行格式）。
-2. 用 `is_process_alive_with_starttime(pid, starttime)` 校验：`kill(pid, 0)` 探活 **且** starttime 匹配。
-3. 若 PID 已死，或 PID 被复用但 starttime 不匹配 → 判定为 stale，删除 PID 文件并返回 `None`。
-
-```rust
-pub fn write_pid(pid: u32, starttime: Option<u64>, ...) -> Result<()> {
-    let content = match starttime {
-        Some(st) => format!("{}\n{}", pid, st),   // 新格式：pid + starttime
-        None => pid.to_string(),                  // 旧格式：仅 pid（向后兼容）
-    };
-    std::fs::write(&path, content)?;
-}
-```
-
-**为什么需要 starttime**：PID 是会复用的。daemon 退出后，OS 可能把它的 PID 分配给一个完全无关的新进程。若只看 PID 探活，会把"无关进程"误判为"daemon 还在运行"，导致后续 `stop` 误杀无辜进程（root 下尤其灾难性）。加上 starttime 双校验后，只有"PID 存活 **且** starttime 与记录一致"才认为是同一个 daemon。
-
-`stop` 路径的 SIGKILL 升级也依赖 starttime：仅当 PID 文件是双行格式（`starttime = Some`）时，SIGTERM 超时后才允许升级 SIGKILL；旧版单行格式（`starttime = None`）则**拒绝 SIGKILL**（fail-SAFE），避免杀到被复用的无关 PID。
-
-## IPC 超时：防 FPM worker 永久阻塞
-
-所有从 PHP-FPM 入口发起的 IPC 调用都包裹在 `tokio::time::timeout` 中，超时由 `XHJOB_IPC_TIMEOUT_SECS` 控制（默认 5s）。
-
-```rust
-// src/lib.rs::ipc_request —— 所有 FPM 入口的路由都走这里
-async fn ipc_request(op: &str, payload: Value, service_name: &str, data_dir: Option<&str>) -> Result<Response> {
-    let timeout_secs = ipc::default_ipc_timeout_secs();   // 默认 5s
-    match tokio::time::timeout(Duration::from_secs(timeout_secs),
-                                ipc::request(op, payload, service_name, data_dir)).await {
-        Ok(inner) => inner,
-        Err(_) => Err(XhjobError::ipc(format!("request timeout ({}s) for op={}", timeout_secs, op))),
-    }
-}
-```
-
-**为什么必须超时**：`max_execution_time` **不会中断 C 级阻塞调用**。若 daemon 已 accept 连接但随后死锁 / 被 SIGSTOP / 在 accept 后崩溃，PHP 端会阻塞在 `read_exact` 上 indefinitely，FPM worker 被一个个钉死，直到 worker 池耗尽、站点 502/504 且无法自愈。IPC 超时把这次等待限定在 5s 内，让 FPM worker fail-fast 返回错误给 PHP。
-
-```bash
-# 调小超时（高并发场景，希望更快 fail-fast）
-export XHJOB_IPC_TIMEOUT_SECS=2
-
-# 调大超时（仅当确实有长 IPC 操作，如大批量 list）
-export XHJOB_IPC_TIMEOUT_SECS=15
-```
-
-> 5s 对任何本地 IPC 操作（SQLite 写 / cron 扫描 / dispatch）都足够。调小可加速 daemon 故障时的 fail-fast，调大需谨慎——它直接决定单个 FPM worker 在 daemon 异常时被占用多久。
-
-## 完整端到端示例：systemd + FPM + CLI
-
-### ① systemd 启 daemon
+### 1. systemd 托管 daemon（生产推荐）
 
 ```ini
-# /etc/systemd/system/xhjob-app.service
+# /etc/systemd/system/xhjob-daemon.service
 [Unit]
-Description=xhjob daemon (app-svc)
+Description=Xhjob task queue daemon (default service)
 After=network.target
 
 [Service]
-Type=oneshot
-# daemon 自身是 double-fork 的独立进程，systemd 只负责"拉起并确认就绪"
-RemainAfterExit=yes
+Type=forking
+# daemon 通过 xhjob_start 拉起后写 PID 文件，systemd 据此跟踪
+PIDFile=/run/xhjob/default.pid
+
+# 显式设置各路径，避免 fallback 歧义
+Environment=XHJOB_SERVICE_NAME=default
 Environment=XHJOB_DATA_DIR=/var/lib/xhjob
-Environment=XHJOB_PERSIST=1
+Environment=XHJOB_SOCK_DIR=/run/xhjob
+Environment=XHJOB_PID_DIR=/run/xhjob
+Environment=XHJOB_LOG_DIR=/var/log/xhjob
+Environment=XHJOB_DB_DIR=/var/lib/xhjob
+Environment=XHJOB_PERSIST=true
 Environment=XHJOB_POOL_MODE=async
-Environment=XHJOB_IPC_TIMEOUT_SECS=5
-ExecStart=/usr/bin/php -d extension=xhjob.so /opt/xhjob/bin/start-daemon.php
-ExecStop=/usr/bin/php -d extension=xhjob.so -r 'xhjob_stop("app-svc", "/var/lib/xhjob");'
+Environment=XHJOB_API_TOKEN=long-random-token
+
+# 通过 PHP 扩展的 xhjob_start 拉起 daemon（spawn + re-exec，立即返回）
+ExecStart=/usr/bin/php -d extension=/usr/lib/php/xhjob.so \
+    -r 'xhjob_start(getenv("XHJOB_SERVICE_NAME"), getenv("XHJOB_DATA_DIR")) or exit(1);'
+
+# 停止：发 SIGTERM，daemon 排空当前任务后退出
+ExecStop=/usr/bin/php -d extension=/usr/lib/php/xhjob.so \
+    -r 'xhjob_stop(getenv("XHJOB_SERVICE_NAME"), getenv("XHJOB_DATA_DIR"));'
+
+Restart=on-failure
+RestartSec=2s
+
+# 运行用户（与 FPM 同用户，避免 socket 权限问题）
 User=www-data
+Group=www-data
 RuntimeDirectory=xhjob
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
+# 启用并启动
 sudo systemctl daemon-reload
-sudo systemctl enable --now xhjob-app.service
-# 验证：socket 文件应已生成
-ls -l /var/lib/xhjob/xhjob.app-svc.sock /var/lib/xhjob/xhjob.app-svc.pid
+sudo systemctl enable --now xhjob-daemon.service
+
+# 验证 daemon 运行
+sudo systemctl status xhjob-daemon.service
+# PID 文件双行格式
+cat /run/xhjob/default.pid
+# 12345
+# 8394832   ← starttime（/proc/{pid}/stat 字段 22）
 ```
 
-### ② FPM 请求内派发（仅做客户端）
+### 2. FPM 请求内派发（连同一 daemon）
+
+FPM worker 通过同一 `service_name=default` + `data_dir=/var/lib/xhjob` 连上 systemd 拉起的 daemon，派发后立即返回。
 
 ```php
 <?php
-// === FPM Web 请求内：只派发，不负责 daemon 生命周期 ===
+// app/controller/Order.php  （FPM 请求内）
+namespace app\controller;
+
 use Xhjob\TaskBuilder;
 
-// daemon 已由 systemd 拉起，这里直接派发（IPC 客户端，5s 超时保护）
-$taskId = TaskBuilder::shell('php /app/jobs/process.php ' . escapeshellarg($payload))
-    ->timeout(300)
-    ->withRetry(3, 5)
-    ->dispatch('app-svc', '/var/lib/xhjob');
+class Order
+{
+    public function pay(): array
+    {
+        $orderId = (int) ($_POST['order_id'] ?? 0);
 
-header('Content-Type: application/json');
-echo json_encode(['task_id' => $taskId]);
-```
+        // 派发到 default 服务（与 systemd daemon 共用同一 socket / db）
+        $id = TaskBuilder::shell(
+                'php /app/bin/after-pay.php ' . escapeshellarg((string) $orderId)
+            )
+            ->withId('after-pay-' . $orderId)     // 业务幂等
+            ->replaceExisting(true)
+            ->withRetry(3, 5)
+            ->retryBackoff(true)
+            ->timeout(120)
+            ->dispatch('default', '/var/lib/xhjob');  // 与 systemd 一致
 
-> FPM 侧**不需要**调用 `ensureRunning()`——daemon 由 systemd 管理。若担心 daemon 偶发不可用，可加一个轻量探活：`$svc->status()` 不阻塞，未运行时返回 `running=false`，再决定是报错还是尝试 `ensureRunning()`。
-
-### ③ CLI 查状态 / 取结果
-
-```php
-<?php
-// === CLI 脚本：查任务状态（连同一个 daemon）===
-use Xhjob\TaskManager;
-
-$mgr   = new TaskManager('app-svc', '/var/lib/xhjob');   // 同名 + 同 data_dir
-$state = $mgr->state($taskId);
-print_r($state);
-
-if (in_array($state['state'] ?? '', ['success', 'failed'], true)) {
-    $result = $mgr->result($taskId);
-    echo "stdout: " . ($result['stdout'] ?? '') . "\n";
-    echo "exit_code: " . ($result['exit_code'] ?? -1) . "\n";
+        if (str_starts_with($id, 'error:')) {
+            throw new \RuntimeException('派发失败：' . substr($id, 6));
+        }
+        return ['task_id' => $id, 'order_id' => $orderId];
+    }
 }
 ```
 
-### ④ 命令行快速查询
+### 3. CLI 查状态 / 运维（连同一 daemon）
+
+CLI 脚本通过同一 `service_name` + `data_dir` 连同一 daemon，查询 FPM 派发的任务状态。
+
+```php
+#!/usr/bin/env php
+<?php
+// bin/check-task.php  （CLI 运维）
+// 用法：php check-task.php <task_id>
+
+$taskId  = $argv[1] ?? '';
+$name    = 'default';           // 与 FPM / systemd 一致
+$dataDir = '/var/lib/xhjob';
+
+if ($taskId === '') {
+    fwrite(STDERR, "usage: php check-task.php <task_id>\n");
+    exit(1);
+}
+
+// 确认 daemon 在运行
+$status = xhjob_status($name, $dataDir);
+if (($status['running'] ?? 'false') !== 'true') {
+    fwrite(STDERR, "daemon 未运行\n");
+    exit(1);
+}
+printf("daemon: running, pid=%s\n", $status['pid'] ?? '-');
+
+// 查任务状态
+$state = xhjob_state($taskId, $name, $dataDir);
+if (isset($state['error'])) {
+    fwrite(STDERR, "state error: {$state['error']}\n");
+    exit(1);
+}
+printf("task %s: state=%s attempts=%s progress=%s%%\n",
+    $taskId,
+    $state['state'] ?? 'UNKNOWN',
+    $state['attempts'] ?? '0',
+    $state['progress'] ?? '0'
+);
+
+// 终态时取结果
+$terminal = ['success', 'failed', 'cancelled', 'expired', 'interrupted'];
+if (in_array($state['state'] ?? '', $terminal, true)) {
+    $result = xhjob_result($taskId, $name, $dataDir);
+    if (!isset($result['error'])) {
+        printf("exit_code=%s\n", $result['exit_code'] ?? $result['status_code'] ?? '-');
+        printf("stdout=%s\n", substr((string) ($result['stdout'] ?? $result['body'] ?? ''), 0, 500));
+    }
+}
+```
+
+### 4. 多服务隔离演示
+
+不同 `service_name` 完全独立，各自的 daemon + DB 互不干扰。
+
+```php
+#!/usr/bin/env php
+<?php
+// bin/multi-service.php  （演示多服务隔离）
+
+// 服务 A：cron 调度（长驻定时任务）
+$aName = 'cron-svc';
+$aDir  = '/var/lib/xhjob';
+
+// 服务 B：账单队列（高优先级实时任务）
+$bName = 'billing';
+$bDir  = '/var/lib/xhjob-billing';
+
+// 启动两个独立 daemon
+xhjob_start($aName, $aDir);
+xhjob_start($bName, $bDir);
+
+// 各自派发（互不影响）
+$aId = TaskBuilder::shell('php /app/bin/report.php')
+    ->cron('0 2 * * *')
+    ->withTimezone('Asia/Shanghai')
+    ->dispatch($aName, $aDir);
+
+$bId = TaskBuilder::shell('php /app/bin/charge.php')
+    ->withRetry(5, 10)
+    ->timeout(30)
+    ->dispatch($bName, $bDir);
+
+printf("cron-svc task: %s\n", $aId);
+printf("billing  task: %s\n", $bId);
+
+// 查询各自 daemon 状态（独立 PID）
+$aStatus = xhjob_status($aName, $aDir);
+$bStatus = xhjob_status($bName, $bDir);
+printf("cron-svc daemon: pid=%s\n", $aStatus['pid'] ?? '-');
+printf("billing  daemon: pid=%s\n", $bStatus['pid'] ?? '-');
+
+// 停一个不影响另一个
+xhjob_stop($aName, $aDir);
+printf("after stop cron-svc: billing still running=%s\n",
+    xhjob_status($bName, $bDir)['running'] ?? 'false');
+```
+
+### 5. PID 文件双行格式与 PID 复用防护
+
+daemon 启动时写 PID 文件，格式为双行：第一行 PID，第二行 starttime（`/proc/{pid}/stat` 字段 22，进程启动时的时钟 ticks）。
 
 ```bash
-# 查 daemon 状态
-php -d extension=xhjob.so -r 'print_r(xhjob_status("app-svc", "/var/lib/xhjob"));'
+# 正常运行的 PID 文件
+$ cat /run/xhjob/default.pid
+12345
+8394832
 
-# 查任务状态
-php -d extension=xhjob.so -r 'print_r(xhjob_state("TASK_ID", "app-svc", "/var/lib/xhjob"));'
+# 模拟 PID 复用：旧 daemon 死后 PID 12345 被 nginx 复用
+$ ps -p 12345 -o pid,comm
+  PID COMM
+12345 nginx
 
-# 查所有注册任务
-php -d extension=xhjob.so -r 'print_r(xhjob_inspect("registered", "app-svc", "/var/lib/xhjob"));'
+# 新 daemon 启动 → 读 PID 文件 → starttime 不匹配 → 视为 stale → 清理
+$ systemctl restart xhjob-daemon
+# daemon 日志：
+# INFO xhjob::pid] stale pid 12345 (starttime mismatch: file=8394832, actual=9201111), cleaning
+# INFO xhjob::daemon] starting fresh daemon, pid=12500
 ```
+
+```php
+<?php
+// 读取并校验 PID 文件（运维脚本示例）
+function readDaemonPid(string $pidFile): ?array
+{
+    if (!is_file($pidFile)) {
+        return null;
+    }
+    $lines = file($pidFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if (count($lines) < 1) {
+        return null;
+    }
+    $pid = (int) $lines[0];
+    $starttime = $lines[1] ?? null;
+
+    // 校验 PID 存活
+    if (!file_exists("/proc/{$pid}")) {
+        return null;  // 进程已死
+    }
+    // 校验 starttime（防 PID 复用）
+    if ($starttime !== null) {
+        $stat = file_get_contents("/proc/{$pid}/stat");
+        $fields = explode(' ', $stat);
+        $actualStarttime = $fields[21] ?? '';  // 字段 22（0-indexed = 21）
+        if ($actualStarttime !== $starttime) {
+            return null;  // PID 被复用，旧 daemon 已死
+        }
+    }
+    return ['pid' => $pid, 'starttime' => $starttime];
+}
+
+$info = readDaemonPid('/run/xhjob/default.pid');
+echo $info ? "daemon alive, pid={$info['pid']}" : "daemon dead (stale pid)";
+```
+
+### 6. `XHJOB_IPC_TIMEOUT_SECS` 防 FPM worker 阻塞
+
+PHP 的 `max_execution_time` **无法中断** C 级 socket 阻塞（`recv` / `connect`）。若 daemon 死锁，FPM worker 会被永久挂住，直到 IPC 超时。`XHJOB_IPC_TIMEOUT_SECS`（默认 5 秒）是兜底机制。
+
+```ini
+; /etc/php/8.2/fpm/pool.d/www.conf  （FPM worker 环境变量）
+; 把 IPC 超时设得比 max_execution_time 小，让 FPM worker 快速失败
+env[XHJOB_IPC_TIMEOUT_SECS] = 3
+```
+
+```php
+<?php
+// FPM 请求内：捕获 IPC 超时并降级
+$id = '';
+try {
+    $id = TaskBuilder::shell('php /app/bin/job.php')
+        ->dispatch('default', '/var/lib/xhjob');
+} catch (\Throwable $e) {
+    // IPC 超时 / daemon 不可达：降级到本地 fallback 队列
+    error_log('xhjob dispatch failed, fallback: ' . $e->getMessage());
+    $id = enqueueFallback($_POST['job_payload']);
+}
+if (str_starts_with($id, 'error:')) {
+    $id = enqueueFallback($_POST['job_payload']);
+}
+return ['task_id' => $id];
+```
+
+---
 
 ## 注意事项
 
-| 关注点 | 说明 |
-|------|------|
-| **同名 + 同 data_dir 是唯一约束** | CLI 与 FPM 必须传入完全相同的 `service_name` 与 `data_dir`，否则会解析到不同 socket，连到不同 daemon。生产建议把这两个值固化在配置文件 / 环境变量中，所有入口统一读取。 |
-| **daemon 由 systemd 管理最佳** | 避免让 FPM worker 拉起 daemon（首次请求延迟、并发拉起竞争）。systemd 负责 daemon 生命周期，FPM / CLI 只做客户端。 |
-| **不要落到 `/tmp`** | `/tmp` 全局可写带 sticky bit，有 symlink / 名称占位风险。生产显式指定 `data_dir`（如 `/var/lib/xhjob`），或用 `/run/xhjob`（systemd tmpfs，0o700）。 |
-| **data_dir 跨进程一致** | `tp/xhjob_server.php` 默认用 `/tmp/xhjob-cross`，生产替换为实际 `data_dir`，否则 client 连不到 server 拉起的 daemon。 |
-| **IPC 超时是 FPM 护栏** | `XHJOB_IPC_TIMEOUT_SECS` 默认 5s，daemon 死锁时保护 FPM worker 不被永久阻塞。不要设为 0 或过大。 |
-| **重启 daemon 不丢持久化任务** | `persist(true)` 的任务定义存在 SQLite，daemon 重启后自动恢复；`acksLate(true)` 的 Running 任务会被重置为 Pending 重投。详见[定时任务](prod-cron/)与[持久化与崩溃恢复](../persistence-recovery/)。 |
-| **stop/restart 的 SIGKILL 安全** | 仅当 PID 文件是双行格式（含 starttime）时，SIGTERM 超时后才升级 SIGKILL。旧版单行格式拒绝 SIGKILL（fail-SAFE），需手动清理。 |
-| **多服务隔离** | 不同 `service_name` 是完全独立的 daemon + DB。业务队列与定时任务建议分服务部署，互不干扰。 |
+- **daemon 用 systemd 托管最稳**：systemd 提供 `Restart=on-failure` 自动拉起、`Type=forking` + `PIDFile` 进程跟踪、`RuntimeDirectory` 自动创建 `/run/xhjob`。不要依赖 FPM 请求内 `ensureRunning` 拉起——daemon 死锁时 FPM worker 会阻塞在 spawn 上。
+- **FPM worker 设较小的 `XHJOB_IPC_TIMEOUT_SECS`**：默认 5 秒对 FPM 偏长。建议设 `3` 秒（小于 FPM 的 `max_execution_time`），让 FPM worker 在 daemon 不可达时快速失败降级，而非占住 worker。CLI worker 可设大一些（如 10 秒），因为 CLI 不怕短暂阻塞。
+- **共用前提是 service_name + data_dir 完全一致**：FPM 用 `dispatch('default', '/var/lib/xhjob')`，CLI 也必须用 `xhjob_state($id, 'default', '/var/lib/xhjob')`。任一参数不一致会连到不同 daemon（或连不上）。封装一个统一配置（环境变量或配置文件）避免硬编码不一致。
+- **socket 权限**：daemon 与 FPM 必须以同一用户运行（或 socket 目录对 FPM 用户可读写），否则 FPM 连不上 socket。systemd unit 设 `User=www-data`（与 FPM pool 用户一致），`RuntimeDirectoryMode=0755`。
+- **PID 文件双行格式防复用**：不能只校验 PID 存活——Linux 会复用 PID，旧 daemon 死后新进程可能拿到同样 PID。starttime（`/proc/{pid}/stat` 字段 22）单调递增，跨重启必然不同，是可靠的存活证据。旧格式单行 PID 文件向后兼容，但生产环境应确认双行格式已生效。
+- **`/run` 是 tmpfs**：`/run/xhjob` 重启清空，适合放 socket / pid（ ephemeral）。`/var/lib/xhjob` 放 SQLite DB（持久），`/var/log/xhjob` 放日志（持久）。不要把 DB 放 `/run`，否则机器重启丢全部任务定义。
+- **多服务不要共用 data_dir**：虽然不同 service_name 的 DB 文件名不同（`<name>.db`），但共用同一目录会增加混乱。建议每个服务独立 data_dir（如 `/var/lib/xhjob` 与 `/var/lib/xhjob-billing`），便于备份与迁移。
+
+---
+
+## 生产建议
+
+- **systemd unit 模板化**：用 systemd 模板单元（`xhjob-daemon@.service`）支持多服务，`%i` 实例名映射到 service_name。`systemctl enable xhjob-daemon@billing.service` 即可拉起 billing 服务的独立 daemon。
+- **健康检查接入 K8s / 负载均衡**：`xhjob_status($name, $dataDir)['running'] === 'true'` 即视为健康。可写一个简单的 PHP 探活脚本（`php -r 'echo xhjob_status()["running"];'`）供 liveness probe 调用。
+- **FPM 与 CLI 共用扩展 ini**：用 `PHP_INI_SCAN_DIR` 让 FPM 与 CLI 共享同一 xhjob 扩展 ini，避免两边版本不一致。CLI 调试时 `php -d extension=... -m | grep xhjob` 确认加载。
+- **滚动发布时先停 FPM 再重启 daemon**：发版时若先 `systemctl restart xhjob-daemon`，正在处理中的 FPM 请求会因 IPC 断开失败。正确顺序：`systemctl reload php8.2-fpm`（停止接受新请求）→ 等存量请求排空 → `systemctl restart xhjob-daemon` → `systemctl reload php8.2-fpm`。`persist(true)` + `acksLate(true)` 保证 daemon 重启期间在途任务恢复。
+- **监控 daemon PID 变化**：`xhjob_status` 返回的 `pid` 应长期稳定。若 pid 频繁变化，说明 daemon 在反复崩溃重启，应查日志（`/var/log/xhjob/<name>.log`）定位。可配告警：5 分钟内 pid 变化超过 3 次即告警。
+- **`XHJOB_IPC_NO_PEERCRED` 谨慎开启**：默认 daemon 用 `SO_PEERCRED` 校验 IPC 连接的发起方 UID（要求同用户）。跨用户访问（如 root daemon + www-data FPM）需设 `XHJOB_IPC_NO_PEERCRED=1` 跳过校验，但这降低安全性。优先方案是把 daemon 与 FPM 设为同一用户。

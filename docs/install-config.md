@@ -1,180 +1,163 @@
----
-title: 安装与配置
-parent: 入门
-nav_order: 13
----
-
 # 安装与配置
 
-本页覆盖 xhjob 扩展的加载方式、全部环境变量、配置文件、运行目录路径解析、服务名校验规则与 PID 文件格式。
+## 概述
 
-## 扩展加载三种方式
+本篇覆盖 xhjob 扩展的加载方式、全部环境变量、配置文件、路径解析优先级、服务名校验与 PID 文件格式。配置正确后，daemon 才能稳定常驻并与 PHP 进程正确互通。
 
-xhjob 是一个标准 PHP 扩展（`.so`），加载方式与普通扩展一致。`dl()` 在新 SAPI（PHP-FPM、较新 CLI）下受限，**推荐以下三种方式**：
+## 函数签名 / 方法签名
 
-### 1. `php.ini` 直接加载
+配置相关无独立函数；以下为受配置影响的运行期 API：
 
-在 `php.ini` 中添加：
+```php
+xhjob_start(?string $name = null, ?string $data_dir = null): bool
+xhjob_status(?string $name = null, ?string $data_dir = null): array
+```
+
+builder 中影响配置上下文的方法：
+
+```php
+Xhjob::task()
+    ->service(string $name): Xhjob   // 指定服务名
+    ->dataDir(string $dir): Xhjob    // 指定统一数据目录
+    ->dispatch(): string;
+```
+
+## 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `$name` / `service($name)` | 服务名，校验 `^[a-zA-Z][a-zA-Z0-9_-]{0,31}$`，非法回退 `default` |
+| `$data_dir` / `dataDir($dir)` | 统一数据目录，覆盖各 `XHJOB_*_DIR` 解析 |
+
+## 返回值
+
+- `xhjob_start`：`bool`。
+- `xhjob_status`：键值对数组（`running` / `pid` / `error`）。
+
+## 注意事项
+
+- **env 优先于配置文件**：`/etc/xhjob/config` 的 KEY=VALUE 在 daemon 启动时由 `load_config_file()` 注入进程环境，但**已存在的 env 不被覆盖**。
+- **路径 fallback 分两套**：sock_dir 走 `/run/xhjob > /var/run/xhjob > /tmp`；pid_dir / log_dir / db_dir 仅 fallback `/tmp`。
+- **dl() 受限**：多数 SAPI（含 FPM，及 `enable_dl=Off` 的 CLI）下 `dl()` 不可用，生产用 `extension=` 永久加载。
+
+## 扩展加载
+
+### 方式一：php.ini 永久加载（推荐）
 
 ```ini
-; 写入 php.ini（CLI 与 FPM 各自的 ini 文件需分别配置）
-extension=xhjob.so
-; 或使用绝对路径，避免 extension_dir 配置差异导致找不到
-; extension=/opt/xhjob/xhjob.so
+; /etc/php/8.2/fpm/conf.d/50-xhjob.ini
+extension=/path/to/xhjob-php8.2-linux-x86_64.so
 ```
 
-适用于：所有 SAPI（CLI、FPM、 FrankenPHP 等）都需使用的场景。
+CLI 与 FPM 各自的 `conf.d` 都要放（或用 `PHP_INI_SCAN_DIR` 共享同一扫描目录）。
 
-### 2. `PHP_INI_SCAN_DIR` 额外 ini 目录
-
-把扩展配置放到独立 ini 文件，通过扫描目录加载，便于与主 `php.ini` 解耦：
+### 方式二：PHP_INI_SCAN_DIR 共享扫描目录
 
 ```bash
-# 1. 创建独立 ini 文件
-cat > /etc/php/8.2/mods-available/xhjob.ini <<'EOF'
-; xhjob 扩展配置
-extension=xhjob.so
-EOF
-
-# 2. 通过 PHP_INI_SCAN_DIR 让 PHP 扫描该目录
-export PHP_INI_SCAN_DIR=/etc/php/8.2/mods-available
-php -m | grep xhjob
+# 把 xhjob 的 ini 放到独立目录，追加到扫描路径
+export PHP_INI_SCAN_DIR=/etc/php/8.2/fpm/conf.d:/etc/xhjob-ini
+# 在 /etc/xhjob-ini/50-xhjob.ini 放 extension=/path/to/xhjob-php8.2-linux-x86_64.so
 ```
 
-适用于：扩展作为可选模块按需启用，不想污染主 `php.ini`。
-
-### 3. 命令行 `-d extension=`
-
-临时加载，不修改任何 ini 文件：
+### 方式三：命令行临时加载
 
 ```bash
-# 单次命令临时加载
-php -d extension=/opt/xhjob/xhjob.so -m | grep xhjob
-
-# 运行脚本
-php -d extension=/opt/xhjob/xhjob.so my_worker.php
+php -d extension=/path/to/xhjob-php8.2-linux-x86_64.so -m | grep xhjob
+php -d extension=/path/to/xhjob-php8.2-linux-x86_64.so \
+    -r 'echo function_exists("xhjob_dispatch") ? "ok" : "no";'
 ```
 
-适用于：调试、一次性脚本、CI 环境。
+### dl() 限制说明
 
-### 关于 `dl()`
+`dl()` 在多数 SAPI 下被禁用（`enable_dl=Off`）或不可用，**不可靠**，不要用于加载 xhjob。请使用上述 `extension=` 或 `PHP_INI_SCAN_DIR` 方式。
 
-`dl()` 仅在部分旧 CLI SAPI 下可用，且在新 SAPI 受限（PHP-FPM 下完全禁用）。**不要在生产环境依赖 `dl()` 加载 xhjob**，优先用上述 `extension=` ini 指令或 `-d extension=` 命令行参数。
+## 环境变量全表
 
-## 环境变量
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `XHJOB_SERVICE_NAME` | `default` | 服务名，命名空间化 sock/pid/log/db 文件 |
+| `XHJOB_DATA_DIR` | （无） | 统一数据目录 |
+| `XHJOB_DB_DIR` | fallback `/tmp` | SQLite 文件目录 |
+| `XHJOB_SOCK_DIR` | `/run/xhjob` > `/var/run/xhjob` > `/tmp` | Unix socket 目录 |
+| `XHJOB_PID_DIR` | fallback `/tmp` | PID 目录（不走 /run 链） |
+| `XHJOB_LOG_DIR` | fallback `/tmp` | 日志目录（不走 /run 链） |
+| `XHJOB_IPC_TIMEOUT_SECS` | `5` | IPC 请求超时（秒） |
+| `XHJOB_POOL_MODE` | `async` | `async` / `thread` / `coroutine`(别名) |
+| `XHJOB_ASYNC_POOL_SIZE` | `1024` | async 池大小 |
+| `XHJOB_COROUTINE_POOL_SIZE` | — | async 池旧别名 |
+| `XHJOB_THREAD_POOL_SIZE` | `num_cpus` | thread 池大小 |
+| `XHJOB_PERSIST` | `true`(编译启用 persist feature 时) / `false` | 是否持久化 |
+| `XHJOB_API_TOKEN` | （空） | API token |
+| `XHJOB_CONFIG_FILE` | `/etc/xhjob/config` | KEY=VALUE 配置文件路径 |
+| `XHJOB_SHELL_TIMEOUT` | `300` | shell 执行器默认超时（秒） |
+| `XHJOB_MAX_PENDING` | `10000` | 待处理任务上限 |
+| `XHJOB_MAX_CRON_PER_TICK` | `500` | 每 tick 处理的 cron 上限 |
+| `XHJOB_MAX_CONNECTIONS` | `256` | IPC 最大连接数 |
+| `XHJOB_SHUTDOWN_DRAIN_SECS` | `30` | 关停排空窗口（秒） |
+| `XHJOB_WATCHDOG_INTERVAL` | `5` | watchdog 巡检间隔（秒） |
+| `XHJOB_WATCHDOG_FACTOR` | `2` | watchdog 倍数因子 |
+| `XHJOB_HTTP_CONNECT_TIMEOUT` | `10` | http 连接超时（秒） |
+| `XHJOB_HTTP_MAX_REDIRECTS` | `5` | http 最大重定向 |
+| `XHJOB_MAX_TASKS_PER_CHILD` | `0`(无限) | 单 worker 最大任务数 |
+| `XHJOB_MAX_MEMORY_PER_CHILD` | `0`(不限) | 单 worker 内存上限 |
+| `XHJOB_IPC_NO_PEERCRED` | （未设） | 设 `1` 跳过 `SO_PEERCRED` 校验 |
+| `XHJOB_OWNER` | `""` | 多租户属主 |
+| `XHJOB_ENCRYPTION_KEY` | （空） | 64 hex(32 字节)，AES-256-GCM 加密任务结果 |
 
-所有 `XHJOB_*` 环境变量在 daemon 启动时读取，部分也可被 PHP 端读取用于解析路径。下表为完整清单：
+## 配置文件 /etc/xhjob/config
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `XHJOB_SERVICE_NAME` | `default` | 服务名，决定 PID/sock/db/log 文件命名与多实例隔离 |
-| `XHJOB_DATA_DIR` | `null` | 统一数据目录，设置后 PID/sock/db/log 全部置于其下 |
-| `XHJOB_SOCK_DIR` | 见路径解析 | Unix 下 IPC socket 目录的细分覆盖（优先级高于 `XHJOB_DATA_DIR`） |
-| `XHJOB_PID_DIR` | 见路径解析 | Unix 下 PID 文件目录的细分覆盖 |
-| `XHJOB_LOG_DIR` | 见路径解析 | Unix 下日志文件目录的细分覆盖 |
-| `XHJOB_IPC_TIMEOUT_SECS` | `5` | IPC 请求超时秒数，防 daemon 死锁后 FPM worker 永久阻塞 |
-| `XHJOB_POOL_MODE` | `async` | 线程池模式：`async`（tokio M:N，IO 密集）或 `thread`（1:1，CPU 密集）；`coroutine` 为 `async` 的兼容别名 |
-| `XHJOB_ASYNC_POOL_SIZE` | `1024` | async 模式最大并发数（推荐变量名） |
-| `XHJOB_COROUTINE_POOL_SIZE` | `1024` | async 模式最大并发数的兼容别名，与上面等价 |
-| `XHJOB_THREAD_POOL_SIZE` | CPU 核数 | thread 模式工作线程数 |
-| `XHJOB_PERSIST` | 未启用 | 非 0 值启用 SQLite 持久化；需 `--all-features` 编译，否则回退到 InMemory |
-| `XHJOB_API_TOKEN` | 未配置 | HTTP 鉴权 token（ThinkPHP 中间件用）；未配置时中间件抛 500（fail-closed，拒绝所有请求） |
-| `XHJOB_CONFIG_FILE` | `/etc/xhjob/config` | 配置文件路径 |
-| `XHJOB_SHELL_TIMEOUT` | `300` | shell 任务默认超时秒数（任务级 `timeout()` 会覆盖此默认值） |
-| `XHJOB_MAX_PENDING` | `10000` | 待执行任务队列上限，超过则拒绝入队，防 cron 风暴打爆内存 |
-
-> **`XHJOB_IPC_TIMEOUT_SECS` 为何重要**：`max_execution_time` 无法中断 C 级阻塞调用。若 daemon 死锁或被 SIGSTOP，没有这个 IPC 超时会让 FPM worker 永久阻塞在 `read_exact`，逐个耗尽 worker 池直至 502/504 且无法自愈。
-
-> **`XHJOB_API_TOKEN`** 仅用于 ThinkPHP HTTP 端点的中间件鉴权（请求需带 `X-Xhjob-Token` header）。未配置时中间件 **fail-closed** 抛 `HttpException(500)`，避免无鉴权 RCE。
-
-## 配置文件 `/etc/xhjob/config`
-
-除环境变量外，xhjob 还支持一个简单的 `KEY=VALUE` 配置文件（类似 `.env`），在 daemon 启动时加载到进程环境。
-
-- 默认路径：`/etc/xhjob/config`（可用 `XHJOB_CONFIG_FILE` 覆盖）
-- 格式：每行一个 `KEY=VALUE`，`#` 开头为注释，空行忽略，VALUE 两侧的引号会被剥离
-- **优先级**：已存在的环境变量优先级更高——配置文件只填充**尚未设置**的环境变量，因此命令行 `-e` 注入的 env 始终覆盖配置文件
-
-示例配置文件：
+`XHJOB_CONFIG_FILE`（默认 `/etc/xhjob/config`）是 KEY=VALUE 纯文本，daemon 启动时由 `load_config_file()` 加载到进程环境。
 
 ```ini
-# Xhjob daemon 配置
-XHJOB_PERSIST=1
+# /etc/xhjob/config
+XHJOB_SERVICE_NAME=default
+XHJOB_DATA_DIR=/var/lib/xhjob
+XHJOB_DB_DIR=/var/lib/xhjob/db
 XHJOB_SOCK_DIR=/run/xhjob
-XHJOB_MAX_PENDING=5000
-RUST_LOG=xhjob=debug
+XHJOB_PID_DIR=/run/xhjob
+XHJOB_LOG_DIR=/var/log/xhjob
+XHJOB_POOL_MODE=async
+XHJOB_ASYNC_POOL_SIZE=2048
+XHJOB_PERSIST=true
+XHJOB_API_TOKEN=long-random-token
+XHJOB_MAX_PENDING=20000
+XHJOB_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-读取逻辑在 `src/config.rs::load_config_file`，daemon 启动时调用一次（在任何 `env::var` 读取之前）。文件不存在时静默跳过（向后兼容）。
+**优先级**：进程已存在的 env > 配置文件 KEY=VALUE。即配置文件不会覆盖已设的环境变量，仅在对应 env 缺失时补位。
 
-## 运行目录路径解析
+## 路径解析优先级
 
-PID / sock / db / log 文件的目录按以下优先级解析（从高到低）：
+| 目录 | 解析顺序 |
+|------|---------|
+| sock_dir | `XHJOB_SOCK_DIR` → `/run/xhjob` → `/var/run/xhjob` → `/tmp` |
+| pid_dir | `XHJOB_PID_DIR` → `/tmp` |
+| log_dir | `XHJOB_LOG_DIR` → `/tmp` |
+| db_dir | `XHJOB_DB_DIR` → `/tmp` |
 
-| 优先级 | 来源 | 说明 |
-|--------|------|------|
-| 1 | 显式参数 | `xhjob_start($name, $dataDir)` 或 `XhjobService` 构造时传入的 `data_dir` |
-| 2 | 细分 env（Unix） | `XHJOB_SOCK_DIR` / `XHJOB_PID_DIR` / `XHJOB_LOG_DIR`，分别覆盖对应文件类型 |
-| 3 | `XHJOB_DATA_DIR` | 统一数据目录，设置后所有运行时文件置于其下 |
-| 4 | 平台默认 | Unix：`/run/xhjob` > `/var/run/xhjob` > `/tmp`；Windows：`%TEMP%` |
+> 注意差异：仅 sock_dir 走 `/run` 链；pid_dir / log_dir / db_dir 找不到时只 fallback 到 `/tmp`。
 
-### 平台默认目录与 symlink 防护
+`XHJOB_DATA_DIR`：统一数据目录，设置后用于统一存放 daemon 数据；与各分项 `XHJOB_*_DIR` 同时存在时的具体覆盖关系以扩展实现为准，生产建议显式设置各分项目录以避免歧义。
 
-Unix 下若未配置任何目录，fallback 顺序为：
+## 服务名校验
 
-1. `/run/xhjob`（systemd tmpfs，优先）
-2. `/var/run/xhjob`（无 `/run` 时）
-3. `/tmp`（最后兜底，安全性较低）
+规则：`^[a-zA-Z][a-zA-Z0-9_-]{0,31}$`
 
-**`/run/xhjob` 与 `/var/run/xhjob` 在创建时设为 `0o700` 权限**，防止 symlink 攻击与同名占位。`/tmp` 是全局可写且带 sticky bit，存在 symlink / 名称占位风险，仅作最后兜底。
-
-文件命名规则：
-
-| 文件 | Unix 路径 | Windows 路径 |
-|------|----------|-------------|
-| IPC socket | `<dir>/xhjob.{name}.sock` | `\\.\pipe\xhjob-{name}` |
-| PID 文件 | `<dir>/xhjob.{name}.pid` | `%TEMP%\xhjob.{name}.pid` |
-| 日志文件 | `<dir>/xhjob.{name}.log` | `%TEMP%\xhjob.{name}.log` |
-| SQLite DB | `<dir>/xhjob.{name}.db` | `%TEMP%\xhjob.{name}.db` |
-
-> Windows 命名管道位于内核独立命名空间，不使用文件系统路径，因此 `data_dir` 对 socket 路径无效（但对 PID/log/db 仍生效）。
-
-## 服务名校验规则
-
-服务名用于隔离多实例 daemon，校验规则（见 `src/service/mod.rs::validate`）：
+- 首字符必须是字母
+- 其余为字母 / 数字 / 下划线 / 连字符
+- 长度 1–32
+- 非法值**回退到 `default`**，不报错
 
 ```
-^[a-zA-Z][a-zA-Z0-9_-]{0,31}$
+合法：  default  my_service  svc-1  A_b-C
+非法：  1svc  svc.1  服务（回退 default）
 ```
 
-- 最长 **32 字符**（首字符 + 后续最多 31 个）
-- **首字符必须是字母**（`a-z` / `A-Z`）
-- 后续字符允许：字母、数字、下划线 `_`、连字符 `-`
-- 不允许：空字符串、以数字/下划线/连字符开头、含 `.` `/` 空格 或非 ASCII 字符
-
-校验示例：
-
-| 名称 | 是否合法 | 原因 |
-|------|---------|------|
-| `default` | ✅ | 合法 |
-| `cron-svc` | ✅ | 合法 |
-| `queue_svc` | ✅ | 合法 |
-| `a1B2c3` | ✅ | 合法 |
-| `1abc` | ❌ | 首字符为数字 |
-| `_abc` | ❌ | 首字符为下划线 |
-| `-abc` | ❌ | 首字符为连字符 |
-| `abc.def` | ❌ | 含 `.` |
-| `abc/def` | ❌ | 含 `/`（防路径穿越） |
-| `中` | ❌ | 非 ASCII |
-| 32 字符以上 | ❌ | 超长 |
-
-> 校验不仅应用于显式传入的服务名，也应用于 `XHJOB_SERVICE_NAME` 环境变量回退路径：若 env 值非法，会打印告警并回退到 `default`，避免恶意 env 含 `../` 造成路径穿越。
+服务名决定文件命名空间：`<name>.sock` / `<name>.pid` / `<name>.log` / `<name>.db`。
 
 ## PID 文件格式
 
-PID 文件用于判断 daemon 是否存活，并防护 PID 复用。支持两种格式：
-
-### 新格式（双行，推荐）
+双行格式：
 
 ```
 <pid>
@@ -182,25 +165,13 @@ PID 文件用于判断 daemon 是否存活，并防护 PID 复用。支持两种
 ```
 
 - 第 1 行：daemon 进程 PID
-- 第 2 行：进程 starttime（Linux `/proc/<pid>/stat` 第 22 字段，单位 clock ticks）
+- 第 2 行：`starttime`，取自 `/proc/{pid}/stat` 字段 22（进程启动时的时钟滴答），用于**防止 PID 复用**误判——PID 被回收后新进程可能复用同号，starttime 不同即可识别
+- 旧格式单行 pid **向后兼容**
 
-读取方会用 `is_process_alive_with_starttime(pid, Some(starttime))` 校验：PID 存活但 starttime 不匹配，说明 PID 已被无关进程复用，判定 daemon 已死并清理 stale PID 文件。停止时也只在 starttime 已记录时才允许升级到 SIGKILL（fail-safe，避免误杀复用 PID 的无辜进程）。
+## 生产建议
 
-### 旧格式（单行，向后兼容）
-
-```
-<pid>
-```
-
-仅一行 PID，无 starttime。读取时 `starttime = None`，退化为普通 `kill(pid, 0)` 存活判断，**不防 PID 复用**。停止超时后也**不会**升级到 SIGKILL（无法证明仍存活的 PID 是同一个 daemon），需人工介入排查。
-
-### 何时写哪种格式
-
-- daemon 启动时调用 `process_starttime(self_pid)` 获取 starttime；Linux 上返回 `Some`，写入双行格式
-- 非 Linux 平台（无 `/proc`）返回 `None`，写入单行旧格式
-- 两种格式读取方都能正确解析（旧格式兼容）
-
-## 下一步
-
-- 跑通第一个任务：[快速开始](quickstart/)
-- 理解整体设计：[架构概览](architecture/)
+- **socket 落 /run**：设 `XHJOB_SOCK_DIR=/run/xhjob`（tmpfs，重启清空，IPC 低延迟），并配 systemd 的 `RuntimeDirectory=xhjob` 自动创建。
+- **db/pid/log 落持久盘**：`XHJOB_DB_DIR=/var/lib/xhjob`、`XHJOB_LOG_DIR=/var/log/xhjob`，避免重启丢 SQLite 与日志。
+- **生产开 persist + 加密**：`XHJOB_PERSIST=true` + `XHJOB_ENCRYPTION_KEY=<64 hex>`，结果落盘加密。
+- **设 API token**：`XHJOB_API_TOKEN` 防止未授权 IPC；如需跨用户访问再设 `XHJOB_IPC_NO_PEERCRED=1`（降低安全性，谨慎）。
+- **配置文件 + env 分层**：通用项写 `/etc/xhjob/config`，实例差异项用 env 覆盖（env 优先）。

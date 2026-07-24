@@ -1,1264 +1,1366 @@
----
-title: PHP 函数参考
-parent: API 参考
-nav_order: 21
----
-
 # PHP 函数参考
 
-本页覆盖 xhjob 扩展（`src/lib.rs`）导出的全部 **27 个 `xhjob_*` 函数**，以及内置的 **`Xhjob` PHP 类**（Rust 侧链式 builder）。
+Xhjob 扩展由 Rust + [ext-php-rs](https://github.com/davidcole1340/ext-php-rs) 实现，向 PHP 暴露 **27 个全局函数**（`xhjob_*`，snake_case）与 **`Xhjob` 链式构建类**（camelCase）。本文档严格对齐 `src/lib.rs` 中的真实实现。
 
-{: .warning }
-所有涉及 daemon 通信的函数都内置 **IPC 超时保护**（默认 5 秒，可通过环境变量 `XHJOB_IPC_TIMEOUT_SECS` 调整）。即使 daemon 接受连接后死锁 / 被 SIGSTOP / 崩溃，PHP-FPM worker 也不会被永久阻塞，从而避免 worker 池被逐个耗尽导致 502/504。
-
-## 通用约定
-
-- **服务名 `$name`**：所有函数的第一个可选参数为服务名，`null` 时回退到默认服务（`default`）。服务名会经过校验，非法名称会让函数返回失败值（`false` / 空数组 / `error:` 前缀字符串 / `null`）。
-- **数据目录 `$data_dir`**：用于重定位 daemon 的 PID / sock / db / log 文件，空字符串与 `null` 等价（使用默认目录）。适用于备份 / 迁移 / 恢复场景。
-- **`error:` 前缀**：返回字符串的函数（`xhjob_dispatch` / `xhjob_list` / `xhjob_events` / `xhjob_pull_events` / `xhjob_inspect` / `xhjob_chain` / `xhjob_group` / `xhjob_chord`）在失败时返回以 `error:` 开头的字符串，调用方应使用 `str_starts_with($r, 'error:')` 判断。
+所有函数的前两个公共参数是 **服务名 `$name`**（`null` = 默认 `default`）与 **数据目录 `$data_dir`**（`null` = 平台默认），用于支持多服务与目录迁移场景。下文不再逐条重复说明，仅在注意事项中点出差异。
 
 ---
 
-## 一、生命周期类
+## 错误契约总览
 
-### xhjob_start
+Xhjob 的全局函数按返回类型采用 **四种** 统一的错误约定，调用方据此判断成功 / 失败：
 
-启动指定服务的 daemon 进程。若 daemon 已在运行则直接返回 `true`。
+| 返回类型 | 失败表示 | 检测方式 |
+| --- | --- | --- |
+| `string`（dispatch / list / events / pull_events / inspect / chain / group / chord） | 以 `error:` 前缀返回 | `str_starts_with($r, 'error:')` |
+| `?string`（get / chain_state / group_state / chord_state） | 返回 `null` | `$r === null` |
+| `array`（state / result / status） | 把 `error` 作为一个键值对放入数组 | `isset($r['error'])` |
+| `bool`（生命周期 / 控制类） | 返回 `false` | `$r === false` |
+
+> ⚠️ 永远不要把 `error: xxx` 字符串当作 task_id 使用。`str_starts_with($r, 'error:')` 是 string 类返回值的唯一正确判错方式（兼容 PHP 7.x 时用 `strncmp($r, 'error:', 6) === 0`）。
+
+---
+
+## 生命周期（5 个）
+
+### `xhjob_start`
 
 ```php
 xhjob_start(?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `?string` | `null` | 服务名，`null` 回退默认服务 |
-| `$data_dir` | `?string` | `null` | 数据目录，空串 / `null` 用默认 |
+**参数**
 
-**返回值**：`bool`。daemon 已运行或成功启动返回 `true`；启动超时 / 服务名校验失败 / spawn 失败返回 `false`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$name` | `?string` | 服务名，`null` 走 `default`；须匹配 `^[A-Za-z0-9_-]+$` |
+| `$data_dir` | `?string` | 数据目录，`null` 走平台默认 |
 
-**错误契约**：失败仅返回 `false`，不抛异常；详细原因写入 daemon 日志与 `tracing`。
+**返回值**：`bool`。daemon 已在运行返回 `true`；启动失败或服务名非法返回 `false`。
 
-**注意事项**：daemon 通过 `spawn_via_double_fork`（Unix）/ `spawn_via_create_process`（Windows）派生，重新 exec 一个 PHP 进程执行 `xhjob_run_daemon`。
+**错误契约**：返回 `false` 即失败。服务名校验失败、PID 文件写入失败、re-exec 子进程拉起失败均归为 `false`（详细原因写入 daemon 日志与 `tracing`）。
+
+**注意事项**
+- 该函数以 spawn + re-exec 方式拉起独立守护进程，调用方（通常是 FPM / CLI 短生命周期进程）会立即返回，不会阻塞。
+- 若 daemon 已在运行（PID 存活且非僵尸），直接返回 `true`，不会重复启动。
+- 服务名非法（含空格 / 路径分隔符等）会在 `tracing::error!` 记录后返回 `false`。
+
+**代码演示**
 
 ```php
-// 启动默认服务
-xhjob_start();
-
-// 启动命名服务并指定数据目录
-$ok = xhjob_start('cron-svc', '/var/lib/xhjob');
-if (!$ok) {
-    throw new RuntimeException('daemon 启动失败，请查看日志');
+<?php
+if (!xhjob_start('cron-svc', '/var/lib/xhjob')) {
+    error_log('xhjob daemon 启动失败，请检查日志');
+    return;
 }
+// 启动成功，可立即派发任务
+$id = xhjob_dispatch(json_encode([
+    'task_type' => 'shell',
+    'payload'   => ['cmd' => 'echo hello'],
+]), 'cron-svc', '/var/lib/xhjob');
 ```
 
-### xhjob_stop
+**生产建议**：在 FPM 入口（如 ThinkPHP 中间件）首次派发前惰性调用一次 `xhjob_start()`；不要在每次请求都强制重启。结合 `xhjob_status()` 做健康检查更稳。
 
-停止指定服务的 daemon。
+---
+
+### `xhjob_stop`
 
 ```php
 xhjob_stop(?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**：同 `xhjob_start`。
 
-**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+**返回值**：`bool`。成功发送停止信号返回 `true`；服务名非法或 daemon 未运行返回 `false`。
 
-**错误契约**：失败仅返回 `false`，原因记录到日志。
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 通过读取 PID 文件并向 daemon 进程发送终止信号实现；daemon 收到后会排空当前任务后退出。
+- 若 daemon 已不在运行，返回 `false`（无残留可停）。
+
+**代码演示**
 
 ```php
-xhjob_stop();                          // 停止默认服务
-xhjob_stop('cron-svc', '/var/lib/xhjob'); // 停止命名服务
+<?php
+xhjob_stop('cron-svc', '/var/lib/xhjob');
+// 等待退出
+while (xhjob_status('cron-svc', '/var/lib/xhjob')['running'] === 'true') {
+    usleep(200_000);
+}
 ```
 
-### xhjob_restart
+**生产建议**：停止操作配合状态轮询确认退出，避免在滚动发布时立即 `xhjob_start` 导致 PID 文件竞争。
 
-重启指定服务的 daemon（等价于 stop + start）。
+---
+
+### `xhjob_restart`
 
 ```php
 xhjob_restart(?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**：同 `xhjob_start`。
 
-**返回值**：`bool`。重启成功返回 `true`，失败返回 `false`。
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
 
-**注意事项**：重启会重新加载 daemon。已持久化的 cron / interval 任务在重启后继续触发；运行中的任务根据 `acksLate` 设置决定是否重置为 Pending（崩溃恢复语义）。
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 等价于 `stop` + `start` 的原子组合，daemon 重启后会从 SQLite 恢复任务定义；标记了 `acksLate=true` 的 Running 任务会被重置为 Pending 重新派发（崩溃恢复语义）。
+
+**代码演示**
 
 ```php
-if (xhjob_restart()) {
-    echo "daemon 已重启\n";
+<?php
+// 发布新版本二进制后热重启
+if (xhjob_restart('cron-svc')) {
+    echo "重启完成\n";
 }
 ```
 
-### xhjob_status
+**生产建议**：发版热重启优先用 `restart` 而非 `stop`+`start`，以减少任务调度空窗。
 
-查询 daemon 运行状态。
+---
+
+### `xhjob_status`
 
 ```php
 xhjob_status(?string $name = null, ?string $data_dir = null): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**：同 `xhjob_start`。
 
-**返回值**：`array`，键值对形式。正常运行返回 `[["running","true"],["pid","123"]]`；未运行返回 `[["running","false"]]`；服务名非法返回 `[["running","false"],["error","<原因>"]]`。
+**返回值**：键值对数组，恒含 `running`（`"true"`/`"false"` 字符串）；daemon 在运行时额外含 `pid`；服务名非法时含 `error`。
 
-**错误契约**：服务名非法时附带 `error` 键；daemon 未运行不算错误。
+**错误契约**：服务名非法时返回 `["running" => "false", "error" => "<原因>"]`，用 `isset($r['error'])` 检测。
+
+**注意事项**
+- 返回值是字符串键值对数组（`Vec<(String, String)>` 在 PHP 侧表现为关联数组），`running` / `pid` 均为字符串。
+- 不会抛异常，适合做探活。
+
+**代码演示**
 
 ```php
-$status = xhjob_status();
-$pairs = [];
-// 扩展返回 [[k, v], ...] 形式，便于转成关联数组
-foreach ($status as $pair) {
-    $pairs[$pair[0]] = $pair[1];
+<?php
+$s = xhjob_status('cron-svc', '/var/lib/xhjob');
+if (isset($s['error'])) {
+    throw new RuntimeException("状态查询失败：{$s['error']}");
 }
-echo $pairs['running'] ? "running, pid={$pairs['pid']}" : "stopped";
+if ($s['running'] === 'true') {
+    printf("daemon 运行中，pid=%s\n", $s['pid'] ?? '-');
+}
 ```
 
-### xhjob_run_daemon
+**生产建议**：接入 K8s liveness/readiness 探针时，`running === 'true'` 即视为健康。
 
-{: .warning }
-**隐藏入口**，由 daemon spawner 在重新 exec 的 PHP 子进程中调用，**永不返回**。普通用户代码不应直接调用。
+---
+
+### `xhjob_run_daemon`
 
 ```php
 xhjob_run_daemon(?string $service_name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$service_name` | `?string` | `null` | 服务名，由 spawner 编码进 `-r` 代码串以穿越环境变量被擦除的场景 |
-| `$data_dir` | `?string` | `null` | 数据目录，安装到 `service::current_data_dir()` |
+**参数**
 
-**返回值**：`bool`。仅在服务名校验失败时返回 `false`，否则进入 daemon 主循环永不返回。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$service_name` | `?string` | 服务名，会经 `service::validate` 校验后通过 `service::set_current()` 安装 |
+| `$data_dir` | `?string` | 数据目录，经 `set_current_data_dir()` 安装 |
 
-**错误契约**：服务名非法时返回 `false`；正常情况下函数不返回。
+**返回值**：`bool`。**正常情况下永不返回**（进入守护循环）；仅当服务名非法时返回 `false`。
 
-**注意事项**：在 Unix 上会重定向 std 流到日志文件（`dup2` 到 log 文件描述符），stdin 重定向到 `/dev/null`。当参数为 `null` 时回退到环境变量 `XHJOB_SERVICE_NAME` / `XHJOB_DATA_DIR`，最后回退到平台默认值。
+**错误契约**：服务名非法返回 `false`（写入 `tracing::error!`）。
+
+**注意事项**
+- 这是 **隐藏入口**，仅供 PHP 二次 re-exec 时在当前进程内运行守护循环使用——`xhjob_start` 会 spawn 一个 PHP 子进程并通过 `-r` 代码片段调用本函数。**业务代码不应直接调用**。
+- 调用后会重定向 std 流到日志文件（Unix 下 `reopen_std_streams_for_daemon`），随后进入 `daemon_main()` 永不返回。
+
+**代码演示**
 
 ```php
-// 通常无需手动调用——spawner 会自动生成如下调用：
-// php -r 'xhjob_run_daemon("cron-svc", "/var/lib/xhjob");'
+<?php
+// 仅作示意：xhjob_start 内部生成的 re-exec 代码等价于：
+// xhjob_run_daemon('cron-svc', '/var/lib/xhjob');
+// 业务层请勿直接调用
 ```
+
+**生产建议**：禁止在 Web 请求中直接调用本函数；如需自定义 spawn 路径，复用 `xhjob_start` 即可。
 
 ---
 
-## 二、任务派发与查询类
+## 派发与查询（5 个）
 
-### xhjob_dispatch
-
-将一个任务 JSON 派发到 daemon。
+### `xhjob_dispatch`
 
 ```php
 xhjob_dispatch(string $task_json, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$task_json` | `string` | — | TaskBuilder JSON 字符串 |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 `task_id`；失败返回 `error: <原因>`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$task_json` | `string` | TaskBuilder JSON 字符串（任务定义） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
 
-**错误契约**（P0-1 fix）：失败返回值固定以 `error:` 前缀开头，调用方据此区分真实 `task_id` 与错误信息——若不加前缀，错误字符串会被误认为 task_id 造成「假成功」。
+**返回值**：`string`。成功为 task_id；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。失败原因包括：JSON 解析失败、服务名非法、IPC 不可达、daemon 返回 `ok=false`。
+
+**注意事项**
+- `$task_json` 必须是合法 JSON 对象，结构与 Rust `TaskBuilder` 一致（`task_type` / `payload` / `cron` / `interval` / `run_at` 等）。
+- 成功返回的 task_id 形如 UUID；若任务指定了 `id` 且 `replace_existing=true`，则会覆盖同 id 任务。
+
+**代码演示**
 
 ```php
-$taskJson = json_encode([
+<?php
+$task = [
     'task_type' => 'shell',
     'payload'   => ['cmd' => 'echo hello'],
     'cron'      => '0 * * * *',
-], JSON_UNESCAPED_SLASHES);
-
-$result = xhjob_dispatch($taskJson);
-if (str_starts_with($result, 'error:')) {
-    throw new RuntimeException('派发失败：' . substr($result, 6));
+    'retry_max' => 3,
+    'retry_delay' => 2,
+];
+$r = xhjob_dispatch(json_encode($task), 'default');
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('派发失败：' . substr($r, 6));
 }
-$taskId = $result;
-echo "task_id = $taskId\n";
+$taskId = $r;
 ```
 
-### xhjob_state
+**生产建议**：不要手拼 JSON，优先用 `TaskBuilder`（见 [TaskBuilder API](api-taskbuilder.md)）或 `Xhjob` 类构建；手拼易触发 serde 反序列化失败。
 
-查询任务运行状态（精简 `StateInfo` 视图）。
+---
+
+### `xhjob_state`
 
 ```php
 xhjob_state(string $id, ?string $name = null, ?string $data_dir = null): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`array`（`[[k, v], ...]` 键值对形式）。包含以下键（部分仅在对应字段非空时出现）：
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
 
-| 键 | 说明 |
-| --- | --- |
-| `state` | 任务状态（pending/running/success/failed/cancelled/expired/interrupted） |
-| `attempts` | 已尝试次数 |
-| `created_at` | 创建时间戳 |
-| `started_at` | 开始执行时间戳（可选） |
-| `finished_at` | 完成时间戳（可选） |
-| `last_error` | 最近一次错误信息（可选） |
-| `execution_count` | cron 已执行次数 |
-| `max_executions` | 最大执行次数（0=无限） |
-| `paused` | 是否暂停 |
-| `start_date` / `end_date` | 起止时间戳，`null` 表示未设置 |
-| `meta` | 用户元数据，`null` 表示未设置 |
-| `interval` / `run_at` | IntervalTrigger / DateTrigger 值，`null` 表示未设置 |
-| `jitter` / `expires` | 抖动 / 过期秒数 |
-| `retry_backoff` / `ignore_result` / `acks_late` | 布尔标志 |
-| `soft_timeout` | 软超时秒数，`null` 表示未设置 |
-| `misfire_grace_time` | 误触发宽限时间 |
-| `tags` | 标签 JSON 数组字符串 |
-| `rate_limit_count` / `rate_limit_window` | 速率限制 |
-| `acks_on_failure` | 失败时是否确认 |
-| `timezone` | 时区标识符 |
-| `coalesce` | 是否合并误触发 |
-| `progress` / `progress_meta` | 进度百分比 / 进度元数据 |
-| `worker_pid` / `worker_starttime` | 执行 worker 的 PID / 启动时间（execution lease，可选） |
+**返回值**：键值对数组，含 `state` / `attempts` / `created_at` 等 **30+ 字段**：`state`、`attempts`、`created_at`、`started_at`（可选）、`finished_at`（可选）、`last_error`（可选）、`execution_count`、`max_executions`、`paused`、`start_date`、`end_date`、`meta`、`interval`、`run_at`、`jitter`、`expires`、`retry_backoff`、`ignore_result`、`acks_late`、`soft_timeout`、`misfire_grace_time`、`tags`（JSON 字符串）、`rate_limit_count`、`rate_limit_window`、`acks_on_failure`、`timezone`、`coalesce`、`progress`、`progress_meta`、`worker_pid`、`worker_starttime`。
 
-任务不存在或 daemon 不可达时返回 `[["state","UNKNOWN"],["error","task not found or daemon not running"]]`。
+**错误契约**：任务不存在或 daemon 不可达时返回 `["state" => "UNKNOWN", "error" => "<原因>"]`，用 `isset($r['error'])` 或 `$r['state'] === 'UNKNOWN'` 检测。
+
+**注意事项**
+- 所有值均为字符串（`Vec<(String, String)>`）；数值字段需自行 `(int)` 转换。
+- `tags` 字段是 JSON 数组字符串，需 `json_decode($r['tags'], true)` 取回数组。
+- 可选字段（`started_at` 等）仅在对应值存在时才出现在数组中。
+
+**代码演示**
 
 ```php
-$raw = xhjob_state($taskId);
-$state = [];
-foreach ($raw as $pair) {
-    $state[$pair[0]] = $pair[1];
+<?php
+$s = xhjob_state($taskId, 'default');
+if (isset($s['error'])) {
+    echo "查询失败：{$s['error']}\n";
+    return;
 }
-printf("state=%s attempts=%s\n", $state['state'], $state['attempts']);
+printf("state=%s attempts=%d\n", $s['state'], (int)$s['attempts']);
+if (($s['state'] ?? '') === 'failed' && isset($s['last_error'])) {
+    echo "上次错误：{$s['last_error']}\n";
+}
 ```
 
-### xhjob_result
+**生产建议**：轮询时优先关注 `state` 是否进入终态（`success` / `failed` / `cancelled` / `expired` / `interrupted`），避免无限轮询。
 
-查询任务执行结果。
+---
+
+### `xhjob_result`
 
 ```php
 xhjob_result(string $id, ?string $name = null, ?string $data_dir = null): array
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**：`$id` / `$name` / `$data_dir`。
 
-**返回值**：`array`（键值对形式）。Shell 任务包含 `stdout` / `stderr` / `exit_code`；HTTP 任务包含 `body`（或二进制时的 `body_b64`）/ `status_code`。无结果记录时返回 `[["error","no result record for this task ..."]]`，调用方应配合 `xhjob_state()` 的 `last_error` 排查。
+**返回值**：键值对数组，含 `body` / `body_b64` / `status_code` / `stdout` / `stderr` / `exit_code`（均为可选，按任务类型与产出情况出现）。
+
+**错误契约**：无结果记录时返回 `["error" => "no result record for this task ..."]`，用 `isset($r['error'])` 检测。这是预期的业务条件（如 `ignoreResult=true` 或任务在产出前失败），不是 daemon 故障。
+
+**注意事项**
+- shell 任务产出 `stdout` / `stderr` / `exit_code`；http 任务产出 `body`（或 `body_b64`） / `status_code`。
+- 当 HTTP 响应为非 UTF-8 二进制时，结果含 `body_b64`（base64 编码），调用方用 `base64_decode($r['body_b64'])` 恢复原始字节。
+- 结果受 `result_ttl` 控制（`0` = 永久保留）；`ignoreResult=true` 的任务不会产出结果。
+
+**代码演示**
 
 ```php
-$raw = xhjob_result($taskId);
-$res = [];
-foreach ($raw as $pair) {
-    $res[$pair[0]] = $pair[1];
+<?php
+$r = xhjob_result($taskId, 'default');
+if (isset($r['error'])) {
+    echo "无结果：{$r['error']}\n";
+    return;
 }
-if (isset($res['error'])) {
-    echo "无结果：{$res['error']}\n";
+if (isset($r['body_b64'])) {
+    $bytes = base64_decode($r['body_b64']);
 } else {
-    echo "exit_code={$res['exit_code']}\n{$res['stdout']}";
+    $text = $r['stdout'] ?? $r['body'] ?? '';
 }
+echo "exit_code=" . ($r['exit_code'] ?? $r['status_code'] ?? '-') . "\n";
 ```
 
-### xhjob_get
+**生产建议**：取结果前先用 `xhjob_state()` 确认已进入终态；终态前结果可能尚未写入。
 
-按 ID 获取完整任务定义（与 `xhjob_state` 的精简视图不同，本函数返回全部持久化字段，包括 `retry_max` / `timeout` / `priority` / `cron` 等配置字段）。
+---
+
+### `xhjob_get`
 
 ```php
 xhjob_get(string $id, ?string $name = null, ?string $data_dir = null): ?string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**：`$id` / `$name` / `$data_dir`。
 
-**返回值**：`?string`。成功返回完整 Task JSON 字符串；任务不存在或 daemon 不可达返回 `null`。
+**返回值**：`?string`。任务存在时返回完整任务定义 JSON 字符串；不存在时返回 `null`。
+
+**错误契约**：任务不存在返回 `null`。与 `xhjob_state`（返回 trimmed `StateInfo` 视图）不同，`xhjob_get` 返回 **全部持久化字段**（含配置字段）。
+
+**注意事项**
+- 返回的是任务定义（创建时的配置快照），不是执行结果——执行结果用 `xhjob_result`。
+- IPC 错误时也会返回 `null`，无法与"任务不存在"区分；如需精确区分，先调 `xhjob_status` 确认 daemon 在线。
+
+**代码演示**
 
 ```php
-$json = xhjob_get($taskId);
+<?php
+$json = xhjob_get($taskId, 'default');
 if ($json === null) {
     echo "任务不存在或 daemon 不可达\n";
-} else {
-    $task = json_decode($json, true);
-    echo "cron={$task['cron']} retry_max={$task['retry_max']}\n";
+    return;
 }
+$def = json_decode($json, true);
+print_r($def['payload'] ?? []);
 ```
 
-### xhjob_list
+**生产建议**：用于任务配置审计 / 迁移；不要用它判断任务是否在运行（用 `xhjob_state`）。
 
-列出服务下所有任务，可按状态 / 标签过滤。
+---
+
+### `xhjob_list`
 
 ```php
 xhjob_list(?string $name = null, ?string $state_filter = null, ?string $tag = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$name` | `?string` | `null` | 服务名 |
-| `$state_filter` | `?string` | `null` | 状态过滤（pending/running/success/...） |
-| `$tag` | `?string` | `null` | 标签过滤，透传到 daemon 端做服务端过滤 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 `{"tasks":[...]}` 形式的 JSON 字符串；失败返回 `error: <原因>`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$name` | `?string` | 服务名 |
+| `$state_filter` | `?string` | 状态过滤，如 `pending` / `running` / `success` / `failed` |
+| `$tag` | `?string` | 标签过滤（透传到 daemon 端 `tag_filter`） |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`string`。成功为 JSON `{"tasks":[...]}`；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- 注意返回的是 **JSON 字符串**，需 `json_decode($r, true)` 取回关联数组。
+- `$state_filter` 与 `$tag` 可同时使用（AND 语义）。
+- 不传任何过滤时返回该服务下全部任务（可能较大，生产环境建议加分页或状态过滤）。
+
+**代码演示**
 
 ```php
-$json = xhjob_list(null, 'pending', 'billing');
-if (str_starts_with($json, 'error:')) {
-    throw new RuntimeException(substr($json, 6));
+<?php
+$r = xhjob_list('default', 'failed', null);
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('list 失败：' . substr($r, 6));
 }
-$tasks = json_decode($json, true)['tasks'];
+$tasks = json_decode($r, true)['tasks'] ?? [];
 foreach ($tasks as $t) {
     echo $t['id'] . "\n";
 }
 ```
 
+**生产建议**：监控面板按 `state_filter=failed` 拉取失败任务告警；避免全量拉取造成大响应。
+
 ---
 
-## 三、任务控制类
+## 控制（7 个）
 
-以下函数签名一致（`$id` 必填，`$name` / `$data_dir` 可选），均返回 `bool`，失败仅返回 `false`：
-
-### xhjob_remove
-
-从 store 中删除任务定义（不影响正在运行的实例）。参考 APScheduler `remove_job`。
+### `xhjob_remove`
 
 ```php
 xhjob_remove(string $id, ?string $name = null, ?string $data_dir = null): bool
 ```
 
+**参数**：`$id` / `$name` / `$data_dir`。
+
+**返回值**：`bool`。删除成功返回 `true`；任务不存在、服务名非法或 IPC 失败返回 `false`。
+
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 从存储中删除任务定义，**不影响**已在运行的实例（运行中的实例会执行完毕）。
+- 服务名非法会写入 `tracing::error!` 后返回 `false`。
+
+**代码演示**
+
 ```php
-if (!xhjob_remove($taskId)) {
-    echo "删除失败（任务不存在或 daemon 不可达）\n";
+<?php
+if (!xhjob_remove($taskId, 'default')) {
+    echo "删除失败（任务可能不存在）\n";
 }
 ```
 
-### xhjob_pause
+**生产建议**：定时清理已完成任务，避免 SQLite 表无限增长。
 
-暂停 cron 任务，定义保留但 cron tick 不再触发。参考 APScheduler `pause_job`。
+---
+
+### `xhjob_pause`
 
 ```php
 xhjob_pause(string $id, ?string $name = null, ?string $data_dir = null): bool
 ```
 
+**参数**：`$id` / `$name` / `$data_dir`。
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 暂停后任务的 `paused` 字段置为 `true`，调度器跳过其触发；运行中的实例不会被中断。
+- 用 `xhjob_resume` 恢复。
+
+**代码演示**
+
 ```php
-xhjob_pause($taskId); // 暂停后再 resume 才会恢复触发
+<?php
+xhjob_pause($taskId, 'default');
+// 维护窗口结束后
+xhjob_resume($taskId, 'default');
 ```
 
-### xhjob_resume
+**生产建议**：维护窗口期间批量暂停 cron 任务，避免维护中的副作用调用。
 
-恢复已暂停的 cron 任务。参考 APScheduler `resume_job`。
+---
+
+### `xhjob_resume`
 
 ```php
 xhjob_resume(string $id, ?string $name = null, ?string $data_dir = null): bool
 ```
 
-```php
-xhjob_resume($taskId);
-```
+**参数**：`$id` / `$name` / `$data_dir`。
 
-### xhjob_cancel
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
 
-取消任务：Pending → Cancelled 终态；Running → 不重试、不再被 cron 触发。参考 Celery `revoke`。
+**错误契约**：`false` 即失败。
+
+**注意事项**：恢复被 `xhjob_pause` 暂停的任务；`paused` 置回 `false`，下次触发正常调度。
+
+**代码演示**：见 `xhjob_pause`。
+
+**生产建议**：恢复后用 `xhjob_state` 确认 `paused=false` 与 `next_fire` 已重算。
+
+---
+
+### `xhjob_cancel`
 
 ```php
 xhjob_cancel(string $id, ?string $name = null, ?string $data_dir = null): bool
 ```
 
+**参数**：`$id` / `$name` / `$data_dir`。
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 取消任务：Pending 任务转 `cancelled` 终态不再触发；Running 任务会收到取消信号并转 `cancelled`。
+- 与 `xhjob_remove` 的区别：cancel 保留任务记录与状态历史，remove 彻底删除。
+
+**代码演示**
+
 ```php
-xhjob_cancel($taskId);
+<?php
+// 用户取消订单关联的延时任务
+if (!xhjob_cancel($orderId . '-timeout', 'default')) {
+    error_log('取消失败：任务可能已终态');
+}
 ```
 
-### xhjob_requeue
+**生产建议**：业务取消优先用 `cancel`（保留审计记录），定期清理再用 `remove`。
 
-将终态任务（Cancelled / Failed / Expired）重新入队回 Pending 以便再次触发。重置 `attempts=0`，`next_fire=now`。参考 Celery `requeue`。
+---
+
+### `xhjob_requeue`
 
 ```php
 xhjob_requeue(string $id, ?string $name = null, ?string $data_dir = null): bool
 ```
 
-**返回值**：`bool`。任务不在可重入队终态或不存在时返回 `false`。
+**参数**：`$id` / `$name` / `$data_dir`。
+
+**返回值**：`bool`。成功重新入队返回 `true`；任务不在可重入队终态（`cancelled` / `failed` / `expired`）或不存在返回 `false`。
+
+**错误契约**：`false` 即失败。
+
+**注意事项**
+- 重置 `attempts` 为 0，`next_fire` 设为当前时间，任务回到 `pending`。
+- 仅对终态任务有效；运行中或 pending 任务调用会返回 `false`。
+
+**代码演示**
 
 ```php
-if (xhjob_requeue($taskId)) {
+<?php
+// 修复后重试一个失败任务
+if (xhjob_requeue($taskId, 'default')) {
     echo "已重新入队\n";
 }
 ```
 
-### xhjob_reschedule
+**生产建议**：配合 `acksOnFailure(false)` 的无限重试任务，requeue 用于人工干预后的强制重试。
 
-在线修改 cron 任务的 cron 表达式。保留任务状态、`execution_count`、`attempts`、`meta`，仅修改 `cron` 与 `next_fire`。参考 APScheduler `reschedule_job`。
+---
+
+### `xhjob_reschedule`
 
 ```php
 xhjob_reschedule(string $id, string $cron, ?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$cron` | `string` | — | 新的 5 字段 cron 表达式 |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`bool`。任务不存在 / 非 cron 任务（interval / runAt）/ 终态 / cron 非法时返回 `false`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$cron` | `string` | 新的 5 字段 cron 表达式 |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：`false` 即失败（cron 表达式非法 / 任务不存在 / IPC 错误）。
+
+**注意事项**
+- 仅修改 cron 表达式并重算 `next_fire`，不改变其他配置。
+- 对非 cron 任务（interval / runAt）调用会返回 `false`。
+
+**代码演示**
 
 ```php
-// 把任务改成每天 8 点执行
-xhjob_reschedule($taskId, '0 8 * * *');
+<?php
+// 从每小时改为每 15 分钟
+xhjob_reschedule($taskId, '*/15 * * * *', 'default');
 ```
 
-### xhjob_modify
+**生产建议**：动态调整频率时用 reschedule，比 remove + 重建更轻量且保留任务 id 与历史。
 
-运行时局部更新任意任务字段。patch JSON 是一个对象，键映射到 Task 字段（cron / interval / priority / tags 等）。
+---
+
+### `xhjob_modify`
 
 ```php
 xhjob_modify(string $id, string $patch_json, ?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$patch_json` | `string` | — | patch 对象 JSON，如 `{"priority":10,"tags":["a"]}` |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`bool`。patch JSON 非法 / 任务不存在 / daemon 拒绝时返回 `false`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$patch_json` | `string` | 补丁 JSON（键值对，覆盖对应字段） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`bool`。成功返回 `true`，失败返回 `false`。
+
+**错误契约**：`false` 即失败。补丁 JSON 解析失败会写入 `tracing::error!("invalid patch json")` 后返回 `false`。
+
+**注意事项**
+- `$patch_json` 必须是合法 JSON 对象；非法 JSON 直接返回 `false`。
+- 适合细粒度字段更新（如改 `priority` / `max_instances`），比 `reschedule`（仅改 cron）更通用。
+
+**代码演示**
 
 ```php
-$patch = json_encode(['priority' => 10, 'tags' => ['urgent', 'billing']]);
-xhjob_modify($taskId, $patch);
+<?php
+$patch = json_encode(['priority' => 10, 'max_instances' => 3]);
+if (!xhjob_modify($taskId, $patch, 'default')) {
+    throw new RuntimeException('修改失败');
+}
 ```
+
+**生产建议**：优先用 `modify` 做增量字段更新，避免 remove + 重建丢失运行历史。
 
 ---
 
-## 四、编排类
+## 编排（6 个）
 
-### xhjob_chain
-
-创建任务链：顺序流水线，每个任务的 stdout 作为下一个任务的 stdin；任一步骤失败则整链转 `failed` 并跳过剩余步骤。参考 Celery `chain(t1, t2, t3)`。
+### `xhjob_chain`
 
 ```php
 xhjob_chain(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$tasks_json` | `string` | — | TaskBuilder 配置对象数组 JSON，如 `[{"type":"shell","cmd":"echo a"}]` |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 `chain_id`；失败返回 `error: <原因>`（含 JSON 解析错误）。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$tasks_json` | `string` | TaskBuilder 配置对象的 JSON 数组 |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`string`。成功为 chain_id；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败（JSON 非法 / IPC 错误 / daemon 返回 `ok=false`）。
+
+**注意事项**
+- 顺序管道：每个任务的 stdout 作为下一个任务的 stdin；任一步失败则 chain 转 `failed`，跳过剩余步骤。
+- `$tasks_json` 是 JSON 数组，如 `[{"task_type":"shell","payload":{"cmd":"echo a"}}, ...]`。
+
+**代码演示**
 
 ```php
-$tasks = json_encode([
-    ['task_type' => 'shell', 'payload' => ['cmd' => 'echo "line1\nline2"']],
-    ['task_type' => 'shell', 'payload' => ['cmd' => 'grep line2']],
-]);
-$result = xhjob_chain($tasks);
-if (!str_starts_with($result, 'error:')) {
-    echo "chain_id = $result\n";
+<?php
+$tasks = [
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'echo hello-world']],
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'grep hello']],
+];
+$r = xhjob_chain(json_encode($tasks), 'default');
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('chain 失败：' . substr($r, 6));
 }
+$chainId = $r;
 ```
 
-### xhjob_chain_state
+**生产建议**：用 `TaskBuilder::chain([...])` 构建而非手拼 JSON，保证字段结构正确。
 
-查询链状态，返回完整 `ChainRecord` JSON（`{chain_id, tasks, current_step, state, created_at, updated_at}`）。
+---
+
+### `xhjob_chain_state`
 
 ```php
 xhjob_chain_state(string $chain_id, ?string $name = null, ?string $data_dir = null): ?string
 ```
 
-**返回值**：`?string`。链不存在或 daemon 不可达返回 `null`。
+**参数**：`$chain_id` / `$name` / `$data_dir`。
+
+**返回值**：`?string`。chain 存在时返回完整 `ChainRecord` JSON（`chain_id` / `tasks` / `current_step` / `state` / `created_at` / `updated_at`）；不存在或 daemon 不可达返回 `null`。
+
+**错误契约**：`null` 即不存在 / 不可达。
+
+**注意事项**：返回 JSON 字符串，需 `json_decode` 取回数组。
+
+**代码演示**
 
 ```php
-$json = xhjob_chain_state($chainId);
-if ($json !== null) {
-    $rec = json_decode($json, true);
-    echo "step={$rec['current_step']} state={$rec['state']}\n";
+<?php
+$json = xhjob_chain_state($chainId, 'default');
+if ($json === null) {
+    echo "chain 不存在\n";
+    return;
 }
+$rec = json_decode($json, true);
+echo "step={$rec['current_step']} state={$rec['state']}\n";
 ```
 
-### xhjob_group
+**生产建议**：监控 chain 的 `current_step` 与 `state`，`failed` 时定位失败步骤。
 
-创建任务组：所有任务并行派发。最终组状态为 `success`（全部成功）/ `partial_failed`（部分失败）/ `failed`（全部失败）。参考 Celery `group(t1, t2, t3)`。
+---
+
+### `xhjob_group`
 
 ```php
 xhjob_group(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
 ```
 
-**返回值**：`string`。成功返回 `group_id`；失败返回 `error: <原因>`。
+**参数**：同 `xhjob_chain`。
+
+**返回值**：`string`。成功为 group_id；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- 并行批量：所有子任务并发派发。终态为 `success`（全部成功）/ `partial_failed`（部分失败）/ `failed`（全部失败）。
+
+**代码演示**
 
 ```php
-$tasks = json_encode([
-    ['task_type' => 'http', 'payload' => ['method' => 'GET', 'url' => 'https://a.test']],
-    ['task_type' => 'http', 'payload' => ['method' => 'GET', 'url' => 'https://b.test']],
-]);
-$groupId = xhjob_group($tasks);
+<?php
+$tasks = [
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'curl -s http://a']],
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'curl -s http://b']],
+];
+$r = xhjob_group(json_encode($tasks), 'default');
+$groupId = str_starts_with($r, 'error:') ? null : $r;
 ```
 
-### xhjob_group_state
+**生产建议**：批量通知 / 报表生成适合 group；注意 `rateLimit` 防止瞬时打爆下游。
 
-查询组状态，返回完整 `GroupRecord` JSON（`{group_id, tasks, state, created_at, updated_at}`）外加实时 `summary`（`{total, succeeded, failed, pending}`）。
+---
+
+### `xhjob_group_state`
 
 ```php
 xhjob_group_state(string $group_id, ?string $name = null, ?string $data_dir = null): ?string
 ```
 
-**返回值**：`?string`。组不存在或 daemon 不可达返回 `null`。
+**参数**：`$group_id` / `$name` / `$data_dir`。
+
+**返回值**：`?string`。group 存在时返回 `GroupRecord` JSON；不存在 / 不可达返回 `null`。
+
+**错误契约**：`null` 即不存在 / 不可达。
+
+**注意事项**：返回 JSON 字符串，需 `json_decode`。
+
+**代码演示**
 
 ```php
-$json = xhjob_group_state($groupId);
-$rec = json_decode($json, true);
-print_r($rec['summary']);
+<?php
+$json = xhjob_group_state($groupId, 'default');
+$rec = $json === null ? null : json_decode($json, true);
+echo $rec['state'] ?? 'unknown';
 ```
 
-### xhjob_chord
+**生产建议**：`partial_failed` 时遍历子任务 state 定位失败项。
 
-创建 chord：header（并行任务）+ body（回调）。所有 header 任务并行执行；全部成功后派发 body，其 `meta` 设为携带每个 header 结果的 JSON 数组。任一 header 失败则 chord 转 `partial_failed` 且不派发 body。参考 Celery `chord(header, body)`。
+---
+
+### `xhjob_chord`
 
 ```php
 xhjob_chord(string $header_json, string $callback_json, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$header_json` | `string` | — | header 任务配置对象数组 JSON |
-| `$callback_json` | `string` | — | 单个回调任务配置对象 JSON |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 `chord_id`；失败返回 `error: <原因>`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$header_json` | `string` | header 任务配置的 JSON 数组（并行执行） |
+| `$callback_json` | `string` | 回调任务配置的 JSON 对象（全部 header 成功后执行） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`string`。成功为 chord_id；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- 参考 Celery chord：header 全部成功后才派发 callback，callback 的 `meta` 携带所有 header 结果。
+- 任一 header 失败时 chord 转 `partial_failed` 终态，**不派发 callback**。
+
+**代码演示**
 
 ```php
-$header = json_encode([
-    ['task_type' => 'shell', 'payload' => ['cmd' => 'echo 1']],
-    ['task_type' => 'shell', 'payload' => ['cmd' => 'echo 2']],
-]);
-$callback = json_encode(['task_type' => 'shell', 'payload' => ['cmd' => 'echo done']]);
-$chordId = xhjob_chord($header, $callback);
+<?php
+$headers = [
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'shard-1.sh']],
+    ['task_type' => 'shell', 'payload' => ['cmd' => 'shard-2.sh']],
+];
+$callback = ['task_type' => 'shell', 'payload' => ['cmd' => 'merge.sh']];
+$r = xhjob_chord(json_encode($headers), json_encode($callback), 'default');
+$chordId = str_starts_with($r, 'error:') ? null : $r;
 ```
 
-### xhjob_chord_state
+**生产建议**：Map-Reduce 场景的理想原语；header 用 group 并行计算，callback 汇总。
 
-查询 chord 状态，返回完整 `ChordRecord` JSON（`{id, header_task_ids, callback_json, callback_task_id, state, created_at, updated_at}`）。
+---
+
+### `xhjob_chord_state`
 
 ```php
 xhjob_chord_state(string $chord_id, ?string $name = null, ?string $data_dir = null): ?string
 ```
 
-**返回值**：`?string`。chord 不存在或 daemon 不可达返回 `null`。
+**参数**：`$chord_id` / `$name` / `$data_dir`。
+
+**返回值**：`?string`。chord 存在时返回 `ChordRecord` JSON（含 `id` / `header_task_ids` / `callback_json` / `callback_task_id` / `state` / `created_at` / `updated_at`）；不存在 / 不可达返回 `null`。
+
+**错误契约**：`null` 即不存在 / 不可达。
+
+**注意事项**：返回 JSON 字符串，需 `json_decode`。
+
+**代码演示**
 
 ```php
-$json = xhjob_chord_state($chordId);
-$rec = json_decode($json, true);
-echo "state={$rec['state']}\n";
+<?php
+$json = xhjob_chord_state($chordId, 'default');
+$rec = $json === null ? null : json_decode($json, true);
+echo $rec['state'] ?? 'unknown';
 ```
+
+**生产建议**：`partial_failed` 时检查 `header_task_ids` 中各 header 任务的 `last_error`。
 
 ---
 
-## 五、事件与进度类
+## 事件与进度（4 个）
 
-### xhjob_events
-
-拉取自 `since_ts`（Unix 秒）以来的任务事件，可按 `task_id` 过滤。参考 APScheduler `EVENT_JOB_*`。
+### `xhjob_events`
 
 ```php
 xhjob_events(int $since_ts, ?string $task_id = null, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$since_ts` | `int` | — | 起始时间戳（Unix 秒） |
-| `$task_id` | `?string` | `null` | 仅返回该任务的事件 |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 JSON 数组（元素为 `{task_id, event_type, payload, ts}`）；失败返回 `error: <原因>`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$since_ts` | `int` | 起始 Unix 时间戳（秒） |
+| `$task_id` | `?string` | 任务 ID 过滤（`null` = 全部任务） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`string`。成功为 JSON 数组 `[{task_id, event_type, payload, ts}, ...]`；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- 返回 JSON 字符串，需 `json_decode($r, true)` 取回数组。
+- `$task_id` 过滤仅返回该任务的事件。
+
+**代码演示**
 
 ```php
-$since = time() - 3600; // 最近 1 小时
-$json = xhjob_events($since, $taskId);
-$events = json_decode($json, true);
-foreach ($events as $e) {
-    echo "{$e['ts']} {$e['event_type']}\n";
+<?php
+$r = xhjob_events(time() - 3600, $taskId, 'default');
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('events 失败：' . substr($r, 6));
+}
+foreach (json_decode($r, true) as $ev) {
+    printf("[%d] %s: %s\n", $ev['ts'], $ev['event_type'], $ev['task_id']);
 }
 ```
 
-### xhjob_pull_events
+**生产建议**：审计 / 调试单个任务生命周期用 `events`；全局事件流用 `pull_events`。
 
-拉取自 `since_ts` 以来的任务事件，可按 `event_type` 过滤（如 `started` / `succeeded` / `failed`）。
+---
+
+### `xhjob_pull_events`
 
 ```php
 xhjob_pull_events(int $since_ts, ?string $event_type = null, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$since_ts` | `int` | — | 起始时间戳（Unix 秒） |
-| `$event_type` | `?string` | `null` | 事件类型过滤 |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`string`。成功返回 JSON 数组；失败返回 `error: <原因>`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$since_ts` | `int` | 起始 Unix 时间戳（秒） |
+| `$event_type` | `?string` | 事件类型过滤（`started` / `succeeded` / `failed` / ...） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`string`。成功为 JSON 数组 `[{task_id, event_type, payload, ts}, ...]`；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- 与 `xhjob_events` 的区别：`events` 按 `task_id` 过滤，`pull_events` 按 `event_type` 过滤。
+- 适合按事件类型订阅（如只拉取 `failed` 事件做告警）。
+
+**代码演示**
 
 ```php
-// 只看最近 1 小时的失败事件
-$json = xhjob_pull_events(time() - 3600, 'failed');
-$failed = json_decode($json, true);
+<?php
+$r = xhjob_pull_events(time() - 600, 'failed', 'default');
+if (!str_starts_with($r, 'error:')) {
+    $fails = json_decode($r, true);
+    // 推送告警...
+}
 ```
 
-### xhjob_report_progress
+**生产建议**：告警网关按 `event_type=failed` 定时拉取，配合 `since_ts` 做增量消费。
 
-上报任务进度（百分比 + 可选元数据）。参考 Celery `update_state(state='PROGRESS', meta=...)`。
+---
+
+### `xhjob_report_progress`
 
 ```php
 xhjob_report_progress(string $id, int $percent, ?string $meta_json = null, ?string $name = null, ?string $data_dir = null): bool
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$id` | `string` | — | 任务 ID |
-| `$percent` | `int` | — | 进度百分比，**必须 0-100**，越界直接返回 `false` 且不联系 daemon |
-| `$meta_json` | `?string` | `null` | 任意 JSON 元数据 |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**返回值**：`bool`。越界 / 服务名非法 / daemon 拒绝返回 `false`。
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `$id` | `string` | 任务 ID |
+| `$percent` | `int` | 进度百分比，**必须 0-100** |
+| `$meta_json` | `?string` | 任意 JSON 元数据 |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
+
+**返回值**：`bool`。上报成功返回 `true`；`$percent` 越界（非 0-100）**直接返回 `false`**（不联系 daemon）；服务名非法 / IPC 失败返回 `false`。
+
+**错误契约**：`false` 即失败。越界检查在联系 daemon 之前完成。
+
+**注意事项**
+- 参考 Celery `update_state(state='PROGRESS', meta=...)`。
+- 进度值可通过 `xhjob_state` 的 `progress` / `progress_meta` 字段读回。
+
+**代码演示**
 
 ```php
-$meta = json_encode(['step' => 'compiling', 'done' => 42]);
-xhjob_report_progress($taskId, 75, $meta);
-// 越界会被拒绝
-var_dump(xhjob_report_progress($taskId, 150)); // false
+<?php
+// 在长时间运行的脚本任务内（需通过 chain/自定义 worker 写入）
+for ($i = 1; $i <= 100; $i++) {
+    do_chunk($i);
+    xhjob_report_progress($taskId, $i, json_encode(['chunk' => $i]));
+}
 ```
 
-### xhjob_inspect
+**生产建议**：进度上报频率不宜过高（建议按 5%-10% 步进），避免 IPC 压力；越界值会被静默丢弃，调用方需自行校验。
 
-聚合检查 daemon 状态。参考 Celery `inspect active / registered / scheduled / stats`。
+---
+
+### `xhjob_inspect`
 
 ```php
 xhjob_inspect(string $mode, ?string $name = null, ?string $data_dir = null): string
 ```
 
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `$mode` | `string` | — | 查询模式（见下） |
-| `$name` | `?string` | `null` | 服务名 |
-| `$data_dir` | `?string` | `null` | 数据目录 |
+**参数**
 
-**`$mode` 取值**：
-
-| 模式 | 含义 | 返回 |
+| 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `active` | 当前运行中的任务 | JSON 数组 |
-| `registered` | cron / interval 注册任务 | JSON 数组 |
-| `scheduled` | 有未来 `next_fire` 的任务 | JSON 数组 |
-| `stats` | 聚合 WorkerStats | JSON 对象 |
+| `$mode` | `string` | 查询模式：`active` / `registered` / `scheduled` / `stats`（默认 `stats`） |
+| `$name` | `?string` | 服务名 |
+| `$data_dir` | `?string` | 数据目录 |
 
-**返回值**：`string`。成功返回 JSON（数组 / 对象取决于模式）；失败返回 `error: <原因>`。
+**返回值**：`string`。成功为 JSON（`active`/`registered`/`scheduled` 返回数组，`stats` 返回对象）；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。
+
+**注意事项**
+- `active`：当前运行中的任务；`registered`：cron / interval 任务；`scheduled`：有未来 `next_fire` 的任务；`stats`：聚合 `WorkerStats`（默认）。
+
+**代码演示**
 
 ```php
-$running = json_decode(xhjob_inspect('active'), true);
-$stats   = json_decode(xhjob_inspect('stats'), true);
-echo "running tasks: " . count($running) . "\n";
+<?php
+$r = xhjob_inspect('stats', 'default');
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('inspect 失败：' . substr($r, 6));
+}
+$stats = json_decode($r, true);
+print_r($stats);
 ```
+
+**生产建议**：监控面板用 `stats` 看全局负载，`active` 看实时并发，`scheduled` 预判未来调度压力。
 
 ---
 
-## 六、Xhjob PHP 类
+## `Xhjob` 链式构建类
 
-`Xhjob` 是扩展内置的链式 builder 类，直接绑定到 Rust 侧的 `TaskBuilder`。所有配置方法返回 `&mut self`（PHP 中即 `$this`），支持链式调用，最后用 `dispatch()` 派发。
+`Xhjob` 是 Rust 侧暴露的链式任务构建器（与 ThinkPHP 扩展包的 `TaskBuilder` PHP 类功能等价但来源不同）。所有配置方法返回 `&mut self`（PHP 侧可链式调用），`dispatch()` 终结并返回 task_id。
 
-{: .note }
-ext-php-rs 会把 Rust 的 `snake_case` 方法名自动转换为 PHP 的 `camelCase`（如 `data_dir` → `dataDir`，`with_headers` → `withHeaders`）。
+> **命名注意**：ext-php-rs 会把 Rust 的 `snake_case` 方法名自动转为 PHP 的 `camelCase`（如 `with_retry` → `withRetry`）。但 **指定任务 ID 的方法实际暴露名为 `id`**（不是 `withId`）——尽管其 Rust doc 注释写的是 `PHP: withId(string $id): $this`，由于 `id` 是单词无下划线、不触发转换，**PHP 侧真实方法名是 `id()`**。下文签名均按真实暴露名书写。
 
-### 创建实例
+### 入口与绑定
+
+#### `Xhjob::task`
 
 ```php
 Xhjob::task(): Xhjob
 ```
 
-工厂方法，返回一个空的 `Xhjob` 实例。
+**参数**：无。
+
+**返回值**：`Xhjob`。新建一个使用默认 `TaskBuilder` 的实例。
+
+**错误契约**：不抛异常。
+
+**注意事项**：静态工厂入口，等价于 `new Xhjob()`（构造受 `#[php_class]` 控制，外部通过 `task()` 创建）。
+
+**代码演示**
 
 ```php
-$xj = Xhjob::task();
+<?php
+$x = Xhjob::task();
 ```
 
-### 任务类型与目标
+**生产建议**：所有链式调用的起点。
 
-#### viaShell
-
-设置任务为 shell 类型。
-
-```php
-viaShell(string $cmd): $this
-```
-
-```php
-Xhjob::task()->viaShell('echo hi');
-```
-
-#### viaHttp
-
-设置任务为 HTTP 类型。
-
-```php
-viaHttp(string $method, string $url): $this
-```
-
-```php
-Xhjob::task()->viaHttp('POST', 'https://api.test/users');
-```
-
-### 服务与目录
-
-#### service
-
-绑定到命名服务，后续 `dispatch()` 路由到该服务 daemon。
+#### `service`
 
 ```php
 service(string $name): $this
 ```
 
-```php
-Xhjob::task()->service('cron-svc');
-```
+**参数**：`$name` — 服务名。
 
-#### dataDir
+**返回值**：`$this`。
 
-设置数据目录，`dispatch()` 据此解析 IPC socket 路径。
+**错误契约**：不抛异常（服务名校验延迟到 `dispatch`）。
+
+**注意事项**：绑定到命名服务，后续 `dispatch()` 路由到该服务 daemon。
+
+**代码演示**：`Xhjob::task()->service('cron-svc')->viaShell('echo hi')->dispatch();`
+
+**生产建议**：多服务场景显式绑定，避免依赖默认 `default`。
+
+#### `dataDir`
 
 ```php
 dataDir(string $dir): $this
 ```
 
+**参数**：`$dir` — 数据目录路径。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。
+
+**注意事项**：用于备份 / 迁移 / 恢复场景，把 IPC socket 解析到自定义目录。
+
+**代码演示**：`Xhjob::task()->dataDir('/var/lib/xhjob')->...`
+
+**生产建议**：仅在多目录部署时使用。
+
+### 任务类型
+
+#### `viaShell`
+
 ```php
-Xhjob::task()->dataDir('/var/lib/xhjob');
+viaShell(string $cmd): $this
 ```
+
+**参数**：`$cmd` — shell 命令。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。
+
+**注意事项**：切换为 shell 任务，命令通过子进程执行。
+
+**代码演示**：`Xhjob::task()->viaShell('ls -la')->dispatch();`
+
+**生产建议**：命令中避免拼接用户输入，防注入。
+
+#### `viaHttp`
+
+```php
+viaHttp(string $method, string $url): $this
+```
+
+**参数**：`$method` — HTTP 方法；`$url` — 请求 URL。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。
+
+**注意事项**：切换为 http 任务。
+
+**代码演示**：`Xhjob::task()->viaHttp('GET', 'https://api.x/y')->dispatch();`
+
+**生产建议**：非幂等方法（POST/PUT/DELETE/PATCH）默认对 5xx 不重试，需重试时声明 `idempotent(true)`。
 
 ### HTTP 专属
 
-#### withHeaders
-
-设置 HTTP 请求头（覆盖之前设置）。PHP 关联数组转换为 `Vec<(String, String)>`。
+#### `withHeaders`
 
 ```php
 withHeaders(array $headers): $this
 ```
 
-```php
-Xhjob::task()->viaHttp('GET', 'https://a.test')
-    ->withHeaders(['Authorization' => 'Bearer xxx', 'Accept' => 'application/json']);
-```
+**参数**：`$headers` — 键值对请求头（PHP 关联数组转 `Vec<(String,String)>`）。
 
-#### withBody
+**返回值**：`$this`。
 
-设置 HTTP 请求体。
+**错误契约**：不抛异常（覆盖之前设置）。
+
+**注意事项**：关联数组直接传入即可。
+
+**代码演示**：`->withHeaders(['Authorization' => 'Bearer x'])->...`
+
+**生产建议**：敏感头（token）从环境变量取，勿硬编码。
+
+#### `withBody`
 
 ```php
 withBody(string $body): $this
 ```
 
-```php
-Xhjob::task()->viaHttp('POST', 'https://a.test')
-    ->withBody(json_encode(['k' => 'v']));
-```
+**参数**：`$body` — 请求体字符串。
 
-#### withProxy
+**返回值**：`$this`。
 
-设置 HTTP / SOCKS5 代理。支持 `http://` / `https://` / `socks5://` / `socks5h://`，URL 可含 `user:pass@` 凭证。
+**错误契约**：不抛异常。
+
+**注意事项**：JSON 请求体需自行 `json_encode`。
+
+**代码演示**：`->withBody(json_encode(['k' => 'v']))->...`
+
+**生产建议**：大 body 注意超时配置。
+
+#### `withProxy`
 
 ```php
 withProxy(string $proxy): $this
 ```
 
-```php
-Xhjob::task()->viaHttp('GET', 'https://a.test')
-    ->withProxy('socks5h://user:pass@127.0.0.1:1080');
-```
+**参数**：`$proxy` — 代理 URL（支持 `http://` / `https://` / `socks5://` / `socks5h://`，可含 `user:pass@`）。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。
+
+**注意事项**：写到任务顶层 `proxy` 字段（非 `payload.proxy`）。
+
+**代码演示**：`->withProxy('socks5://127.0.0.1:1080')->...`
+
+**生产建议**：内网爬取 / 出海请求走代理。
 
 ### Shell 专属
 
-#### withEncoding
-
-设置 shell 任务输出编码（大小写不敏感，转发给 `encoding_rs::Encoding::for_label`）。`auto` 在 Windows 触发 OEM 代码页检测（Unix 无副作用）。
+#### `withEncoding`
 
 ```php
 withEncoding(string $from): $this
 ```
 
-```php
-Xhjob::task()->viaShell('chcp 936 && echo 你好')
-    ->withEncoding('GBK');
-```
+**参数**：`$from` — 编码标签（`GBK` / `Big5` / `Shift_JIS` / `auto` 等，大小写不敏感）。
 
-#### withTimezone
+**返回值**：`$this`。
 
-设置 IANA 时区（如 `Asia/Shanghai`），cron 在此时区下计算 `next_fire`。非法时区会导致 `dispatch()` 失败。
+**错误契约**：不抛异常；非法标签在解码时按默认处理。
 
-```php
-withTimezone(string $tz): $this
-```
+**注意事项**：stdout/stderr 字节流按此编码解码为 UTF-8；`auto` 在 Windows 触发 OEM 代码页检测（Unix 无操作）。
 
-```php
-Xhjob::task()->viaShell('echo 9am')->cron('0 9 * * *')->withTimezone('America/New_York');
-```
+**代码演示**：`->withEncoding('GBK')->viaShell('chcp 936 && dir')->...`
 
-### 重试与超时
-
-#### withRetry
-
-设置重试策略。
-
-```php
-withRetry(int $max, int $delay): $this
-```
-
-| 参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `$max` | `int` | 最大重试次数 |
-| `$delay` | `int` | 重试间隔秒数 |
-
-```php
-Xhjob::task()->viaShell('flaky-cmd')->withRetry(3, 5);
-```
-
-#### retryBackoff
-
-启用指数退避重试：`min(retry_delay * 2^(attempts-1), retry_delay * 60)`。参考 Celery `retry_backoff`。
-
-```php
-retryBackoff(bool $on): $this
-```
-
-```php
-Xhjob::task()->viaShell('flaky-cmd')->withRetry(5, 2)->retryBackoff(true);
-```
-
-#### timeout
-
-设置单次执行超时（秒）。
-
-```php
-timeout(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('long-job')->timeout(120);
-```
-
-#### softTimeout
-
-设置软超时（优雅退出秒数）。当其严格小于 `timeout` 时，shell 执行器在 `soft_timeout` 秒后发 SIGTERM，若 `(timeout - soft_timeout)` 秒内未退出再发 SIGKILL。传 0 清除软超时。HTTP 任务忽略此字段。参考 Celery `soft_time_limit`。
-
-```php
-softTimeout(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->timeout(60)->softTimeout(50);
-```
+**生产建议**：Windows / 中文环境 shell 任务务必设置编码，避免乱码。
 
 ### 触发器
 
-#### cron
+| 方法 | 签名 | 写入字段 | 说明 |
+| --- | --- | --- | --- |
+| `cron` | `cron(string $expr): $this` | `cron` | 5 字段 cron 表达式 |
+| `orCron` | `orCron(array $exprs): $this` | `or_cron` | 附加 cron，任一匹配即触发（F-1） |
+| `skipDates` | `skipDates(array $ts): $this` | `skip_dates` | 跳过指定日期（任务时区） |
+| `workdaysOnly` | `workdaysOnly(): $this` | `workdays_only` | 仅工作日（周一至周五）触发 |
+| `every` | `every(int $secs): $this` | `interval` | 固定间隔秒；与 `cron`/`runAt` 同时设时后者优先 |
+| `runAt` | `runAt(int $ts): $this` | `run_at` | 一次性绝对时间戳，最高优先级 |
+| `startAt` | `startAt(int $ts): $this` | `start_date` | 起始时间戳，之前不触发 |
+| `endAt` | `endAt(int $ts): $this` | `end_date` | 结束时间戳，之后转 `success` 终态 |
+| `jitter` | `jitter(int $secs): $this` | `jitter` | 调度抖动，避免惊群；`runAt` 任务忽略 |
+| `withTimezone` | `withTimezone(string $tz): $this` | `timezone` | IANA 时区，`next_fire` 按此时区计算 |
+| `misfireGraceTime` | `misfireGraceTime(int $secs): $this` | `misfire_grace_time` | 误触发宽限秒，0=用全局默认 60s |
 
-设置 5 字段 cron 表达式。
+**错误契约**：均不抛异常（校验延迟到 `dispatch`，非法时区 / cron 会导致 `dispatch` 返回 `error:`）。
 
-```php
-cron(string $expr): $this
-```
+**注意事项**
+- `runAt` 优先级最高（覆盖 `cron` + `interval`）。
+- `misfireGraceTime` 仅对 cron 任务有效，配合 `coalesce` 决定漏触发是合并执行还是跳过。
 
-```php
-Xhjob::task()->viaShell('backup')->cron('0 2 * * *'); // 每天 2 点
-```
-
-#### orCron
-
-设置额外的 cron 表达式列表，cron + orCron 任一匹配即触发（F-1）。
-
-```php
-orCron(array $exprs): $this
-```
-
-```php
-Xhjob::task()->viaShell('report')
-    ->cron('0 8 * * 1-5')            // 工作日早 8 点
-    ->orCron(['0 18 * * 5', '0 9 1 * *']); // 或周五晚 6 点 / 月初早 9 点
-```
-
-#### skipDates
-
-设置应跳过的日历日期（任务时区下的日期，F-2），参数为 Unix 时间戳数组。
+**代码演示**
 
 ```php
-skipDates(array $dates): $this
+<?php
+Xhjob::task()
+    ->viaShell('backup.sh')
+    ->cron('0 2 * * 1-5')        // 工作日凌晨 2 点
+    ->withTimezone('Asia/Shanghai')
+    ->misfireGraceTime(300)
+    ->dispatch();
 ```
+
+**生产建议**：跨时区任务显式设 `withTimezone`，勿依赖系统时区。
+
+### 重试 / 超时
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `withRetry` | `withRetry(int $max, int $delay = 1): $this` | 最大重试次数与间隔 |
+| `retryBackoff` | `retryBackoff(bool $on = true): $this` | 指数退避 `min(delay*2^(attempts-1), delay*60)` |
+| `timeout` | `timeout(int $secs): $this` | 硬超时，到期 SIGKILL |
+| `softTimeout` | `softTimeout(int $secs): $this` | 软超时，到期 SIGTERM，未退出再 SIGKILL；`<=0` 清除 |
+| `maxExecutions` | `maxExecutions(int $n): $this` | 最大执行次数，0=无限 |
+
+**错误契约**：均不抛异常。负值会被归零处理（`maxExecutions` 负值转 0，`softTimeout` `<=0` 清除为 None）。
+
+**注意事项**
+- `softTimeout` 必须严格小于 `timeout` 才生效；HTTP 任务忽略 `softTimeout`。
+
+**代码演示**
 
 ```php
-Xhjob::task()->viaShell('job')->cron('0 9 * * *')
-    ->skipDates([strtotime('2026-01-01'), strtotime('2026-10-01')]);
+<?php
+Xhjob::task()
+    ->viaShell('long-job.sh')
+    ->withRetry(3, 5)
+    ->retryBackoff(true)
+    ->softTimeout(60)->timeout(90)
+    ->dispatch();
 ```
 
-#### workdaysOnly
+**生产建议**：长任务务必设 `softTimeout < timeout`，给业务优雅退出窗口。
 
-启用后任务仅在周一至周五触发（F-3）。
+### 并发
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `priority` | `priority(int $p): $this` | 优先级，数值越大越优先 |
+| `maxInstances` | `maxInstances(int $n): $this` | 最大并发实例数 |
+| `allowOverlap` | `allowOverlap(bool $on = true): $this` | 允许重叠执行 |
+| `rateLimit` | `rateLimit(int $count, int $window): $this` | 滑动窗口限流，`count=0` 关闭 |
+
+**错误契约**：不抛异常。
+
+**代码演示**
 
 ```php
-workdaysOnly(): $this
+<?php
+Xhjob::task()
+    ->viaHttp('GET', 'https://api/third-party')
+    ->cron('*/1 * * * *')
+    ->rateLimit(10, 60)        // 60 秒内最多 10 次
+    ->maxInstances(1)
+    ->dispatch();
 ```
 
-```php
-Xhjob::task()->viaShell('job')->cron('0 9 * * *')->workdaysOnly();
-```
-
-#### every
-
-设置 IntervalTrigger 周期（秒）。与 `cron` / `runAt` 互斥，若都设置则 cron / runAt 优先。参考 APScheduler `IntervalTrigger`。
-
-```php
-every(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('poll')->every(60); // 每 60 秒
-```
-
-#### runAt
-
-设置 DateTrigger 绝对时间戳，到点触发一次后立即转 Success 终态。优先级最高（覆盖 cron + interval）。参考 APScheduler `DateTrigger`。
-
-```php
-runAt(int $ts): $this
-```
-
-```php
-Xhjob::task()->viaShell('one-shot')->runAt(time() + 300); // 5 分钟后
-```
-
-#### jitter
-
-设置抖动（秒），随机偏移叠加到 cron / interval 的 `next_fire` 以避免惊群。runAt 任务忽略（精确一次性时间戳）。参考 APScheduler `jitter`。
-
-```php
-jitter(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->jitter(30);
-```
-
-#### expires
-
-设置任务级过期（秒）：Pending 超过该时长（自 `created_at` 起）转 `Expired` 终态。仅影响 Pending，不中断 Running。参考 APScheduler `expires`。
-
-```php
-expires(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->runAt(time() + 600)->expires(300);
-```
-
-### 并发控制
-
-#### priority
-
-设置优先级（数值越大越优先）。
-
-```php
-priority(int $p): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->priority(10);
-```
-
-#### allowOverlap
-
-是否允许同一任务重叠执行。
-
-```php
-allowOverlap(bool $allow): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('* * * * *')->allowOverlap(true);
-```
-
-#### maxInstances
-
-设置最大并发实例数。
-
-```php
-maxInstances(int $n): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('* * * * *')->maxInstances(3);
-```
-
-#### coalesce
-
-是否合并误触发：`true` 把错过的触发合并为一次（仍执行一次），`false` 直接跳过。
-
-```php
-coalesce(bool $c): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->coalesce(true);
-```
-
-#### persist
-
-是否持久化任务。
-
-```php
-persist(bool $p): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->persist(true);
-```
-
-#### maxExecutions
-
-设置 cron 任务最大执行次数（0 = 无限）。
-
-```php
-maxExecutions(int $n): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->maxExecutions(100);
-```
-
-#### misfireGraceTime
-
-设置单任务误触发宽限时间（秒）。0 = 用全局默认（60s）。仅 cron 任务有效。参考 APScheduler `misfire_grace_time`。
-
-```php
-misfireGraceTime(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->misfireGraceTime(120);
-```
-
-### 起止时间
-
-#### startAt
-
-设置起始时间戳，此前 cron 触发被跳过。
-
-```php
-startAt(int $ts): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->startAt(strtotime('2026-08-01'));
-```
-
-#### endAt
-
-设置结束时间戳，此后任务转 Success 终态。
-
-```php
-endAt(int $ts): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->cron('0 * * * *')->endAt(strtotime('2026-12-31'));
-```
+**生产建议**：调用第三方 API 必设 `rateLimit`，防被限流封禁。
 
 ### 可靠性
 
-#### ignoreResult
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `coalesce` | `coalesce(bool $on = true): $this` | 合并漏触发为一次执行 |
+| `persist` | `persist(bool $on = true): $this` | 持久化任务定义 |
+| `acksLate` | `acksLate(bool $on = true): $this` | 延迟确认；daemon 重启时重置 Running→Pending |
+| `acksOnFailure` | `acksOnFailure(bool $on = true): $this` | `false`=失败不 ack，无限重试至成功 / 取消 |
+| `idempotent` | `idempotent(bool $on = true): $this` | 声明 HTTP 任务幂等，非幂等方法也重试 5xx |
+| `ignoreResult` | `ignoreResult(bool $on = true): $this` | fire-and-forget，不存结果；与 `resultTtl>0` 冲突时本项优先 |
+| `resultTtl` | `resultTtl(int $secs): $this` | 结果保留秒数，0=永久 |
+| `expires` | `expires(int $secs): $this` | Pending 超 `secs` 秒转 `expired` 终态；0=不过期 |
 
-启用 fire-and-forget：daemon 跳过 `save_result`，`xhjob_result()` 返回 null。状态机仍正常运转。若同时设 `ignoreResult(true)` 和 `resultTtl(>0)`，记日志且 `ignoreResult` 优先。参考 Celery `ignore_result`。
+**错误契约**：不抛异常。
 
-```php
-ignoreResult(bool $on): $this
-```
-
-```php
-Xhjob::task()->viaShell('high-throughput')->cron('* * * * *')->ignoreResult(true);
-```
-
-#### acksLate
-
-启用延迟确认：daemon 重启时 Running 的 `acksLate=true` 任务自动重置为 Pending（崩溃恢复语义）。参考 Celery `acks_late`。
-
-```php
-acksLate(bool $on): $this
-```
+**代码演示**
 
 ```php
-Xhjob::task()->viaShell('job')->acksLate(true);
+<?php
+Xhjob::task()
+    ->viaHttp('POST', 'https://api/charge')
+    ->idempotent(true)->acksLate(true)
+    ->withRetry(5, 10)
+    ->dispatch();
 ```
 
-#### acksOnFailure
+**生产建议**：幂等的副作用任务用 `idempotent(true)` + `acksLate(true)` 保至少一次执行；非幂等任务保持默认不重试。
 
-失败时是否确认。`true`（默认）失败遵循 `retry_max`；`false` 失败无限重试直到成功或被取消 / 删除。参考 Celery `acks_on_failure`。
+### 元数据 / 身份
 
-```php
-acksOnFailure(bool $on): $this
-```
-
-```php
-Xhjob::task()->viaShell('must-succeed')->withRetry(0, 1)->acksOnFailure(false);
-```
-
-#### resultTtl
-
-设置结果 TTL（秒），0 = 永久保留。
-
-```php
-resultTtl(int $secs): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->resultTtl(3600);
-```
-
-### 元数据与身份
-
-#### id
-
-设置显式任务 ID。**必须匹配 `^[A-Za-z0-9_-]{1,64}$`**（P0-2 fix：防止以 `error:` 开头的 id 破坏 dispatch 错误检测契约，防止含特殊字符的 id 引发下游解析 / SQLite 问题）。空串视为 None（自动生成）。非法 id 不报错，回退为自动生成并记 warn 日志。
-
-```php
-id(string $id): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->id('nightly-backup-2026');
-```
-
-#### replaceExisting
-
-启用后，配合 `id` 使用，dispatch 会整体替换同 id 的已存在任务。参考 APScheduler `replace_existing`。
-
-```php
-replaceExisting(bool $on): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')
-    ->id('nightly-backup')
-    ->replaceExisting(true)
-    ->cron('0 2 * * *');
-```
-
-#### tag
-
-追加单个标签，重复标签自动去重，空标签忽略。参考 APScheduler `tags`。
-
-```php
-tag(string $tag): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->tag('billing')->tag('urgent');
-```
-
-#### rateLimit
-
-设置速率限制：`window` 秒内最多 `count` 次触发，count=0 表示不限。参考 Celery `rate_limit`。
-
-```php
-rateLimit(int $count, int $window): $this
-```
-
-```php
-Xhjob::task()->viaShell('job')->rateLimit(10, 60); // 每分钟最多 10 次
-```
-
-#### idempotent
-
-声明 HTTP 任务为幂等（即使 POST/PUT/DELETE/PATCH 也允许重试）。默认 false 时非幂等方法在 5xx 不重试以防重复副作用；GET/HEAD/OPTIONS 始终可重试。参考 RFC 7231 §4.2.1-2。
-
-```php
-idempotent(bool $on): $this
-```
-
-```php
-Xhjob::task()->viaHttp('POST', 'https://a.test/idempotent-endpoint')
-    ->withRetry(3, 2)->idempotent(true);
-```
-
-#### withMeta
-
-附加用户元数据（JSON 字符串）。
+#### `withMeta`
 
 ```php
 withMeta(string $json): $this
 ```
 
+**参数**：`$json` — 任意 JSON 字符串元数据。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。
+
+**代码演示**：`->withMeta(json_encode(['order_id' => 42]))->...`
+
+#### `tag`
+
 ```php
-Xhjob::task()->viaShell('job')->withMeta(json_encode(['owner' => 'team-a', 'ticket' => 'JIRA-123']));
+tag(string $tag): $this
 ```
 
-### 终端
+**参数**：`$tag` — 标签名（空串静默忽略，重复标签去重）。
 
-#### dispatch
+**返回值**：`$this`。
 
-派发任务到 daemon。
+**代码演示**：`->tag('billing')->tag('nightly')->...`
+
+#### `id`
+
+```php
+id(string $id): $this
+```
+
+**参数**：`$id` — 任务 ID。**须匹配 `^[A-Za-z0-9_-]{1,64}$`**。
+
+**返回值**：`$this`。
+
+**错误契约**：不抛异常。**空串** 视为清除（回退自动生成 UUID）；**非法字符 / 超长** 会在 `tracing::warn!` 记录后回退为自动生成（不 panic，因跨 extern "C" panic 是 UB）。
+
+**注意事项**
+- > ⚠️ **真实方法名是 `id`，不是 `withId`**。Rust doc 注释虽写 `withId`，但 ext-php-rs 对单词方法名不做转换，PHP 侧暴露为 `id()`。调用 `withId()` 会触发 "Call to undefined method" 错误。
+- ID 校验规则防止两类 bug：以 `error:` 开头的 id 会破坏 PHP 侧 `str_starts_with($r, 'error:')` 判错契约；含 JSON / SQL 元字符的 id 会引发下游解析问题。
+
+**代码演示**
+
+```php
+<?php
+Xhjob::task()
+    ->viaShell('cleanup.sh')
+    ->id('nightly-cleanup')        // 注意是 id() 不是 withId()
+    ->replaceExisting(true)
+    ->cron('0 3 * * *')
+    ->dispatch();
+```
+
+**生产建议**：业务幂等任务用稳定业务 id（如 `order-{$id}-timeout`）+ `replaceExisting(true)`，避免重复派发。
+
+#### `replaceExisting`
+
+```php
+replaceExisting(bool $on = true): $this
+```
+
+**参数**：`$on`。
+
+**返回值**：`$this`。
+
+**注意事项**：`true` 且已设 `id` 时，dispatch 覆盖同 id 任务（全量覆写）。
+
+**代码演示**：见 `id`。
+
+### 终结
+
+#### `dispatch`
 
 ```php
 dispatch(): string
 ```
 
-**返回值**：`string`。成功返回 `task_id`；失败返回 `error: <原因>`。
+**参数**：无（服务名 / 数据目录通过 `service()` / `dataDir()` 预绑定）。
+
+**返回值**：`string`。成功为 task_id；失败以 `error:` 前缀返回。
+
+**错误契约**：`str_starts_with($r, 'error:')` 为真即失败。内部经 `block_on` 同步执行 `builder.dispatch()`，错误统一格式化为 `error: <e>`。
+
+**注意事项**
+- 调用后 builder 内部状态被 `take` 清空，**不可重复 dispatch 同一实例**。
+- 与 `TaskBuilder::dispatch($service, $dataDir)` 的区别：`Xhjob` 通过 `service()` / `dataDir()` 绑定参数，不接受 dispatch 参数。
+
+**代码演示**
 
 ```php
-$taskId = Xhjob::task()
-    ->viaShell('echo hello')
-    ->cron('0 * * * *')
-    ->withRetry(3, 2)
+<?php
+$r = Xhjob::task()
     ->service('cron-svc')
-    ->dataDir('/var/lib/xhjob')
+    ->viaShell('echo hi')
+    ->cron('0 * * * *')
     ->dispatch();
-if (str_starts_with($taskId, 'error:')) {
-    throw new RuntimeException('派发失败：' . substr($taskId, 6));
+if (str_starts_with($r, 'error:')) {
+    throw new RuntimeException('dispatch 失败：' . substr($r, 6));
 }
-echo "task_id = $taskId\n";
+$taskId = $r;
 ```
 
----
-
-## 完整链式示例
-
-```php
-// 一个完整的 cron shell 任务：每天 2 点备份，重试 3 次，记录进度元数据
-$taskId = Xhjob::task()
-    ->viaShell('/usr/local/bin/backup.sh')
-    ->withEncoding('UTF-8')
-    ->cron('0 2 * * *')
-    ->withTimezone('Asia/Shanghai')
-    ->withRetry(3, 10)
-    ->retryBackoff(true)
-    ->timeout(1800)
-    ->softTimeout(1700)
-    ->maxExecutions(0)
-    ->persist(true)
-    ->acksLate(true)
-    ->resultTtl(86400)
-    ->id('daily-backup')
-    ->replaceExisting(true)
-    ->tag('backup')
-    ->tag('critical')
-    ->withMeta(json_encode(['owner' => 'ops']))
-    ->startAt(strtotime('today'))
-    ->misfireGraceTime(300)
-    ->dispatch();
-```
+**生产建议**：封装统一包装函数，把 `error:` 检测收敛到一处。

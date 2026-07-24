@@ -1,190 +1,171 @@
----
-title: 架构概览
-parent: 入门
-nav_order: 12
----
-
 # 架构概览
 
-xhjob 由 **PHP 扩展**与**独立 Rust daemon**两部分组成，通过 Unix domain socket（Windows 为命名管道）通信。本页说明组件关系、请求流程、daemon 生命周期，并与 Celery / APScheduler 做概念映射。
+## 概述
+
+xhjob 采用 **PHP 进程 ↔ 独立 daemon** 的双进程架构。PHP 扩展只做 IPC 客户端，所有调度、执行、持久化都在 Rust daemon 内完成。这使得 FPM 请求可以非阻塞地投递任务后立即返回，长任务在 daemon 侧异步执行。
+
+核心组件：PHP 进程（CLI 或 FPM）通过 Unix socket 与独立的 daemon 进程 IPC；daemon 内部含 IPC server、scheduler（cron/interval/date trigger + max_pending 队列）、pool（async 或 thread）、executor（shell/http）、store（InMemory 或 SQLite WAL）、watchdog。
+
+## 函数签名 / 方法签名
+
+daemon 生命周期相关 API：
+
+```php
+xhjob_start(?string $name = null, ?string $data_dir = null): bool
+xhjob_stop(?string $name = null, ?string $data_dir = null): bool
+xhjob_restart(?string $name = null, ?string $data_dir = null): bool
+xhjob_status(?string $name = null, ?string $data_dir = null): array
+xhjob_run_daemon(?string $service_name = null, ?string $data_dir = null): bool  // 隐藏入口
+```
+
+复合编排 API：
+
+```php
+xhjob_chain(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
+xhjob_chain_state(string $chain_id, ?string $name = null, ?string $data_dir = null): ?string
+xhjob_group(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
+xhjob_group_state(string $group_id, ?string $name = null, ?string $data_dir = null): ?string
+xhjob_chord(string $header_json, string $callback_json, ?string $name = null, ?string $data_dir = null): string
+xhjob_chord_state(string $chord_id, ?string $name = null, ?string $data_dir = null): ?string
+```
+
+运行期观测 API：
+
+```php
+xhjob_events(int $since_ts, ?string $task_id = null, ?string $name = null, ?string $data_dir = null): string
+xhjob_pull_events(int $since_ts, ?string $event_type = null, ?string $name = null, ?string $data_dir = null): string
+xhjob_inspect(string $mode, ?string $name = null, ?string $data_dir = null): string
+```
+
+## 参数说明
+
+| API | 参数 | 说明 |
+|-----|------|------|
+| `xhjob_start` | `$name` | 服务名（命名空间化 sock/pid/log/db） |
+| `xhjob_run_daemon` | `$service_name` | 隐藏入口；daemon 通过 re-exec 调用它进入主循环，业务代码不应直接调用 |
+| `xhjob_chain` | `$tasks_json` | 顺序任务数组 JSON |
+| `xhjob_chord` | `$header_json` | header 并行任务数组 JSON |
+| `xhjob_chord` | `$callback_json` | 汇总回调任务 JSON |
+| `*_state` | `$chain_id` / `$group_id` / `$chord_id` | 编排 ID |
+| `xhjob_events` | `$since_ts` | 起始 Unix 时间戳 |
+| `xhjob_events` | `$task_id` | 可选，按任务过滤 |
+| `xhjob_pull_events` | `$event_type` | 可选，按事件类型过滤 |
+| `xhjob_inspect` | `$mode` | 检视模式 |
+
+## 返回值
+
+- `xhjob_start` / `xhjob_stop` / `xhjob_restart`：`bool`。
+- `xhjob_status`：键值对数组，含 `running`（bool）、可选 `pid`、非法时含 `error`。
+- `xhjob_run_daemon`：`bool`（正常进入循环不返回）。
+- `xhjob_chain` / `xhjob_group` / `xhjob_chord`：`string`，编排 ID 或 `error: ...`。
+- `xhjob_chain_state` / `xhjob_group_state` / `xhjob_chord_state`：`?string`，状态 JSON 或 `null`。
+- `xhjob_events` / `xhjob_pull_events` / `xhjob_inspect`：`string`（JSON 字符串或 `error:` 前缀）。
+
+## 注意事项
+
+- **PHP 进程是瘦客户端**：不持有任务队列，重启 PHP-FPM 不影响在跑任务。
+- **daemon 单实例 per 服务名**：同一服务名重复 `xhjob_start()` 会复用已有实例。
+- `xhjob_run_daemon` 是内部入口，业务层不要调用。
+- store 选 InMemory 还是 SQLite WAL 取决于是否开启 persist（`XHJOB_PERSIST` 或 builder 的 `persist(true)`）。
 
 ## 组件图
 
-PHP 进程（CLI 或 FPM）通过扩展导出的 `xhjob_*` 函数发起请求，经 IPC 帧到达独立 daemon 进程；daemon 内部由 scheduler 调度、pool 执行、store 持久化。
-
 ```
-┌─────────────────────────────┐
-│  PHP 进程（CLI / FPM）        │
-│                             │
-│  TaskBuilder / XhjobService │
-│        │                    │
-│        ▼                    │
-│   xhjob_* 扩展函数           │   （27 个导出函数：dispatch / state / result / chain / group ...）
-│        │                    │
-└────────┼────────────────────┘
-         │  IPC 帧（length-prefixed JSON）
-         ▼
-┌──────────────────────────────────────────────────────┐
-│  Daemon（独立 Rust 进程，double-fork + setsid 守护化） │
-│                                                      │
-│   ┌──────────────┐    Unix socket / Named Pipe       │
-│   │  IPC listener │◄──── PHP 进程连接                  │
-│   └──────┬───────┘                                   │
-│          │ handle                                     │
-│          ▼                                            │
-│   ┌──────────────┐   入队    ┌────────────────────┐   │
-│   │  Scheduler    │─────────►│  TaskQueue         │   │
-│   │ (cron/interval│          │ (优先级队列，上限    │   │
-│   │  /runAt 扫描) │          │  XHJOB_MAX_PENDING) │   │
-│   └──────────────┘          └─────────┬──────────┘   │
-│          ▲                            │ spawn         │
-│          │ 周期 tick                   ▼              │
-│          │                   ┌────────────────────┐   │
-│          │                   │  Pool              │   │
-│          │                   │  - async（tokio    │   │
-│          │                   │    M:N，IO 密集）   │   │
-│          │                   │  - thread（1:1，    │   │
-│          │                   │    CPU 密集）       │   │
-│          │                   └─────────┬──────────┘   │
-│          │                             │ run          │
-│          │                             ▼              │
-│          │                   ┌────────────────────┐   │
-│          │                   │  Executor          │   │
-│          │                   │  - shell（sh -c）   │   │
-│          │                   │  - http（hyper）    │   │
-│          │                   └─────────┬──────────┘   │
-│          │                             │ 写状态/结果    │
-│          │                             ▼              │
-│          │                   ┌────────────────────┐   │
-│          └───────────────────│  Store             │   │
-│                              │  - SQLite（WAL，    │   │
-│                              │    persist 模式）   │   │
-│                              │  - InMemory（默认） │   │
-│                              └────────────────────┘   │
-└──────────────────────────────────────────────────────┘
-         ▲
-         │ 轮询 xhjob_state / xhjob_result
-┌────────┴────────────────────┐
-│  PHP 进程读取任务状态/结果     │
-└─────────────────────────────┘
+┌──────────────┐   Unix socket    ┌──────────────────────────────────────┐
+│  PHP 进程     │ ═══════════════► │            daemon (Rust)             │
+│ (CLI / FPM)  │ ◄═══════════════  │                                      │
+│  IPC client  │   IPC reply       │  ┌─────────┐    ┌─────────────────┐  │
+└──────────────┘                   │  │ IPC srv │───►│   scheduler     │  │
+                                   │  └─────────┘    │ cron/interval/  │  │
+                                   │                 │ date trigger    │  │
+                                   │                 │ + max_pending   │  │
+                                   │                 │   队列          │  │
+                                   │                 └────────┬────────┘  │
+                                   │                          ▼           │
+                                   │                 ┌─────────────────┐  │
+                                   │                 │      pool       │  │
+                                   │                 │ async / thread /│  │
+                                   │                 │ coroutine       │  │
+                                   │                 └────────┬────────┘  │
+                                   │                          ▼           │
+                                   │                 ┌─────────────────┐  │
+                                   │                 │    executor     │  │
+                                   │                 │  shell / http   │  │
+                                   │                 └────────┬────────┘  │
+                                   │                          ▼           │
+                                   │                 ┌─────────────────┐  │
+                                   │                 │      store      │  │
+                                   │                 │ InMemory /      │  │
+                                   │                 │ SQLite (WAL)    │  │
+                                   │                 └─────────────────┘  │
+                                   │           watchdog 监控全局          │
+                                   └──────────────────────────────────────┘
 ```
 
-关键点：
+组件职责：
 
-- **PHP 进程不执行任务**，只负责派发与查询，因此 Web 请求不会被任务阻塞。
-- **daemon 是常驻进程**，承载 scheduler / pool / executor / store 全部运行时。
-- **IPC 帧格式**：`[4 字节大端长度][JSON payload]`，单帧上限 8 MB。
-- **IPC 路径**：Unix 为 `<dir>/xhjob.{name}.sock`，Windows 为 `\\.\pipe\xhjob-{name}`。
+| 组件 | 职责 |
+|------|------|
+| PHP 扩展 | 27 个顶层函数 + `Xhjob` builder，IPC 客户端 |
+| IPC server | 监听 Unix socket，鉴权（SO_PEERCRED / API token） |
+| scheduler | cron / interval(`every`) / date(`runAt`) 三种 trigger；受 `max_pending` 队列约束 |
+| pool | `async`(默认) / `thread` / `coroutine` 三种执行池（`XHJOB_POOL_MODE`） |
+| executor | shell（`viaShell`）/ http（`viaHttp`）两种执行器 |
+| store | InMemory 或 SQLite WAL（persist 开启时） |
+| watchdog | 周期巡检（`XHJOB_WATCHDOG_INTERVAL` / `XHJOB_WATCHDOG_FACTOR`） |
 
-## 请求流程详解
+## 请求流程
 
-以 FPM 请求派发一个 shell 任务并随后轮询为例，完整流程如下：
+以 FPM 投递一个 shell 任务为例：
+
+1. **FPM dispatch（非阻塞）**：PHP 进程调用 `Xhjob::task()->viaShell(...)->dispatch()`，扩展经 Unix socket 把任务 JSON 发给 daemon，**不等执行完成**，立即拿到 `task_id` 返回给 HTTP 客户端。
+2. **daemon 入队**：IPC server 收到任务，scheduler 根据 trigger 决定立即入队或按计划排队（受 `XHJOB_MAX_PENDING` 上限约束）。
+3. **pool 取出执行**：pool worker 从队列取任务，交给 executor（shell 派生子进程 / http 发请求），受 `timeout` / `softTimeout` 约束。
+4. **写 store**：执行结果与状态写入 store（InMemory 或 SQLite WAL），供后续 `xhjob_result` / `xhjob_get` / `xhjob_state` 查询。
+5. **PHP 取结果**：CLI 或另一个 FPM 请求用 `task_id` 轮询/拉取结果。
 
 ```
-FPM dispatch()  ──►  扩展函数 xhjob_dispatch()
-                          │
-                          ▼  构造 IPC Request（op + payload + trace_id）
-                    IPC connect（Unix socket）+ write_frame
-                          │
-                          ▼
-                  Daemon IPC listener accept
-                          │
-                          ▼  handle：解析 op，校验任务
-                    Scheduler 入队（TaskQueue.enqueue）
-                          │  超过 XHJOB_MAX_PENDING 拒绝
-                          ▼
-                    Pool 取出任务 spawn（async task / OS thread）
-                          │
-                          ▼
-                    Executor 执行（shell: /bin/sh -c；http: hyper 请求）
-                          │  受 timeout / soft_timeout / retry 约束
-                          ▼
-                    Store 更新状态（running→success/failed）与结果
-                          │
-                          ▼  返回 IPC Response（dispatch 直接返回 task id）
-
-FPM 轮询  ──►  xhjob_state($id)  ──►  IPC ──► Store 查询状态
-FPM 取结果 ──►  xhjob_result($id) ──►  IPC ──► Store 查询结果
+FPM 请求 ──dispatch(非阻塞)──► daemon 队列 ──► executor ──► store
+                                                              ▲
+CLI / FPM ──result/get/state──────────────────────────────────┘
 ```
-
-阶段说明：
-
-| 阶段 | 组件 | 说明 |
-|------|------|------|
-| 派发 | `xhjob_dispatch` | 把 TaskBuilder JSON 通过 IPC 帧发给 daemon，立即返回 task id，不等待执行 |
-| 入队 | Scheduler / TaskQueue | 按 priority 入队；超过 `XHJOB_MAX_PENDING`（默认 10000）拒绝，防 cron 风暴打爆内存 |
-| 调度 | Scheduler | cron / interval / runAt 触发器周期扫描，到点把 pending 任务推给 pool |
-| 执行 | Pool + Executor | async 模式 tokio M:N 调度（默认，IO 密集）；thread 模式 1:1 OS 线程（CPU 密集）。Executor 调 shell 或 http |
-| 持久化 | Store | persist 模式写 SQLite（WAL）；否则用 InMemory。状态/结果/执行次数均落库 |
-| 查询 | `xhjob_state` / `xhjob_result` | FPM 短连接读 daemon，单次 IPC 往返返回当前状态/结果 |
-
-> **IPC 超时保护**：每个 FPM 可达的调用点都套了 `XHJOB_IPC_TIMEOUT_SECS`（默认 5 秒）超时。原因是 `max_execution_time` **无法中断 C 级阻塞调用**——若 daemon 死锁/被 SIGSTOP，没有这个超时会让 FPM worker 永久阻塞，逐个耗尽 worker 池直至 502/504 且无法自愈。
 
 ## daemon 生命周期
 
-daemon 的启停通过 PHP 端的两组 API 暴露，底层都走 `src/daemon/mod.rs`。
+| 操作 | API | 行为 |
+|------|-----|------|
+| 启动 | `xhjob_start()` | 拉起 Rust daemon，写 PID 文件，进入主循环 |
+| 停止 | `xhjob_stop()` | 优雅停止，`XHJOB_SHUTDOWN_DRAIN_SECS` 内排空在跑任务 |
+| 重启 | `xhjob_restart()` | stop + start，持久化任务调度不丢 |
+| 状态 | `xhjob_status()` | 返回 `running` / `pid` / `error` |
+| 内部循环 | `xhjob_run_daemon()` | 隐藏入口，re-exec 后进入 daemon 循环，业务勿调 |
 
-### 全局函数
-
-| 函数 | 作用 |
-|------|------|
-| `xhjob_start($name, $dataDir)` | 启动 daemon（幂等）。返回 `true` 前等待 **PID 文件写入 AND socket 可连接**双条件 |
-| `xhjob_stop($name, $dataDir)` | 停止 daemon：SIGTERM → 轮询退出 → 必要时 SIGKILL（仅当 PID 文件含 starttime 时） |
-| `xhjob_restart($name, $dataDir)` | 先 stop 再 start |
-| `xhjob_status($name, $dataDir)` | 查询运行状态与 PID |
-
-### XhjobService 封装类
-
-`Xhjob\XhjobService` 在上述函数之上提供更易用的便捷方法：
-
-| 方法 | 作用 |
-|------|------|
-| `start()` | 调 `xhjob_start` 后 `wait(10, true)` 等待就绪，返回 daemon PID |
-| `stop()` | 调 `xhjob_stop` |
-| `restart()` | 调 `xhjob_restart` 后等待就绪，返回新 PID |
-| `status()` | 归一化 `xhjob_status` 返回值为 `['running' => bool, 'pid' => int|null]` |
-| `healthCheck()` | running 且 pid>0 视为健康，返回 `['healthy', 'pid', 'stats']` |
-| `wait($timeoutSec, $expectRunning)` | 轮询 status 直到进入期望状态或超时 |
-| `ensureRunning()` | 未运行则自动 start |
-| `ensureStopped()` | 运行中则 stop 并等待退出 |
-
-### 启动等待的双条件
-
-`xhjob_start` 返回 `true` 之前会循环（最多 100 次 × 100ms）检查两个条件**同时满足**：
-
-1. PID 文件存在，且其中记录的 PID 仍存活、starttime 匹配（防 PID 复用）；
-2. IPC socket 可以成功 `connect`。
-
-仅检查 PID 文件有竞态：daemon 写 PID 在 bind socket 之前，若只等 PID，紧接的 dispatch 会因 socket 未就绪而 `Connection refused`。
-
-### PID 复用防护
-
-daemon 写 PID 文件时同时记录自己的 **starttime**（Linux `/proc/<pid>/stat` 第 22 字段）。后续读取方用 `is_process_alive_with_starttime(pid, Some(starttime))` 校验：PID 存活但 starttime 不匹配，说明该 PID 已被无关进程复用，视为「daemon 已死」。停止时也只在 starttime 已记录的情况下才允许升级到 SIGKILL，避免误杀复用 PID 的无辜进程（fail-safe）。
+PID 文件采用双行格式（`pid\nstarttime`，starttime 取自 `/proc/{pid}/stat` 字段 22），用于防止 PID 复用误判（详见 [安装与配置](install-config.md)）。
 
 ## 与 Celery / APScheduler 概念映射
 
-如果你熟悉 Python 生态，下表帮你快速建立对应关系：
+| 外部概念 | xhjob 对应 | 说明 |
+|----------|-----------|------|
+| Celery worker | daemon + pool + executor | 独立进程承担执行 |
+| Celery task | `Xhjob` builder / `TaskBuilder` | 链式构建后 `dispatch()` |
+| Celery `apply_async` | `dispatch()` | 投递 |
+| Celery `result.get` | `xhjob_result` / `xhjob_get` | 取结果 |
+| Celery chain | `xhjob_chain` | 顺序依赖 |
+| Celery group | `xhjob_group` | 并行批次 |
+| Celery chord | `xhjob_chord` | header 并行 + callback 汇总 |
+| Celery retry | `withRetry(max, delay)` / `retryBackoff` | 重试与退避 |
+| Celery rate_limit | `rateLimit(count, window)` | 限流 |
+| APScheduler CronTrigger | `cron($expr)` / `orCron($exprs)` | cron 触发 |
+| APScheduler IntervalTrigger | `every($secs)` | 间隔触发 |
+| APScheduler DateTrigger | `runAt($ts)` | 一次性定时 |
+| APScheduler jobstore | store (InMemory / SQLite WAL) | 持久化 |
+| APScheduler misfire_grace | `misfireGraceTime($secs)` | 错过补偿窗口 |
+| APScheduler coalesce | `coalesce(bool)` | 合并积压 |
 
-| Celery / APScheduler 概念 | xhjob 对应 | 说明 |
-|--------------------------|-----------|------|
-| worker（Celery） | daemon | 常驻进程，承载调度与执行 |
-| task（Celery） | Task | 一个可调度单元，由 TaskBuilder 构建 |
-| queue（Celery） | TaskQueue | 优先级队列，受 `XHJOB_MAX_PENDING` 限流 |
-| beat（Celery） / Scheduler（APScheduler） | scheduler（cron/interval 扫描） | 周期扫描触发器，到点入队 |
-| result backend（Celery） | store（SQLite / InMemory） | 存储任务状态与结果 |
-| `acks_late`（Celery） | `acksLate` | 任务执行成功后才 ack，崩溃可重投 |
-| `soft_time_limit`（Celery） | `soft_timeout` | 软超时：先发 SIGTERM，给任务清理机会 |
-| `time_limit`（Celery） | `timeout`（hard） | 硬超时：超时后 SIGKILL |
-| `rate_limit`（Celery） | `rate_limit_count` + `rate_limit_window` | 滑动窗口限流 |
-| `retry_backoff`（Celery） | `retry_backoff` | 重试指数退避 |
-| CronTrigger（APScheduler） | `cron()` | 5/6 字段 cron 表达式 |
-| IntervalTrigger（APScheduler） | `every()` | 固定间隔触发 |
-| DateTrigger（APScheduler） | `runAt()` | 一次性绝对时间触发 |
-| `misfire_grace_time`（APScheduler） | `misfire_grace_time` | 错过触发的宽限时间 |
-| `coalesce`（APScheduler） | `coalesce` | 多次积压触发合并为一次 |
-| `max_instances`（APScheduler） | `max_instances` | 同任务最大并发实例数 |
+## 生产建议
 
-## 下一步
-
-- 完整环境变量与路径配置：[安装与配置](install-config/)
-- 上手跑通第一个任务：[快速开始](quickstart/)
+- **daemon 与 FPM 分离部署**：daemon 用 systemd 常驻，FPM 只做 IPC 客户端，互不拖累。
+- **pool 模式按负载选**：IO 密集用默认 `async`（`XHJOB_ASYNC_POOL_SIZE=1024`）；CPU 密集用 `thread`（`XHJOB_THREAD_POOL_SIZE=num_cpus`）。
+- **持久化生产必开**：`XHJOB_PERSIST=true` + SQLite WAL，重启不丢调度。
+- **编排优先用原生 API**：chain/group/chord 在 daemon 侧原子编排，比 PHP 端自己轮询拼装更可靠。
+- **监控用 inspect/events**：`xhjob_inspect($mode)` 看运行时统计，`xhjob_events` / `xhjob_pull_events` 订阅事件流做告警。

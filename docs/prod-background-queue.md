@@ -1,237 +1,299 @@
+# 后台任务队列
+
+> 生产实战篇 · FPM 非阻塞派发 · daemon 队列执行 · CLI worker 轮询结果 · 进度上报 · 失败重试
+
+Web 场景下，PHP-FPM 请求的生命周期通常只有几百毫秒到几秒，无法承载耗时几分钟的报表生成、视频转码、批量推送等任务。Xhjob 的后台任务队列模式把「派发」与「执行」解耦：FPM 请求只负责把任务投递到 daemon 队列后立即返回 task_id，真正的执行在独立 Rust daemon 内异步完成；需要结果的业务方再由 CLI worker 轮询拉取。
+
+本文档按 **架构说明 → 完整可运行代码 → 注意事项 → 生产建议** 的结构展开。
+
 ---
-title: 生产实战：后台任务队列
-parent: 生产实战
-nav_order: 51
----
 
-# 生产实战：后台任务队列
-
-本篇演示如何用 xhjob 把**耗时的后台处理**从 FPM Web 请求中剥离：Web 请求只做"非阻塞派发 + 立即返回 task_id"，真正的执行交给独立 daemon，前端再通过 CLI worker 或轮询接口拿结果与进度。这是 APScheduler / Celery 在单机 PHP 场景下的等价做法，无需引入 Redis / RabbitMQ / Supervisor。
-
-## 架构
+## 架构说明
 
 ```
-┌──────────────┐   ① xhjob_dispatch（非阻塞，立即返回 task_id）   ┌──────────────────────┐
-│  FPM Web 请求 │ ──────────────────────────────────────────────▶ │  Rust daemon         │
-│  (PHP)       │                                                 │  ┌────────────────┐  │
-└──────────────┘                                                 │  │ 队列调度器      │  │
-       ▲                                                         │  │ (rate_limit/    │  │
-       │ ⑤ HTTP 返回 task_id 给前端                                │  │  retry/coalesce)│  │
-       │                                                         │  └───────┬────────┘  │
-       │                                                         │          ▼           │
-       │                                                         │  ┌────────────────┐  │
-       │                                                         │  │ executor        │  │
-       │                                                         │  │ (shell/http)    │  │
-       │                                                         │  └───────┬────────┘  │
-       │                                                         │          ▼           │
-       │                                                         │  ┌────────────────┐  │
-       │                                                         │  │ store           │  │
-       │                                                         │  │ (InMemory/SQLite)│ │
-       │                                                         │  └───────▲────────┘  │
-       │                                                         └──────────┼───────────┘
-       │                                                                    │
-       │ ④ xhjob_result($id) / xhjob_state($id)                             │
-┌──────┴─────────┐   ② while 轮询状态/结果 + 超时处理                          │
-│  CLI worker    │ ◀─────────────────────────────────────────────────────────┘
-│  (php 进程)    │   ③ xhjob_report_progress($id, $pct, $meta)
-└────────────────┘      （任务脚本内部上报进度，写入 store）
+┌────────────────┐   dispatch (非阻塞 IPC)   ┌─────────────────────────────────────────────┐
+│  FPM 请求      │ ════════════════════════► │              daemon (Rust)                  │
+│  (毫秒级)      │ ◄════════════════════════  │                                             │
+│  返回 task_id  │   立即回 task_id           │  ┌───────────┐   ┌───────────┐   ┌────────┐ │
+└────────────────┘                           │  │ scheduler │──►│  pool     │──►│executor│ │
+                                             │  │ (队列)    │   │ async/    │   │shell/  │ │
+┌────────────────┐   state / result 轮询     │  └───────────┘   │ thread    │   │http    │ │
+│  CLI worker    │ ════════════════════════► │                  └───────────┘   └───┬────┘ │
+│  (长驻轮询)    │ ◄════════════════════════  │                                    │      │
+│  拉取结果/状态  │   state / result JSON     │  ┌─────────────────────────────────▼────┐ │
+└────────────────┘                           │  │  store (SQLite WAL / InMemory)        │ │
+                                             │  │  任务定义 · 状态机 · 结果 · 事件流     │ │
+                                             │  └──────────────────────────────────────┘ │
+                                             └─────────────────────────────────────────────┘
 ```
 
-数据流：
+数据流分三段：
 
-1. **FPM 侧**调用 `xhjob_dispatch`（或 `TaskBuilder::...->dispatch()`）非阻塞派发，立即拿到 `task_id`。
-2. **CLI worker**（或前端轮询）通过 `xhjob_state($id)` / `xhjob_result($id)` 查询进度与结果。
-3. **任务脚本**在执行过程中调用 `xhjob_report_progress($id, $pct, $meta)` 上报进度，进度写入 store。
-4. CLI worker 调 `xhjob_result($id)` 取最终 stdout / stderr / exit_code。
-5. FPM 把 `task_id` 返回给前端，前端用该 id 轮询状态接口。
+1. **派发（FPM → daemon）**：FPM worker 调用 `TaskBuilder::shell(...)->dispatch()`，扩展经 Unix socket 把任务 JSON 发给 daemon 后**立即返回 task_id**，IPC 耗时通常在毫秒级。FPM 请求即可结束，不等待任务执行。
+2. **执行（daemon 内部）**：daemon scheduler 从队列取出任务，交给 pool（async 协程池或 thread 线程池），executor 执行 shell/http，结果与状态写入 store。
+3. **消费（CLI worker ← daemon）**：独立的 CLI 长驻进程通过 `xhjob_state` / `xhjob_result` 轮询任务状态与结果，进入终态后取回结果并落库或回调业务。
 
-## FPM 侧：非阻塞派发
+> PHP 进程（无论 FPM 还是 CLI）都是**瘦 IPC 客户端**，不持有队列。重启 PHP-FPM 不影响 daemon 中正在执行的任务。
 
-FPM worker 的核心原则是**派发即返回，绝不阻塞等待结果**。`xhjob_dispatch` 本质是一次本地 Unix socket IPC（默认 5s 超时保护），提交后立即返回 `task_id`。
+---
+
+## 完整可运行代码
+
+### 1. FPM 侧：非阻塞派发
+
+FPM 请求内构建任务并派发，立即返回 task_id 给前端。对不需要回读结果的 fire-and-forget 任务，启用 `ignoreResult(true)` 节省 DB 写入；用 `rateLimit` 防止瞬时打爆下游；用 `withRetry` + `retryBackoff` 应对临时失败。
 
 ```php
 <?php
-// === FPM Web 请求内：派发后台任务 ===
+// app/controller/Report.php  （FPM 请求内）
+namespace app\controller;
+
 use Xhjob\TaskBuilder;
-use Xhjob\XhjobService;
 
-// 确保 daemon 已启动（幂等，已运行则直接返回）
-$svc = new XhjobService('queue-svc', '/var/lib/xhjob');
-$svc->ensureRunning();
+class Report
+{
+    /**
+     * POST /report/generate
+     *
+     * 入队一个报表生成任务，立即返回 task_id，前端凭 task_id 轮询进度。
+     */
+    public function generate(): array
+    {
+        $userId = (int) ($_POST['user_id'] ?? 0);
+        $date   = $_POST['date'] ?? date('Y-m-d');
 
-// 业务数据（来自 HTTP 请求）
-$data = $_POST['payload'] ?? '';
-$jobArg = escapeshellarg($data);
+        // 业务幂等键：同一用户同一天只允许一个在途任务
+        $taskId = 'report-' . $userId . '-' . str_replace('-', '', $date);
 
-// 非阻塞派发：立即返回 task_id
-$taskId = TaskBuilder::shell('php /app/jobs/process.php ' . $jobArg)
-    ->ignoreResult(false)                  // 需要取结果，保留 stdout
-    ->rateLimit(100, 60)                   // 限流：60 秒内最多 100 个，防雪崩
-    ->withRetry(3, 5)                      // 失败重试 3 次，间隔 5 秒
-    ->retryBackoff(true)                   // 指数退避：5,10,20... 上限 5*60
-    ->timeout(300)                         // 单次执行硬超时 5 分钟
-    ->softTimeout(270)                     // 软超时 4.5 分钟，先 SIGTERM 再 SIGKILL
-    ->dispatch('queue-svc', '/var/lib/xhjob');
+        // 派发 shell 任务：报表脚本接收 task_id 以便上报进度
+        $id = TaskBuilder::shell(
+                'php /app/bin/generate-report.php ' . escapeshellarg($taskId)
+                    . ' ' . escapeshellarg((string) $userId)
+                    . ' ' . escapeshellarg($date)
+            )
+            ->withId($taskId)              // 业务幂等 ID（TaskBuilder PHP 类用 withId）
+            ->replaceExisting(true)        // 同 id 覆盖，防重复派发
+            ->ignoreResult(true)           // fire-and-forget：FPM 不读结果，节省 DB
+            ->rateLimit(100, 60)           // 60 秒内最多 100 个，防爆队列
+            ->withRetry(3, 5)              // 失败重试 3 次，间隔 5 秒
+            ->retryBackoff(true)           // 指数退避：5s → 10s → 20s
+            ->timeout(600)                 // 单次执行硬超时 10 分钟
+            ->softTimeout(540)             // 软超时 9 分钟，给业务优雅退出
+            ->maxInstances(1)              // 同任务最多 1 个实例并发
+            ->tag('report')
+            ->withMeta(json_encode(['user_id' => $userId, 'date' => $date]))
+            ->dispatch('default', '/var/lib/xhjob');  // 指定服务名 + 数据目录
 
-// 立即把 task_id 返回给前端，前端用它轮询状态
-header('Content-Type: application/json');
-echo json_encode([
-    'task_id' => $taskId,
-    'status'  => 'dispatched',
-    // 前端轮询：GET /jobs/status?task_id=xxx
-    'poll'    => '/jobs/status?task_id=' . urlencode($taskId),
-]);
+        // dispatch 成功返回 task_id；失败返回 "error: ..." 字符串
+        if (str_starts_with($id, 'error:')) {
+            throw new \RuntimeException('派发失败：' . substr($id, 6));
+        }
+
+        // 立即返回，不等任务执行
+        return ['task_id' => $id, 'status' => 'queued'];
+    }
+}
 ```
 
-{: .warning }
-> **绝对不要在 FPM 请求内调用 `waitForResult` / `waitForState`**。这两个方法会轮询 IPC，把 FPM worker 钉死在请求上，迅速耗尽 worker 池导致 502/504。需要同步等结果时改用 CLI worker 或独立轮询服务。
+### 2. CLI worker：轮询状态与结果
 
-## CLI worker：轮询结果
-
-CLI worker 是一个常驻 `php` 进程，负责消费 `task_id` 队列、轮询状态、取结果、处理超时。它和 FPM 共用同一个 `service_name` + `data_dir`，因此连的是同一个 daemon。
+对于需要回读结果的任务（**不要**设 `ignoreResult(true)`），用一个独立 CLI 长驻进程轮询。下面是一个通用 worker，从业务队列拉取待消费的 task_id，轮询 `xhjob_state` 确认终态后用 `xhjob_result` 取回结果。
 
 ```php
+#!/usr/bin/env php
 <?php
-// === CLI worker：worker.php ===
-// 运行：nice -n 10 php /app/worker.php
-use Xhjob\TaskManager;
+// bin/result-worker.php  （CLI 长驻，systemd 托管）
+//
+// 用途：消费业务侧记录的 task_id 队列，轮询 xhjob 取回结果后回写业务库。
+// 启动：php bin/result-worker.php
+// 托管：systemd unit（Restart=on-failure）
 
-$mgr = new TaskManager('queue-svc', '/var/lib/xhjob');
+$name    = 'default';
+$dataDir = '/var/lib/xhjob';
+$pollInterval = 2;       // 轮询间隔（秒）
+$maxWaitSecs  = 1800;    // 单任务最长等待 30 分钟
 
-// 待处理的 task_id 队列（实际从 DB / Redis / 文件 / 消息队列读取）
-$pendingIds = fetchPendingTaskIds();
+// 从业务 DB 取出待消费的 task_id 列表（示例用文件代替）
+function fetchPendingTaskIds(): array
+{
+    $file = '/var/run/xhjob-result-queue.json';
+    if (!is_file($file)) {
+        return [];
+    }
+    $ids = json_decode((string) file_get_contents($file), true) ?: [];
+    return is_array($ids) ? $ids : [];
+}
 
-foreach ($pendingIds as $id) {
-    $timeoutSec = 600;          // 单任务最长等待 10 分钟
-    $deadline   = time() + $timeoutSec;
+function markConsumed(string $taskId): void
+{
+    $file = '/var/run/xhjob-result-queue.json';
+    $ids  = fetchPendingTaskIds();
+    unset($ids[$taskId]);
+    file_put_contents($file, json_encode(array_values($ids)), LOCK_EX);
+}
+
+function consumeResult(string $taskId, int $maxWaitSecs): void
+{
+    global $name, $dataDir;
+    $deadline = time() + $maxWaitSecs;
+    $terminal = ['success', 'failed', 'cancelled', 'expired', 'interrupted'];
 
     while (time() < $deadline) {
-        try {
-            $state = $mgr->state($id);           // 查状态
-        } catch (\Throwable $e) {
-            // daemon 重启中等临时错误，退避后重试
-            usleep(500000);
+        $state = xhjob_state($taskId, $name, $dataDir);
+
+        if (isset($state['error'])) {
+            // daemon 不可达或任务不存在：退避后重试，不放弃
+            fwrite(STDERR, "[" . date('c') . "] state error: {$state['error']}\n");
+            sleep(5);
             continue;
         }
 
-        $s = $state['state'] ?? 'unknown';
-        if (in_array($s, ['success', 'failed', 'cancelled', 'expired', 'interrupted'], true)) {
-            // 终态：取结果并退出
-            $result = $mgr->result($id);
-            handleTerminal($id, $s, $result);     // 业务处理：写 DB / 通知前端
-            break;
-        }
+        $s = $state['state'] ?? 'UNKNOWN';
+        $progress = isset($state['progress']) ? (int) $state['progress'] : 0;
+        fwrite(STDOUT, "[" . date('c') . "] {$taskId} state={$s} progress={$progress}%\n");
 
-        // 非终态：打印进度，继续轮询
-        $pct = $state['progress_percent'] ?? null;
-        if ($pct !== null) {
-            echo "[{$id}] 进度 {$pct}%\n";
+        if (in_array($s, $terminal, true)) {
+            // 进入终态，取结果
+            $result = xhjob_result($taskId, $name, $dataDir);
+            if (isset($result['error'])) {
+                fwrite(STDERR, "[" . date('c') . "] {$taskId} no result: {$result['error']}\n");
+            } else {
+                $exitCode = $result['exit_code'] ?? ($result['status_code'] ?? '-');
+                $stdout   = $result['stdout'] ?? $result['body'] ?? '';
+                fwrite(STDOUT, "[" . date('c') . "] {$taskId} DONE exit={$exitCode}\n");
+                fwrite(STDOUT, "  stdout=" . substr((string) $stdout, 0, 500) . "\n");
+                // TODO: 回写业务库 / 触发回调
+            }
+            return;
         }
-        usleep(300000);                          // 300ms 轮询
+        sleep($pollInterval ?? 2);
     }
 
-    if (time() >= $deadline) {
-        // 超时未完成：取消任务并标记
-        $mgr->stop($id);                          // 取消（xhjob_cancel）
-        markTimeout($id);
+    // 超时未完成：记录告警，交给人工或重试机制
+    fwrite(STDERR, "[" . date('c') . "] {$taskId} TIMEOUT after {$maxWaitSecs}s\n");
+}
+
+// 主循环
+fwrite(STDOUT, "[" . date('c') . "] result-worker started\n");
+while (true) {
+    $ids = fetchPendingTaskIds();
+    foreach ($ids as $taskId) {
+        consumeResult((string) $taskId, $maxWaitSecs);
+        markConsumed((string) $taskId);
     }
+    sleep($pollInterval);
 }
 ```
 
-CLI worker 进入终态后退出本轮循环，可由 systemd / supervisor 拉起下一轮，或循环消费新 id。
+### 3. 进度上报：任务脚本内调用 `xhjob_report_progress`
 
-## 进度上报
+长任务脚本通过自身的 task_id 上报进度，前端 / worker 可通过 `xhjob_state` 的 `progress` / `progress_meta` 字段读回。
 
-长任务应向前端反馈进度。任务脚本内部调用 `xhjob_report_progress` 上报百分比与任意 JSON 元数据，daemon 将其写入 store，`xhjob_state` 的返回值即携带进度。
+```php
+#!/usr/bin/env php
+<?php
+// bin/generate-report.php  （被 daemon shell executor 拉起的子进程）
+//
+// 用法：php generate-report.php <task_id> <user_id> <date>
+// task_id 由 FPM 派发时传入，用于上报进度。
+
+$taskId = $argv[1] ?? '';
+$userId = (int) ($argv[2] ?? 0);
+$date   = $argv[3] ?? date('Y-m-d');
+
+if ($taskId === '') {
+    fwrite(STDERR, "missing task_id\n");
+    exit(1);
+}
+
+$steps = [
+    'fetch-data'    => '从 DB 拉取原始数据',
+    'aggregate'     => '聚合统计',
+    'render'        => '渲染模板',
+    'upload'        => '上传到对象存储',
+    'notify'        => '发送通知',
+];
+
+$total = count($steps);
+$i = 0;
+foreach ($steps as $key => $desc) {
+    $i++;
+    $percent = (int) round($i / $total * 100);
+
+    // 上报进度：0-100，越界返回 false（不会联系 daemon）
+    $ok = xhjob_report_progress(
+        $taskId,
+        $percent,
+        json_encode(['step' => $key, 'desc' => $desc], JSON_UNESCAPED_UNICODE)
+    );
+    if (!$ok) {
+        fwrite(STDERR, "report_progress failed at {$percent}% (step={$key})\n");
+        // 进度上报失败不阻断业务，继续执行
+    }
+
+    // 执行实际业务（模拟）
+    doStep($key, $userId, $date);
+}
+
+// stdout 会被 daemon 捕获为结果（除非 ignoreResult=true）
+echo json_encode(['task_id' => $taskId, 'url' => '/reports/' . $taskId . '.xlsx']);
+exit(0);
+
+function doStep(string $key, int $userId, string $date): void
+{
+    // ... 实际业务逻辑 ...
+    usleep(500000); // 模拟耗时
+}
+```
+
+### 4. 失败重试配置
+
+`withRetry` 设定最大重试次数与基础间隔，`retryBackoff(true)` 启用指数退避（`min(delay * 2^(attempts-1), delay * 60)`）。两者组合是后台任务对抗临时故障的核心手段。
 
 ```php
 <?php
-// === 任务脚本：/app/jobs/process.php ===
-// 由 daemon 以 shell 任务拉起，$argv[1] 是业务数据
-$taskId = $argv[1] ?? '';
-$total  = 1000;
+use Xhjob\TaskBuilder;
 
-for ($i = 1; $i <= $total; $i++) {
-    processOneItem($i);                          // 实际业务处理
+// 调用第三方 HTTP 接口：临时 5xx 自动重试，指数退避避免雪崩
+$id = TaskBuilder::http('POST', 'https://api.example.com/notify')
+    ->withBody(json_encode(['event' => 'order.paid', 'order_id' => 42]))
+    ->withHeaders(['Authorization' => 'Bearer ' . getenv('API_TOKEN')])
+    ->idempotent(true)            // 声明幂等，允许 POST 重试
+    ->withRetry(5, 10)            // 最多重试 5 次，基础间隔 10 秒
+    ->retryBackoff(true)          // 退避：10s → 20s → 40s → 60s(封顶) → 60s
+    ->timeout(30)                 // 单次请求 30 秒超时
+    ->acksOnFailure(true)         // 失败后确认（不无限重试），最终落 failed 终态
+    ->resultTtl(86400)            // 结果保留 1 天供排查
+    ->dispatch();
 
-    // 每 100 条上报一次进度（避免 IPC 过频）
-    if ($i % 100 === 0) {
-        $pct = (int) floor($i / $total * 100);
-        $meta = json_encode([
-            'processed' => $i,
-            'total'     => $total,
-            'items'     => $i,
-        ]);
-        // 上报进度：task_id、百分比、元数据 JSON
-        xhjob_report_progress($taskId, $pct, $meta);
-    }
-}
-
-// 正常退出，exit_code=0 → daemon 标记 Success
-exit(0);
-```
-
-前端 / CLI worker 查询进度：
-
-```php
-$state = $mgr->state($taskId);
-// $state 含 state / progress_percent / progress_meta 等字段
-echo "状态={$state['state']} 进度={$state['progress_percent']}%\n";
-```
-
-## 失败重试配置
-
-`withRetry` + `retryBackoff` 是后台队列的可靠性基石：
-
-```php
-TaskBuilder::shell('php /app/jobs/process.php ' . $jobArg)
-    ->withRetry(3, 5)          // 最多重试 3 次，基础间隔 5 秒
-    ->retryBackoff(true)       // 启用指数退避：5, 10, 20... 上限 retry_delay*60=300s
-    ->acksOnFailure(false)     // 失败时不 ack，便于重试（配合 acksLate 使用）
+// shell 任务：依赖外部资源（DB / 文件）偶发失败，重试 + 退避
+$id = TaskBuilder::shell('php /app/bin/import-csv.php --file=/data/today.csv')
+    ->withRetry(3, 5)
+    ->retryBackoff(true)
+    ->softTimeout(50)->timeout(60)
+    ->maxInstances(1)             // 防止重叠导入
     ->dispatch();
 ```
 
-- `withRetry(3, 5)`：任务失败（非零退出码 / 超时）后，最多重试 3 次，每次基础间隔 5 秒。
-- `retryBackoff(true)`：启用指数退避，重试延迟按 `min(retry_delay * 2^(attempts-1), retry_delay * 60)` 增长，避免短时间内反复冲击失败的下游。
-- `acksOnFailure(false)`：失败时不确认，配合 `acksLate(true)` 可在 daemon 崩溃后重投（见[定时任务](prod-cron/)与崩溃恢复文档）。
+---
 
 ## 注意事项
 
-| 关注点 | 建议 |
-|------|------|
-| **FPM 内不要 `waitForResult`** | `waitForResult` / `waitForState` 会轮询 IPC 钉死 FPM worker，迅速耗尽 worker 池。FPM 只做派发，等结果交给 CLI worker 或前端轮询。 |
-| **worker 进程用 `nice` 降权** | CLI worker 与 daemon 同机运行，用 `nice -n 10 php worker.php` 降低其 CPU 优先级，避免与 FPM 抢资源。 |
-| **`ignoreResult(true)` 省 DB 写入** | 不需要取结果的高吞吐任务（如纯通知、心跳）设 `ignoreResult(true)`，daemon 跳过 `save_result`，减少 SQLite 写入。本篇因需取结果，故设 `false`。 |
-| **高并发用 `rateLimit` 防雪崩** | `rateLimit(100, 60)` 限制 60 秒窗口内最多 100 次执行，避免下游被瞬时流量压垮。 |
-| **IPC 超时保护** | 所有 `xhjob_*` 通信默认 5s 超时（`XHJOB_IPC_TIMEOUT_SECS`），daemon 死锁时 FPM worker 不会被永久阻塞。 |
-| **任务幂等性** | 开启重试 / `acksLate` 后任务可能被重复执行，业务逻辑必须幂等（如用唯一键去重、状态机判断）。 |
-| **进度上报频率** | 上报过频会增加 IPC 开销，建议按批次（如每 100 条 / 每 5%）上报一次。 |
+- **FPM 请求内严禁 `waitForResult` / `waitForState` 长轮询**：`TaskManager::waitForResult()` 内部是 `while` 轮询，会占住 FPM worker 直到超时。FPM worker 数量有限（通常 5~50），几个长轮询就能把整个站点拖垮。轮询只在 CLI worker 内做。
+- **worker 用 `nice` 降权**：CLI worker 是常驻进程，应 `nice -n 10 php bin/result-worker.php` 降低调度优先级，避免与 FPM / Nginx 抢 CPU。
+- **`ignoreResult(true)` 节省 DB**：fire-and-forget 任务不写结果表，减少 SQLite 写入压力。但一旦设置，`xhjob_result` 永远返回 `error`，CLI worker 无法取回输出——只适合「不关心结果」的场景（如发通知）。需要回读结果的任务**不要**设此项。
+- **`rateLimit` 防爆**：批量派发时务必设 `rateLimit(count, window)`，否则瞬时大量任务会打爆下游 API 或 daemon 队列。限流是滑动窗口语义，`count=0` 关闭。
+- **`maxInstances(1)` 防重叠**：对不允许并发执行的任务（如数据导入），设 `maxInstances(1)`，前一轮未完成时新一轮会被跳过并记 `max_instances_reached` 事件。
+- **进度上报频率**：`xhjob_report_progress` 每次都是一次 IPC 往返，建议按 5%~10% 步进上报，不要每个循环都调。越界值（非 0-100）直接返回 `false`，不联系 daemon。
+- **task_id 传递**：任务脚本需要知道自己的 task_id 才能上报进度。派发时把 task_id 作为 shell 参数传入（见上方代码）。若用自动生成的 UUID，派发后把返回的 id 写入脚本能读到的位置（如环境变量 `XHJOB_TASK_ID`，由 shell executor 注入）。
 
-## 完整端到端示例
+---
 
-把上述三段拼起来：FPM 派发 → 任务脚本上报进度 → CLI worker 取结果。
+## 生产建议
 
-```php
-<?php
-// === 1. FPM 派发（Web 请求内）===
-$taskId = TaskBuilder::shell('php /app/jobs/process.php ' . escapeshellarg($payload))
-    ->rateLimit(100, 60)
-    ->withRetry(3, 5)
-    ->retryBackoff(true)
-    ->timeout(300)
-    ->dispatch('queue-svc', '/var/lib/xhjob');
-// 返回 task_id 给前端
-
-// === 2. 任务脚本上报进度（/app/jobs/process.php 内）===
-xhjob_report_progress($taskId, 50, json_encode(['items' => 500]));
-
-// === 3. CLI worker 取结果（worker.php 内）===
-$mgr = new \Xhjob\TaskManager('queue-svc', '/var/lib/xhjob');
-if ($mgr->waitForState($taskId, 'success', 600)) {
-    $r = $mgr->result($taskId);
-    echo "stdout: " . ($r['stdout'] ?? '') . "\n";
-    echo "exit_code: " . ($r['exit_code'] ?? -1) . "\n";
-}
-```
-
-> `waitForState` 仅在 **CLI worker** 中使用，绝不在 FPM 请求内调用。
+- **daemon 用 systemd 托管**：不要让 FPM 请求拉起 daemon（`ensureRunning`）。生产环境 daemon 应由 systemd 长驻（`Restart=on-failure`），FPM / CLI 都只做 IPC 客户端。详见 [CLI 与 FPM 共用服务连接](prod-cli-fpm-share.md)。
+- **结果落库后及时 `remove`**：CLI worker 取回结果并写入业务库后，调 `xhjob_remove($taskId)` 清理 daemon 侧的任务记录与结果，避免 SQLite 表无限膨胀。对 `ignoreResult(true)` 的任务也建议定期清理。
+- **监控三件套**：用 `xhjob_inspect('stats')` 看队列深度与 worker 负载；用 `xhjob_pull_events(time() - 600, 'failed')` 拉取最近 10 分钟失败事件接告警；用 `xhjob_pull_events(time() - 600, 'max_instances_reached')` 监控被跳过的任务。
+- **FPM 侧设 `XHJOB_IPC_TIMEOUT_SECS`**：FPM worker 派发时若 daemon 卡死，IPC 会阻塞。设 `XHJOB_IPC_TIMEOUT_SECS=3`（小于 FPM 的 `max_execution_time`），让 FPM worker 快速失败而非挂死。PHP 的 `max_execution_time` **无法中断** C 级 socket 阻塞，必须靠此环境变量兜底。
+- **队列容量**：`XHJOB_MAX_PENDING`（默认 10000）限制待处理任务上限。派发超过上限会返回 `error:`，业务侧应捕获并降级（如写入本地 fallback 队列稍后重投）。
+- **进程隔离**：CLI worker 与 FPM 共用同一 daemon（同 `service_name` + `data_dir`），但 worker 进程本身独立。建议 worker 单独部署在非 Web 节点，只通过网络（或共享 socket 目录）连 daemon，避免与 Web 流量争抢 CPU。

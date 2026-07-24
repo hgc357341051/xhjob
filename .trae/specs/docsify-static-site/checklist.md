@@ -6,11 +6,23 @@
 - [ ] 旧 Jekyll 文档（index.md、6 个分组索引页、19 篇带 front matter 的内容文档）已删除
 
 ## 阶段二：Docsify 骨架
-- [ ] `docs/index.html` 存在，引入 docsify.js + search/prism/emoji 插件，配置 loadSidebar/coverpage/subMaxLevel/search/auto2top/name
-- [ ] `docs/.nojekyll` 存在（GitHub Pages 静态模式不忽略 `_` 文件）
-- [ ] `docs/_coverpage.md` 存在，含项目名 + 简介 + 快速开始按钮 + GitHub 链接
-- [ ] `docs/_sidebar.md` 存在，6 分组导航（入门/API 参考/核心能力/进阶/生产实战/排障）链接到对应 markdown
-- [ ] `docs/README.md` 存在，含项目介绍 + 核心特性 + 快速开始代码 + 部署方式说明
+- [ ] `docs/index.html` 存在，引入 docsify.js + search/prism(PHP/Rust/Bash/JSON)/emoji/copy-to-clipboard 插件，配置 loadSidebar/coverpage/subMaxLevel/search/auto2top/name/logo/themeColor
+- [ ] `docs/.nojekyll` 存在
+- [ ] `docs/assets/img/logo.svg` 存在（X + 队列几何，主色 #3B82F6）
+- [ ] `docs/assets/css/custom.css` 存在，含完整主题样式
+- [ ] `docs/_coverpage.md` 存在，含 Logo + 标题 + 副标题 + 徽章行 + 三个 CTA 按钮
+- [ ] `docs/_sidebar.md` 存在，6 分组导航带 emoji 分组标题与分隔线
+- [ ] `docs/README.md` 存在，含特性卡片网格 + 快速开始 + 部署方式
+
+## 阶段二补充：站点设计样式核对
+- [ ] custom.css 含亮/暗双模式 CSS 变量（--primary #3B82F6 / --primary-dark #1E40AF / --accent #F59E0B / 亮色 --bg #FFFFFF --text #1F2937 / 暗色 --bg #0F172A --text #E2E8F0 --code-bg #1E293B）
+- [ ] 封面页样式：全屏渐变 linear-gradient(135deg,#3B82F6,#8B5CF6)、居中 flex、超大标题、徽章 inline-flex 圆角、CTA 按钮实心+描边两式
+- [ ] 特性卡片网格：CSS Grid repeat(auto-fill,minmax(280px,1fr))、box-shadow、hover translateY(-4px) 动画
+- [ ] 代码块：prism 主题覆盖、复制按钮右上角、hover 显示、点击「已复制」反馈、overflow-x:auto
+- [ ] 表格：表头主色背景+白字、斑马纹 nth-child(even)、hover 高亮、圆角 overflow hidden、移动端横向滚动
+- [ ] 侧边栏：分组标题大写+主色、子项缩进、active 高亮左边框
+- [ ] 主题切换按钮：右上角固定、三态 ☀️/🌙/🖥️、localStorage 持久化、[data-theme] 切换
+- [ ] 移动端 @media max-width:768px：侧边栏 transform 隐藏+汉堡菜单、卡片单列、表格/代码横向滚动、封面 clamp 字号
 
 ## 阶段三：入门篇
 - [ ] `docs/quickstart.md` 含前置条件、so 下载加载、第一个 shell 任务、第一个 cron 任务、注意事项

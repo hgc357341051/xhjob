@@ -1,165 +1,347 @@
----
-title: 编排（chain/group/chord）
-parent: 核心能力
-nav_order: 35
----
-
 # 编排（chain / group / chord）
 
-Xhjob 提供三种任务编排原语，对齐 Celery 的 chain / group / chord 语义，分别覆盖 **顺序流水线**、**并行批处理**、**并行 + 回调** 三类组合场景。相关实现位于 `src/scheduler/chain.rs`、`src/scheduler/group.rs` 与 `src/scheduler/chord.rs`。
+> 核心能力篇 · 顺序执行 · 并行汇总 · 回调栅栏 · 三种编排原语的状态查询与对比
 
-三种编排均可通过 `TaskBuilder` 的工厂方法创建并直接 `dispatch()`，也可通过 `TaskManager` 的 `createChain` / `createGroup` / `createChord` 方法创建。
+Xhjob 提供三种编排原语，覆盖「顺序流水线 / 并行扇出 / 并行+回调聚合」三大场景。本文档按 **签名 → 行为说明 → 注意事项 → 代码演示 → 生产建议** 的统一结构展开，并在末尾给出三者对比表。
 
 ---
 
-## chain（顺序执行）
+## 1. chain — 顺序执行（上一步 stdout → 下一步 stdin）
 
-`TaskBuilder::chain(array $builders)` 将多个任务串联成一条 **顺序流水线**：
+### 签名
 
-- 任务按数组顺序依次执行。
-- **上一步的 stdout 作为下一步的 stdin**，形成数据传递管道。
-- 任意一步失败则 **中断整条链**，剩余步骤被跳过，链状态变为 `failed`。
-- 所有步骤成功后，链状态变为 `success`。
+```php
+// TaskBuilder 静态工厂（self 链式，最后用 dispatch() 终结）
+public static function chain(array $builders): self
+public function dispatch(): string
 
-参考 Celery `chain(t1, t2, t3)`。
+// PHP 函数（底层，需自行组装 tasks_json）
+function xhjob_chain(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
+//   返回 chain_id，失败返回 "error: ..."
 
-> 实现细节：链记录以 `TaskBuilder` JSON 列表形式持久化。每步成功后 daemon 递增 `current_step` 并派发下一步。为防止"两个并发完成回调同时读取 `current_step=N` 并各自推进到 N+2、跳过某步且重复某步"的 check-then-act 竞态，每个 chain_id 由一把独立 mutex 串行化 `advance()` 操作。
+// TaskManager
+public function chainState(string $chainId): ?array
+
+// PHP 函数（状态查询）
+function xhjob_chain_state(string $chain_id, ?string $name = null, ?string $data_dir = null): ?string
+//   返回 ChainRecord JSON 或 null
+```
+
+### 行为说明
+
+`chain` 把多个子任务按数组顺序串联：
+
+- 顺序执行：第 N 步必须等第 N-1 步完成才开始；
+- **数据传递**：每一步的 **stdout 原样作为下一步的 stdin**（典型 Unix 管道语义）；
+- **失败中断**：任一步失败（非 0 退出 / 超时 / 假死），整条链立即终止，state 置为 `failed`，后续步骤不再执行；
+- 全部成功后链 state 置为 `success`，链结果取**最后一步的 stdout**。
+
+### 注意事项
+
+- stdin/stdout 是**字节流**，不解析为 JSON；如需结构化传递，业务侧自行 `json_encode` / `json_decode`。
+- 链中任一子任务也可单独 `persist(true)`，整体崩溃恢复按子任务粒度重派。
+- `chain()` 是**静态工厂**，参数是 `TaskBuilder[]`，每个 builder 不要单独调 `dispatch()`。
 
 ### 代码演示
 
 ```php
-use Xhjob\TaskBuilder;
+<?php
+// 三步流水线：抓数据 → 清洗 → 入库
+$chainId = \Xhjob\TaskBuilder::chain([
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.example.com/raw'),
+    (new \Xhjob\TaskBuilder())->shell('jq -c ".[] | select(.active)"'),
+    (new \Xhjob\TaskBuilder())->shell('php /app/bin/import.php'),
+])
+    ->timeout(60)
+    ->persist(true)
+    ->dispatch();
 
-// 三步流水线：echo 输出 → 转大写 → 统计字节数
-// step1 的 stdout 传给 step2 的 stdin，step2 的 stdout 传给 step3 的 stdin
-$chainId = TaskBuilder::chain([
-    TaskBuilder::shell('echo step1-data'),
-    TaskBuilder::shell('tr a-z A-Z'),   // 接收 step1 的 stdout
-    TaskBuilder::shell('wc -c'),         // 接收 step2 的 stdout
-])->dispatch();
+echo "chain_id = {$chainId}\n";
+
+// 轮询链状态
+while (true) {
+    $state = xhjob_chain_state($chainId);
+    $rec = json_decode($state, true);
+    echo "chain state = {$rec['state']}, step = {$rec['current_step']}/{$rec['total_steps']}\n";
+    if (in_array($rec['state'], ['success', 'failed'], true)) break;
+    usleep(500_000);
+}
+print_r($rec);
 ```
 
-也可通过 `TaskManager` 创建：
+### 生产建议
 
-```php
-use Xhjob\TaskBuilder;
-use Xhjob\TaskManager;
-
-$mgr = new TaskManager('default', '/var/lib/xhjob');
-
-$chainId = $mgr->createChain([
-    TaskBuilder::shell('echo step1-data'),
-    TaskBuilder::shell('tr a-z A-Z'),
-    TaskBuilder::shell('wc -c'),
-]);
-```
+- 链长建议 ≤ 10 步，过长用 `group` 拆并行。
+- 每步脚本开头加 `set -euo pipefail`，避免静默失败导致后续步骤拿到空 stdin。
 
 ---
 
-## group（并行执行）
+## 2. group — 并行执行 + 汇总
 
-`TaskBuilder::group(array $builders)` 将多个任务作为一个 **并行批** 同时派发：
+### 签名
 
-- 所有子任务 **并发执行**。
-- 每个子任务完成后，daemon 更新其完成记录。
-- 全部完成后汇总 group 结果。
+```php
+// TaskBuilder 静态工厂
+public static function group(array $builders): self
+public function dispatch(): string
 
-状态流转：`pending` → `running` → `success`（全部成功）/ `partial_failed`（部分失败）/ `failed`（全部失败）。
+// PHP 函数
+function xhjob_group(string $tasks_json, ?string $name = null, ?string $data_dir = null): string
+//   返回 group_id，失败返回 "error: ..."
 
-参考 Celery `group(t1, t2, t3)`。
+// TaskManager
+public function groupState(string $groupId): ?array
 
-> 实现细节：group 记录以 `TaskBuilder` JSON 列表持久化。创建时 daemon 并发派发所有子任务；`group_state` 查询时实时读取各子任务的当前状态聚合得出（而非维护冗余计数器），对长生命周期 group 可接受；超大 group（>10k 任务）未来可能引入反范式完成计数器。
+// PHP 函数（状态查询，返回 GroupRecord JSON + summary）
+function xhjob_group_state(string $group_id, ?string $name = null, ?string $data_dir = null): ?string
+```
+
+### 行为说明
+
+`group` 把多个子任务**并行**派发，所有子任务同时跑：
+
+- 并发执行：所有子任务一次性入队，由 daemon 双线程池调度；
+- 等待全部完成（success 或 failed）后，group 进入终态；
+- 终态汇总规则：
+  - 全部 success → `success`
+  - 全部 failed → `failed`
+  - 部分 failed → `partial_failed`
+- `group_state` 返回的 JSON 含 `summary` 字段，含 `total / success / failed` 计数。
+
+### 注意事项
+
+- 并发量受 daemon 线程池容量限制（async 默认 1024，thread 默认 CPU 核数），超过会排队。
+- group 不做数据传递，子任务之间**互相独立**，如需聚合结果用 `chord`。
+- `partial_failed` 是 group 独有的终态，chain / chord 不会出现。
 
 ### 代码演示
 
 ```php
-use Xhjob\TaskBuilder;
+<?php
+// 并行抓取 5 个数据源
+$groupId = \Xhjob\TaskBuilder::group([
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.a.com/data'),
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.b.com/data'),
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.c.com/data'),
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.d.com/data'),
+    (new \Xhjob\TaskBuilder())->shell('curl -s https://api.e.com/data'),
+])
+    ->timeout(30)
+    ->persist(true)
+    ->dispatch();
 
-// 并行抓取 3 个用户信息
-$groupId = TaskBuilder::group([
-    TaskBuilder::http('GET', 'https://api.example.com/user/1'),
-    TaskBuilder::http('GET', 'https://api.example.com/user/2'),
-    TaskBuilder::http('GET', 'https://api.example.com/user/3'),
-])->dispatch();
+echo "group_id = {$groupId}\n";
+
+// 轮询，关注 summary
+while (true) {
+    $raw = xhjob_group_state($groupId);
+    $rec = json_decode($raw, true);
+    $s = $rec['summary'];
+    echo "group state = {$rec['state']}, success={$s['success']}/{$s['total']}, failed={$s['failed']}\n";
+    if (in_array($rec['state'], ['success', 'partial_failed', 'failed'], true)) break;
+    usleep(500_000);
+}
+print_r($rec);
 ```
+
+### 生产建议
+
+- 子任务数 > 池容量时，拆成多个 group 串行执行，避免单个 group 长时间占满池。
+- 用 `summary.failed` 触发补偿：`partial_failed` 时对失败子任务重派一个新 group。
 
 ---
 
-## chord（并行 + 回调）
+## 3. chord — header 并行 + callback 回调栅栏
 
-`TaskBuilder::chord(array $headerBuilders, self $callback)` 是 group 的增强版：header 并行执行，**全部成功后** 派发 callback 回调任务。
+### 签名
 
-- **header**：一组并行任务，行为同 group。
-- **callback**：header 全部成功后才派发的回调任务。callback 的 `meta` 被设置为一个 JSON 数组，携带每个 header 任务的结果（`{ id, result }`，含 stdout / stderr / exit_code / body / status_code）。
-- **header 任一失败**（failed / cancelled / expired）→ chord 直接进入 **`partial_failed` 终态**，**callback 不被派发**。
+```php
+// TaskBuilder 静态工厂
+public static function chord(array $headerBuilders, self $callback): self
+public function dispatch(): string
 
-参考 Celery `chord(header, body)`。
+// PHP 函数
+function xhjob_chord(string $header_json, string $callback_json, ?string $name = null, ?string $data_dir = null): string
+//   返回 chord_id，失败返回 "error: ..."
 
-> 实现细节：chord 记录持久化 `header_task_ids` 与 `callback_json`。状态流转：`running` → `success`（全部 header 成功 → 派发 callback）/ `partial_failed`（任一 header 失败 → 不派发 callback）。为防止"两个并发 header 完成回调同时通过 all-succeeded 检查、重复插入并派发 callback"，每个 chord_id 由一把独立 mutex 串行化 `refresh_state`。
+// TaskManager
+public function chordState(string $chordId): ?array
 
-> 空 chord（header 为空数组）遵循 Celery `chord([])` 的 no-op 语义：立即转 `success` 终态，不派发 callback。
+// PHP 函数（状态查询）
+function xhjob_chord_state(string $chord_id, ?string $name = null, ?string $data_dir = null): ?string
+```
+
+### 行为说明
+
+`chord` 是「并行 + 栅栏 + 回调」三段式：
+
+1. **header 并发**：`headerBuilders` 数组中的子任务一次性并行派发（类似 group）；
+2. **栅栏等待**：daemon 等待所有 header 完成；
+3. **callback 触发**：仅当**所有 header 全部 success** 时，才派发 `callback` 任务；
+   - callback 的 **meta 携带各 header 的结果**（按 header 顺序的数组），业务可从 meta 取出聚合；
+4. **失败短路**：任一 header failed → **不触发 callback**，chord 直接进入 `partial_failed` 终态。
+
+### 注意事项
+
+- `chord` 的终态只有三种：`success`（header 全成功 + callback 成功）、`partial_failed`（任一 header 失败，callback 不触发）、`failed`（header 全成功但 callback 失败）。
+- callback 是**单个** TaskBuilder，不是数组；它接收的是 header 结果数组，不是 stdout 管道。
+- header 失败时 callback 不会被丢弃，但也不会重试 —— 如需失败补偿，在外层包 `withRetry` 或自行重派。
 
 ### 代码演示
 
 ```php
-use Xhjob\TaskBuilder;
-
-// 3 个 header 并行预处理，全部成功后执行汇总 callback
-$chordId = TaskBuilder::chord(
-    // header：3 个并行任务
+<?php
+// 三个 header 并行抓数据 → 全成功后 callback 聚合入库
+$chordId = \Xhjob\TaskBuilder::chord(
+    // header: 三个并行抓取
     [
-        TaskBuilder::shell('echo header-1'),
-        TaskBuilder::shell('echo header-2'),
-        TaskBuilder::shell('echo header-3'),
+        (new \Xhjob\TaskBuilder())->shell('curl -s https://api.a.com/users'),
+        (new \Xhjob\TaskBuilder())->shell('curl -s https://api.b.com/users'),
+        (new \Xhjob\TaskBuilder())->shell('curl -s https://api.c.com/users'),
     ],
-    // callback：header 全部成功后执行
-    TaskBuilder::shell('echo callback-done')
-        ->withMeta('{"source":"chord"}')
-)->dispatch();
+    // callback: meta 含三个 header 的结果数组
+    (new \Xhjob\TaskBuilder())->shell('php /app/bin/merge-users.php')
+)
+    ->timeout(60)
+    ->persist(true)
+    ->dispatch();
+
+echo "chord_id = {$chordId}\n";
+
+// 轮询
+while (true) {
+    $raw = xhjob_chord_state($chordId);
+    $rec = json_decode($raw, true);
+    echo "chord state = {$rec['state']}, headers_done = {$rec['headers_done']}/{$rec['headers_total']}, callback = {$rec['callback_state']}\n";
+    if (in_array($rec['state'], ['success', 'partial_failed', 'failed'], true)) break;
+    usleep(500_000);
+}
+
+if ($rec['state'] === 'partial_failed') {
+    echo "some header failed, callback NOT triggered\n";
+    print_r($rec['header_results']);   // 看哪个 header 失败
+}
 ```
+
+`merge-users.php` 内读取 callback meta 的方式（业务侧约定）：
+
+```php
+<?php
+// /app/bin/merge-users.php
+// callback 启动时，daemon 把各 header 结果以 JSON 写入环境变量 XHJOB_CHORD_META
+$meta = json_decode(getenv('XHJOB_CHORD_META') ?: '[]', true);
+// $meta = [['stdout'=>'...','exit_code'=>0], ['stdout'=>'...','exit_code'=>0], ...]
+$all = [];
+foreach ($meta as $i => $header) {
+    $users = json_decode($header['stdout'] ?? '[]', true) ?: [];
+    foreach ($users as $u) $all[] = $u;
+}
+echo json_encode($all, JSON_UNESCAPED_UNICODE);
+```
+
+### 生产建议
+
+- chord 是「MapReduce」的 Map 阶段（header）+ Reduce 阶段（callback），适合聚合计算。
+- header 数量 ≥ 3 才有意义用 chord；只有 2 个并行任务用 group 即可。
+- callback 脚本要**幂等**：daemon 崩溃重启时若 callback 已派发未完成，可能重派。
 
 ---
 
-## 状态查询
+## 4. 三种编排的状态查询
 
-三种编排均提供对应的状态查询接口，返回编排记录的当前状态与元信息：
+### 签名
 
-| 编排 | 查询方法（TaskManager） | 查询方法（PHP 函数） |
-|------|------------------------|---------------------|
-| chain | `chainState($id)` | `xhjob_chain_state($id)` |
-| group | `groupState($id)` | `xhjob_group_state($id)` |
-| chord | `chordState($id)` | `xhjob_chord_state($id)` |
+```php
+// TaskManager（返回数组或 null）
+public function chainState(string $chainId): ?array
+public function groupState(string $groupId): ?array
+public function chordState(string $chordId): ?array
 
-### 返回字段
+// PHP 函数（返回 JSON 字符串或 null）
+function xhjob_chain_state(string $chain_id, ?string $name = null, ?string $data_dir = null): ?string
+function xhjob_group_state(string $group_id, ?string $name = null, ?string $data_dir = null): ?string
+function xhjob_chord_state(string $chord_id, ?string $name = null, ?string $data_dir = null): ?string
+```
 
-返回的 state 对象通常包含以下字段：
+### 行为说明
 
-- `id`：编排记录 ID。
-- `state`：编排状态（`pending` / `running` / `success` / `failed` / `partial_failed`）。
-- `created_at` / `updated_at`：创建与最后更新时间戳。
-- chain：`current_step`（当前执行到第几步）。
-- group：各子任务的完成情况（`completed` / `failed` / `total` 等聚合字段）。
-- chord：`header_task_ids`（header 任务 ID 列表）、`callback_json`（回调任务配置）、`callback_task_id`（回调任务被派发后的 ID）。
+三者查询接口对称：
+
+- `*State()` 返回对应的 `ChainRecord` / `GroupRecord` / `ChordRecord`；
+- group 状态额外带 `summary`（计数），chord 状态额外带 `headers_done` / `headers_total` / `callback_state`；
+- 不存在的 id 返回 `null`（PHP 函数）或 `null`（TaskManager），**不会抛异常**。
+
+### 注意事项
+
+- `xhjob_chain_state` 等返回的是 **JSON 字符串**，调用方需自行 `json_decode`；`TaskManager::chainState` 等返回的是**已解码数组**，更易用。
+- 查询频率建议 ≥ 500ms，过密会给 SQLite 增加读压力（WAL 模式下读不阻塞写，但仍占连接）。
+- `name` 参数用于多 daemon 隔离场景，单 daemon 默认 null 即可。
 
 ### 代码演示
 
 ```php
-use Xhjob\TaskManager;
+<?php
+// 方式 A: PHP 函数（返回 JSON 字符串）
+$chainState = xhjob_chain_state($chainId);
+$groupState = xhjob_group_state($groupId);
+$chordState = xhjob_chord_state($chordId);
 
-$mgr = new TaskManager('default', '/var/lib/xhjob');
+if ($chainState !== null) {
+    $rec = json_decode($chainState, true);
+    echo "chain: state={$rec['state']}, steps={$rec['current_step']}/{$rec['total_steps']}\n";
+}
+if ($groupState !== null) {
+    $rec = json_decode($groupState, true);
+    echo "group: state={$rec['state']}, summary=" . json_encode($rec['summary']) . "\n";
+}
+if ($chordState !== null) {
+    $rec = json_decode($chordState, true);
+    echo "chord: state={$rec['state']}, callback={$rec['callback_state']}\n";
+}
 
-// 查询 chain 状态
-$chainState = $mgr->chainState($chainId);
-// $chainState['state']         // 'running' / 'success' / 'failed'
-// $chainState['current_step']  // 当前步骤序号
-
-// 查询 group 状态
-$groupState = $mgr->groupState($groupId);
-// $groupState['state']      // 'running' / 'success' / 'partial_failed' / 'failed'
-
-// 查询 chord 状态
-$chordState = $mgr->chordState($chordId);
-// $chordState['state']            // 'running' / 'success' / 'partial_failed'
-// $chordState['header_task_ids']  // header 任务 ID 数组
-// $chordState['callback_task_id'] // 回调任务 ID（派发后才有）
+// 方式 B: TaskManager（返回数组，推荐）
+$tm = new \Xhjob\TaskManager();
+if ($c = $tm->chainState($chainId)) {
+    echo "chain: state={$c['state']}\n";
+}
+if ($g = $tm->groupState($groupId)) {
+    echo "group: state={$g['state']}, failed={$g['summary']['failed']}\n";
+}
+if ($h = $tm->chordState($chordId)) {
+    echo "chord: state={$h['state']}, callback={$h['callback_state']}\n";
+}
 ```
+
+### 生产建议
+
+- 长轮询场景用 TaskManager 数组版，省去反复 `json_decode`。
+- 把编排 id（chain_id / group_id / chord_id）和任务 id 一起存到业务表，便于追溯。
+
+---
+
+## 5. 三者区别对比表
+
+| 维度 | chain | group | chord |
+|---|---|---|---|
+| **执行顺序** | 严格顺序（step 1 → 2 → ... → N） | 全部并行 | header 全部并行，callback 在 header 全成功后单独执行 |
+| **数据传递** | 上一步 stdout → 下一步 stdin（管道） | 无传递，子任务独立 | header 无传递；callback 通过 meta 收到各 header 结果数组 |
+| **失败行为** | 任一步失败 → 链终止，state=`failed` | 各子任务独立失败，终态按比例 `success`/`partial_failed`/`failed` | 任一 header 失败 → **不触发 callback**，state=`partial_failed` |
+| **终态集合** | `success` / `failed` | `success` / `partial_failed` / `failed` | `success` / `partial_failed` / `failed` |
+| **典型适用场景** | 流水线（抓取→清洗→入库）、有依赖的串行步骤 | 扇出（批量抓取、批量通知）、无依赖并行 | MapReduce（Map=header 并行，Reduce=callback 聚合）、需要栅栏同步 |
+| **结果获取** | 最后一步 stdout | 各子任务各自 result | callback 的 stdout（header 失败时无） |
+| **状态查询** | `chainState` / `xhjob_chain_state` | `groupState` / `xhjob_group_state`（带 summary） | `chordState` / `xhjob_chord_state`（带 headers_done / callback_state） |
+| **子任务 builder** | `TaskBuilder::chain($builders)` | `TaskBuilder::group($builders)` | `TaskBuilder::chord($headerBuilders, $callback)` |
+| **底层函数** | `xhjob_chain($tasks_json)` | `xhjob_group($tasks_json)` | `xhjob_chord($header_json, $callback_json)` |
+
+### 选型口诀
+
+- **有依赖、要管道** → `chain`
+- **无依赖、要快** → `group`
+- **无依赖、但要等齐再聚合** → `chord`
+
+### 生产建议（综合）
+
+- 编排 id 一旦派发不可修改，业务侧把 id 与业务实体绑定存表，便于对账。
+- 三种编排都支持 `persist(true)`，长耗时编排**务必**开启持久化 + `acksLate(true)`，避免 daemon 重启丢链。
+- 编排嵌套目前不支持（chain 内不能直接放 group），需要嵌套时拆成多个独立编排，外层用业务脚本串接。
+- 监控编排终态分布：`partial_failed` 比例升高通常意味着上游数据质量下降或下游服务抖动。
