@@ -47,4 +47,4 @@ Route::group('xhjob', function () {
     Route::get('chainState', 'XhjobTask/chainState');
     Route::get('groupState', 'XhjobTask/groupState');
     Route::get('demo', 'XhjobTask/demo');
-});
+})->middleware(\app\middleware\XhjobAuth::class);

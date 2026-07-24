@@ -1,11 +1,11 @@
 //! Task model + Builder pattern chainable API.
 
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 use crate::errors::{Result, XhjobError};
-use crate::store::{Task, TaskType, HttpPayload, ShellPayload};
 use crate::ipc::request as ipc_request;
 use crate::store::now_ts;
+use crate::store::{HttpPayload, ShellPayload, Task, TaskType};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Builder for constructing tasks with a fluent chainable API.
 ///
@@ -195,7 +195,9 @@ pub struct TaskBuilder {
     pub owner: String,
 }
 
-fn default_acks_on_failure_true() -> bool { true }
+fn default_acks_on_failure_true() -> bool {
+    true
+}
 
 fn default_service_name() -> String {
     "default".to_string()
@@ -207,10 +209,18 @@ fn default_service_name() -> String {
 // `timeout`, `max_instances`, and `coalesce`. Providing explicit functions
 // ensures partial JSON (e.g. only `task_type` + `payload` from PHP users)
 // deserializes with the same sensible defaults the Rust builder API uses.
-fn default_retry_delay() -> u64 { 1 }
-fn default_timeout() -> u64 { 30 }
-fn default_max_instances() -> u32 { 1 }
-fn default_coalesce_true() -> bool { true }
+fn default_retry_delay() -> u64 {
+    1
+}
+fn default_timeout() -> u64 {
+    30
+}
+fn default_max_instances() -> u32 {
+    1
+}
+fn default_coalesce_true() -> bool {
+    true
+}
 
 /// Compute a random jitter offset in `[0, secs]` using `rand::thread_rng()`.
 /// Used to spread out cron / interval task triggers and avoid thundering-herd
@@ -274,7 +284,9 @@ impl Default for TaskBuilder {
 }
 
 impl TaskBuilder {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Bind this builder to the named service. The dispatch path will resolve
     /// to that service's IPC socket.
@@ -681,9 +693,11 @@ impl TaskBuilder {
 
     /// Build the final Task struct (without dispatching).
     pub fn build(self) -> Result<Task> {
-        let task_type = self.task_type.ok_or_else(|| XhjobError::InvalidTask(
-            "task type not set; call via_http() or via_shell() first".to_string()
-        ))?;
+        let task_type = self.task_type.ok_or_else(|| {
+            XhjobError::InvalidTask(
+                "task type not set; call via_http() or via_shell() first".to_string(),
+            )
+        })?;
         // P0-2: validate explicit id charset. ids must match
         // `^[A-Za-z0-9_-]{1,64}$`. This prevents two classes of bug:
         //   (1) ids starting with "error:" break the PHP-side dispatch()
@@ -696,9 +710,9 @@ impl TaskBuilder {
                 // auto-generate below.
             } else {
                 let valid = id.len() <= 64
-                    && id.bytes().all(|b| {
-                        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-                    });
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
                 if !valid {
                     return Err(XhjobError::InvalidTask(format!(
                         "task id '{}' is invalid: must match ^[A-Za-z0-9_-]{{1,64}}$",
@@ -742,11 +756,21 @@ impl TaskBuilder {
         // interval / runAt / start_date / end_date / soft_timeout 被误判为
         // 已设置，进而触发 DateTrigger / SoftTimeout 等错误路径。
         // 这里把所有 Option 时间戳字段中的 Some(0) 视为 None。
-        if task.interval == Some(0) { task.interval = None; }
-        if task.run_at == Some(0) { task.run_at = None; }
-        if task.start_date == Some(0) { task.start_date = None; }
-        if task.end_date == Some(0) { task.end_date = None; }
-        if task.soft_timeout == Some(0) { task.soft_timeout = None; }
+        if task.interval == Some(0) {
+            task.interval = None;
+        }
+        if task.run_at == Some(0) {
+            task.run_at = None;
+        }
+        if task.start_date == Some(0) {
+            task.start_date = None;
+        }
+        if task.end_date == Some(0) {
+            task.end_date = None;
+        }
+        if task.soft_timeout == Some(0) {
+            task.soft_timeout = None;
+        }
         // countdown 归一化：countdown 与 run_at 同时设置时 run_at 优先。
         // countdown==0 视为未设置（无延迟）。当 run_at 未设置但 countdown
         // 已设置时，转换为 run_at = now + countdown，复用既有 DateTrigger 路径。
@@ -759,9 +783,7 @@ impl TaskBuilder {
                 // run_at, causing the task to fire immediately (or never).
                 task.run_at = Some((now_ts() as i64).saturating_add(cd as i64));
             } else {
-                tracing::warn!(
-                    "both countdown and run_at set; run_at takes precedence"
-                );
+                tracing::warn!("both countdown and run_at set; run_at takes precedence");
             }
         }
         // A14: explicit id — if set, override the auto-generated UUID.
@@ -809,10 +831,18 @@ impl TaskBuilder {
         // Emit warnings when multiple triggers are set simultaneously.
         // F-1: or_cron provides additional cron expressions; the trigger set
         // is the union of `cron` (if set) and `or_cron` (non-empty entries).
-        let cron_exprs: Vec<String> = task.cron.as_ref().cloned()
+        let cron_exprs: Vec<String> = task
+            .cron
+            .as_ref()
+            .cloned()
             .into_iter()
-            .chain(task.or_cron.clone().unwrap_or_default().into_iter()
-                .filter(|s| !s.is_empty()))
+            .chain(
+                task.or_cron
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| !s.is_empty()),
+            )
             .collect();
         if task.run_at.is_some() {
             if !cron_exprs.is_empty() {
@@ -852,7 +882,8 @@ impl TaskBuilder {
                     }
                     Err(e) => {
                         return Err(XhjobError::CronParse(format!(
-                            "invalid cron '{}': {}", expr, e
+                            "invalid cron '{}': {}",
+                            expr, e
                         )));
                     }
                 }
@@ -905,16 +936,37 @@ impl TaskBuilder {
         }
         let json = serde_json::to_value(&self)
             .map_err(|e| XhjobError::InvalidTask(format!("serialize: {}", e)))?;
-        let resp = ipc_request("dispatch", json, &self.service_name, self.data_dir.as_deref()).await?;
+        let resp = ipc_request(
+            "dispatch",
+            json,
+            &self.service_name,
+            self.data_dir.as_deref(),
+        )
+        .await?;
         if !resp.ok {
-            return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown error".to_string())));
+            return Err(XhjobError::ipc(
+                resp.err.unwrap_or_else(|| "unknown error".to_string()),
+            ));
         }
         // Expect data = {"task_id": "..."}
-        let task_id = resp.data.get("task_id")
+        let task_id = resp
+            .data
+            .get("task_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| XhjobError::ipc("missing task_id in response".to_string()))?
             .to_string();
         Ok(task_id)
+    }
+}
+
+impl Task {
+    /// HTTP 任务不支持 soft_timeout（协议层无 SIGTERM 等价物）。
+    /// `TaskBuilder::build()` 对 HTTP 任务会把 soft_timeout 重置为 None，
+    /// 但因清空后无法区分"用户没设"与"用户设了被清空"，此方法简化为：
+    /// HTTP 任务返回 true（soft_timeout 不被支持），Shell 任务返回 false。
+    /// 调用方（如 inspect / 调试输出）可据此向用户标注该字段被忽略。
+    pub fn soft_timeout_unsupported(&self) -> bool {
+        self.task_type == TaskType::Http
     }
 }
 
@@ -938,7 +990,10 @@ mod tests {
             .build()
             .expect("build should succeed (warn + reset, not error)");
         assert_eq!(task.task_type, TaskType::Http);
-        assert_eq!(task.soft_timeout, None, "soft_timeout should be reset to None for HTTP tasks");
+        assert_eq!(
+            task.soft_timeout, None,
+            "soft_timeout should be reset to None for HTTP tasks"
+        );
     }
 
     /// softTimeout (C11) SubTask 41.12 — `soft_timeout >= timeout` is invalid
@@ -957,7 +1012,10 @@ mod tests {
             .build()
             .expect("build should succeed (warn + reset, not error)");
         assert_eq!(task.task_type, TaskType::Shell);
-        assert_eq!(task.soft_timeout, None, "soft_timeout > timeout should be reset to None");
+        assert_eq!(
+            task.soft_timeout, None,
+            "soft_timeout > timeout should be reset to None"
+        );
 
         // Case 2: soft_timeout (10) == timeout (10) — equality boundary.
         let task = TaskBuilder::new()
@@ -966,7 +1024,10 @@ mod tests {
             .soft_timeout(10)
             .build()
             .expect("build should succeed (warn + reset, not error)");
-        assert_eq!(task.soft_timeout, None, "soft_timeout == timeout should also be reset to None");
+        assert_eq!(
+            task.soft_timeout, None,
+            "soft_timeout == timeout should also be reset to None"
+        );
     }
 
     /// Partial-JSON deserialization (Round 4 fix): PHP users typically pass
@@ -1000,11 +1061,11 @@ mod tests {
     #[test]
     fn test_build_rejects_invalid_id_charset() {
         let bad_ids = [
-            "error: malicious",      // contains ":" and space
+            "error: malicious",        // contains ":" and space
             "'; DROP TABLE tasks; --", // SQL injection chars
-            "id with spaces",        // spaces
-            "id/with/slashes",       // slashes
-            &"a".repeat(65),         // too long (>64)
+            "id with spaces",          // spaces
+            "id/with/slashes",         // slashes
+            &"a".repeat(65),           // too long (>64)
         ];
         for bad in bad_ids {
             let json = format!(
@@ -1012,13 +1073,14 @@ mod tests {
                 bad.replace('"', "\\\"").replace('\\', "\\\\")
             );
             let b = TaskBuilder::from_json(&json).expect("JSON should deserialize");
-            let err = b.build().expect_err(
-                &format!("id '{}' should be rejected", bad)
-            );
+            let err = b
+                .build()
+                .expect_err(&format!("id '{}' should be rejected", bad));
             let msg = format!("{}", err);
             assert!(
                 msg.contains("invalid") && msg.contains("id"),
-                "error message should mention invalid id: {}", msg
+                "error message should mention invalid id: {}",
+                msg
             );
         }
     }
@@ -1029,7 +1091,7 @@ mod tests {
         let good_ids = [
             "my-task-001_ABC",
             "a",
-            &"a".repeat(64),  // max length
+            &"a".repeat(64), // max length
             "ABC123-_-",
         ];
         for good in good_ids {
@@ -1038,10 +1100,55 @@ mod tests {
                 good
             );
             let b = TaskBuilder::from_json(&json).expect("JSON should deserialize");
-            let task = b.build().expect(
-                &format!("id '{}' should be accepted", good)
-            );
+            let task = b
+                .build()
+                .unwrap_or_else(|_| panic!("id '{}' should be accepted", good));
             assert_eq!(task.id, *good);
         }
+    }
+
+    /// Task 7: HTTP 任务的 soft_timeout 因协议层无 SIGTERM 等价物而被忽略，
+    /// `soft_timeout_unsupported()` 应返回 true。即使用户设置了 soft_timeout，
+    /// `build()` 也会将其重置为 None（见 test_soft_timeout_ignored_for_http），
+    /// 此方法让调用方/inspect 输出能向用户标注该字段被忽略。
+    #[test]
+    fn test_http_soft_timeout_marked_unsupported() {
+        let task = TaskBuilder::new()
+            .via_http("GET", "https://example.com")
+            .timeout(10)
+            .soft_timeout(5)
+            .build()
+            .expect("build should succeed (warn + reset, not error)");
+        assert_eq!(task.task_type, TaskType::Http);
+        assert_eq!(
+            task.soft_timeout, None,
+            "soft_timeout should be reset to None for HTTP"
+        );
+        assert!(
+            task.soft_timeout_unsupported(),
+            "HTTP task should report soft_timeout as unsupported"
+        );
+    }
+
+    /// Task 7: Shell 任务的 soft_timeout 是有效字段（SIGTERM graceful exit），
+    /// `soft_timeout_unsupported()` 应返回 false。
+    #[test]
+    fn test_shell_soft_timeout_supported() {
+        let task = TaskBuilder::new()
+            .via_shell("echo hi")
+            .timeout(10)
+            .soft_timeout(5)
+            .build()
+            .expect("build should succeed");
+        assert_eq!(task.task_type, TaskType::Shell);
+        assert_eq!(
+            task.soft_timeout,
+            Some(5),
+            "soft_timeout should be retained for Shell"
+        );
+        assert!(
+            !task.soft_timeout_unsupported(),
+            "Shell task should report soft_timeout as supported"
+        );
     }
 }

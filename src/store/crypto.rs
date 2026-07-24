@@ -1,7 +1,7 @@
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::aead::{Aead, KeyInit};
-use std::sync::OnceLock;
 use crate::errors::{Result, XhjobError};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use std::sync::OnceLock;
 
 /// Cached parsed encryption key (None = plaintext mode).
 ///
@@ -53,10 +53,7 @@ fn resolve_key_from_env() -> Option<[u8; 32]> {
     let mut key = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
         // safe: verified all-hex above, chunks(2) on 64 chars yields 32 pairs
-        let byte = u8::from_str_radix(
-            std::str::from_utf8(chunk).unwrap(),
-            16,
-        ).unwrap();
+        let byte = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
         key[i] = byte;
     }
     Some(key)
@@ -65,8 +62,8 @@ fn resolve_key_from_env() -> Option<[u8; 32]> {
 /// Encrypt a plaintext string. Returns a base64-encoded ciphertext with
 /// a random 12-byte nonce prepended. Format: base64(nonce || ciphertext).
 pub fn encrypt(plaintext: &str) -> Result<String> {
-    let key_bytes = encryption_key()
-        .ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
+    let key_bytes =
+        encryption_key().ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     // P0-22 fix: generate the 12-byte nonce from the OS CSPRNG (OsRng)
@@ -87,7 +84,8 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
         nonce
     };
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
         .map_err(|e| XhjobError::store(format!("encrypt: {}", e)))?;
     let mut combined = nonce_bytes.to_vec();
     combined.extend_from_slice(&ciphertext);
@@ -96,21 +94,23 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
 
 /// Decrypt a base64-encoded ciphertext (nonce || ciphertext).
 pub fn decrypt(b64: &str) -> Result<String> {
-    let key_bytes = encryption_key()
-        .ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
-    let combined = base64_decode(b64)
-        .map_err(|e| XhjobError::store(format!("decrypt base64: {}", e)))?;
+    let key_bytes =
+        encryption_key().ok_or_else(|| XhjobError::store("encryption key not set".to_string()))?;
+    let combined =
+        base64_decode(b64).map_err(|e| XhjobError::store(format!("decrypt base64: {}", e)))?;
     if combined.len() < 12 {
-        return Err(XhjobError::store("decrypt: ciphertext too short".to_string()));
+        return Err(XhjobError::store(
+            "decrypt: ciphertext too short".to_string(),
+        ));
     }
     let (nonce_bytes, ciphertext) = combined.split_at(12);
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext)
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| XhjobError::store(format!("decrypt: {}", e)))?;
-    String::from_utf8(plaintext)
-        .map_err(|e| XhjobError::store(format!("decrypt utf8: {}", e)))
+    String::from_utf8(plaintext).map_err(|e| XhjobError::store(format!("decrypt utf8: {}", e)))
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -140,7 +140,10 @@ fn base64_encode(data: &[u8]) -> String {
 
 fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let s: Vec<u8> = s.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    let s: Vec<u8> = s
+        .bytes()
+        .filter(|&b| b != b'\n' && b != b'\r' && b != b' ')
+        .collect();
     let s: Vec<u8> = s.iter().filter(|&&b| b != b'=').cloned().collect();
     let mut result = Vec::new();
     for chunk in s.chunks(4) {
@@ -153,9 +156,15 @@ fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
             }
         }
         n <<= (4 - valid) * 6;
-        if valid >= 2 { result.push((n >> 16) as u8); }
-        if valid >= 3 { result.push((n >> 8) as u8); }
-        if valid >= 4 { result.push(n as u8); }
+        if valid >= 2 {
+            result.push((n >> 16) as u8);
+        }
+        if valid >= 3 {
+            result.push((n >> 8) as u8);
+        }
+        if valid >= 4 {
+            result.push(n as u8);
+        }
     }
     Ok(result)
 }
@@ -211,7 +220,8 @@ mod tests {
             nonce
         };
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext.as_bytes())
             .map_err(|e| XhjobError::store(format!("encrypt: {}", e)))?;
         let mut combined = nonce_bytes.to_vec();
         combined.extend_from_slice(&ciphertext);
@@ -219,18 +229,20 @@ mod tests {
     }
 
     fn decrypt_with_key(key_bytes: &[u8; 32], b64: &str) -> Result<String> {
-        let combined = base64_decode(b64)
-            .map_err(|e| XhjobError::store(format!("decrypt base64: {}", e)))?;
+        let combined =
+            base64_decode(b64).map_err(|e| XhjobError::store(format!("decrypt base64: {}", e)))?;
         if combined.len() < 12 {
-            return Err(XhjobError::store("decrypt: ciphertext too short".to_string()));
+            return Err(XhjobError::store(
+                "decrypt: ciphertext too short".to_string(),
+            ));
         }
         let (nonce_bytes, ciphertext) = combined.split_at(12);
         let key = Key::<Aes256Gcm>::from_slice(key_bytes);
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(nonce_bytes);
-        let plaintext = cipher.decrypt(nonce, ciphertext)
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
             .map_err(|e| XhjobError::store(format!("decrypt: {}", e)))?;
-        String::from_utf8(plaintext)
-            .map_err(|e| XhjobError::store(format!("decrypt utf8: {}", e)))
+        String::from_utf8(plaintext).map_err(|e| XhjobError::store(format!("decrypt utf8: {}", e)))
     }
 }

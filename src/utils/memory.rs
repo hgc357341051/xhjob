@@ -42,12 +42,7 @@ fn rss_linux() -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             // rest looks like "      1234 kB"
-            let kb: u64 = rest
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
             return Some(kb.saturating_mul(1024));
         }
     }
@@ -79,7 +74,9 @@ fn rss_macos() -> Option<u64> {
 /// Windows: GetProcessMemoryInfo -> WorkingSetSize (bytes).
 #[cfg(target_os = "windows")]
 fn rss_windows() -> Option<u64> {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     unsafe {
         let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();

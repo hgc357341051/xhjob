@@ -1,8 +1,8 @@
 //! Cross-platform daemon process management.
 
+use crate::errors::{Result, XhjobError};
 use std::path::PathBuf;
 use std::time::Duration;
-use crate::errors::{Result, XhjobError};
 
 #[cfg(unix)]
 pub mod unix;
@@ -20,8 +20,7 @@ pub mod windows;
 /// Unix: `<dir>/xhjob.{name}.pid`
 /// Windows: `%TEMP%\xhjob.{name}.pid` (data_dir is also honored when provided)
 pub fn pid_file_path(service_name: &str, data_dir: Option<&str>) -> PathBuf {
-    resolve_dir_path(data_dir, "XHJOB_PID_DIR")
-        .join(format!("xhjob.{}.pid", service_name))
+    resolve_dir_path(data_dir, "XHJOB_PID_DIR").join(format!("xhjob.{}.pid", service_name))
 }
 
 /// Log file path derived from `service_name` and optional `data_dir`.
@@ -32,8 +31,7 @@ pub fn pid_file_path(service_name: &str, data_dir: Option<&str>) -> PathBuf {
 ///   3. `XHJOB_DATA_DIR` env var (unified data directory)
 ///   4. Platform default (`/tmp` on Unix, `%TEMP%` on Windows)
 pub fn log_file_path(service_name: &str, data_dir: Option<&str>) -> PathBuf {
-    resolve_dir_path(data_dir, "XHJOB_LOG_DIR")
-        .join(format!("xhjob.{}.log", service_name))
+    resolve_dir_path(data_dir, "XHJOB_LOG_DIR").join(format!("xhjob.{}.log", service_name))
 }
 
 /// Resolve a runtime directory path from the priority chain.
@@ -69,27 +67,53 @@ fn resolve_dir_path(data_dir: Option<&str>, fine_grained_var: &str) -> PathBuf {
     }
 }
 
-/// Read PID from file. Returns None if not present or stale.
-pub fn read_pid(service_name: &str, data_dir: Option<&str>) -> Option<u32> {
+/// Read PID (and optional starttime) from file.
+///
+/// Returns `Some((pid, starttime))` if the PID file exists and the recorded
+/// process is still alive (with matching starttime when present).
+/// Returns `None` (and removes the stale PID file) if the file is missing,
+/// unparseable, or points at a dead/reused PID.
+///
+/// File format:
+///   - New (two lines): `pid\nstarttime`
+///   - Legacy (one line): `pid` — parsed with `starttime = None`
+pub fn read_pid(service_name: &str, data_dir: Option<&str>) -> Option<(u32, Option<u64>)> {
     let path = pid_file_path(service_name, data_dir);
     let content = std::fs::read_to_string(&path).ok()?;
-    let pid: u32 = content.trim().parse().ok()?;
-    if is_process_alive(pid) {
-        Some(pid)
+    let mut lines = content.lines();
+    let pid_str = lines.next()?;
+    let pid: u32 = pid_str.trim().parse().ok()?;
+    // Optional second line: starttime. Absent or unparseable -> None (legacy).
+    let starttime: Option<u64> = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
+    if is_process_alive_with_starttime(pid, starttime) {
+        Some((pid, starttime))
     } else {
-        // stale pid file
+        // stale pid file (dead, or PID reused with mismatched starttime)
         let _ = std::fs::remove_file(&path);
         None
     }
 }
 
 /// Write PID file atomically.
-pub fn write_pid(pid: u32, service_name: &str, data_dir: Option<&str>) -> Result<()> {
+///
+/// When `starttime` is `Some`, writes the new two-line format `pid\nstarttime`
+/// so future readers can detect PID reuse. When `None`, writes the legacy
+/// single-line format `pid` for backward compatibility.
+pub fn write_pid(
+    pid: u32,
+    starttime: Option<u64>,
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<()> {
     let path = pid_file_path(service_name, data_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, pid.to_string())?;
+    let content = match starttime {
+        Some(st) => format!("{}\n{}", pid, st),
+        None => pid.to_string(),
+    };
+    std::fs::write(&path, content)?;
     Ok(())
 }
 
@@ -106,8 +130,53 @@ pub fn remove_pid_file(service_name: &str, data_dir: Option<&str>) {
     }
 }
 
+/// Read the starttime of a process (Linux: `/proc/<pid>/stat` field 22,
+/// in clock ticks). Returns `None` on non-Linux platforms or any read/parse
+/// failure, so callers can gracefully degrade to plain liveness checks.
+pub fn process_starttime(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        // /proc/<pid>/stat format: `pid (comm) state ppid ... starttime ...`
+        // `comm` may contain spaces and parentheses, so we cannot simply
+        // split the whole line on whitespace — we must start parsing after
+        // the *last* ')' (the closing paren of the comm field).
+        let after_comm = stat.rsplit_once(')')?.1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // After the closing ')', fields are: state(0) ppid(1) pgrp(2) session(3)
+        // tty_nr(4) tpgid(5) flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10)
+        // utime(11) stime(12) cutime(13) cstime(14) priority(15) nice(16)
+        // num_threads(17) itrealvalue(18) starttime(19).
+        // This maps to field 22 of the full /proc/<pid>/stat (1-indexed),
+        // since `pid`(1) + `comm`(2) precede the ')' — starttime is the 20th
+        // field after the ')' (0-indexed 19).
+        let st: u64 = fields.get(19)?.parse().ok()?;
+        Some(st)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No /proc filesystem on Windows/macOS — starttime unavailable.
+        let _ = pid;
+        None
+    }
+}
+
 /// Check if a process is alive (cross-platform).
+///
+/// Backward-compatible wrapper: equivalent to `is_process_alive_with_starttime(pid, None)`.
 pub fn is_process_alive(pid: u32) -> bool {
+    is_process_alive_with_starttime(pid, None)
+}
+
+/// Check if a process is alive, optionally verifying its starttime to guard
+/// against PID reuse.
+///
+/// When `expected_starttime` is `Some(expected)`, returns `true` only if the
+/// PID is alive AND its current starttime matches `expected` — so a stale
+/// PID file pointing at a recycled PID (same numeric PID, different process)
+/// is correctly rejected. When `None`, degrades to plain `kill(pid, 0)`
+/// liveness (legacy behavior).
+pub fn is_process_alive_with_starttime(pid: u32, expected_starttime: Option<u64>) -> bool {
     // P0/P2 fix: pid==0 is never a real daemon process. On Unix,
     // kill(0, 0) tests "can we signal the caller's process group" and
     // always returns 0, so a PID file containing "0" would cause a
@@ -121,17 +190,33 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        // kill(pid, 0) returns 0 if process exists
-        unsafe { libc_kill(pid as i32, 0) == 0 }
+        // kill(pid, 0) returns 0 if process exists (EAGAIN/EPERM/ESRCH
+        // mean not-plainly-alive from our perspective). We treat any
+        // non-zero return as "not alive" for simplicity; the subsequent
+        // starttime check would have to be skipped anyway.
+        let alive = unsafe { libc_kill(pid as i32, 0) == 0 };
+        if !alive {
+            return false;
+        }
+        match expected_starttime {
+            None => true,
+            Some(expected) => process_starttime(pid) == Some(expected),
+        }
     }
     #[cfg(windows)]
     {
-        // OpenProcess returns handle if process exists
+        // Windows has no starttime concept — degrade to OpenProcess-based
+        // liveness, ignoring expected_starttime.
+        let _ = expected_starttime;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         unsafe {
             let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h.is_null() { return false; }
+            if h.is_null() {
+                return false;
+            }
             CloseHandle(h);
             true
         }
@@ -157,23 +242,48 @@ pub struct DaemonStatus {
 
 impl DaemonStatus {
     pub fn not_running() -> Self {
-        Self { running: false, pid: None }
+        Self {
+            running: false,
+            pid: None,
+        }
     }
     pub fn running(pid: u32) -> Self {
-        Self { running: true, pid: Some(pid) }
+        Self {
+            running: true,
+            pid: Some(pid),
+        }
     }
 }
 
 /// Query current daemon status for `service_name` with optional `data_dir`.
 pub fn status(service_name: &str, data_dir: Option<&str>) -> DaemonStatus {
     match read_pid(service_name, data_dir) {
-        Some(pid) if is_process_alive(pid) => DaemonStatus::running(pid),
+        Some((pid, starttime)) if is_process_alive_with_starttime(pid, starttime) => {
+            DaemonStatus::running(pid)
+        }
         _ => DaemonStatus::not_running(),
     }
 }
 
 /// Send SIGTERM (Unix) or TerminateProcess (Windows) to the daemon.
-pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> Result<()> {
+///
+/// `expected_starttime` (when `Some`) is used to verify the target PID has not
+/// been recycled between the caller reading the PID file and us sending the
+/// signal — if the daemon died and an unrelated process reused the PID, the
+/// starttime check causes the loop to exit early without raising SIGKILL on
+/// the innocent process.
+///
+/// The SIGKILL grace period aligns with the daemon-side drain timeout
+/// (`XHJOB_SHUTDOWN_DRAIN_SECS`, default 30s): we wait `max(10, drain + 5)`
+/// seconds for the daemon to drain in-flight tasks and exit cleanly before
+/// escalating to SIGKILL. The +5 buffer covers shutdown bookkeeping after the
+/// drain deadline fires inside the daemon.
+pub fn send_terminate(
+    pid: u32,
+    service_name: &str,
+    data_dir: Option<&str>,
+    expected_starttime: Option<u64>,
+) -> Result<()> {
     // P0 fix: defensive validation mirroring is_process_alive. A pid of 0
     // or > i32::MAX must never reach kill(): kill(0, sig) would signal the
     // caller's whole process group, and kill(-1, sig) (from u32::MAX as i32)
@@ -181,36 +291,57 @@ pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> R
     // the daemon runs as root. is_process_alive() already rejects these,
     // but send_terminate can be reached independently, so guard here too.
     if pid == 0 || pid > i32::MAX as u32 {
-        return Err(XhjobError::Io(std::io::Error::other(
-            format!("refusing to signal invalid pid {}", pid),
-        )));
+        return Err(XhjobError::Io(std::io::Error::other(format!(
+            "refusing to signal invalid pid {}",
+            pid
+        ))));
     }
+    // Task 5: SIGKILL wait time aligned with the daemon's drain timeout so
+    // in-flight tasks are not preemptively killed. drain_secs + 5 covers the
+    // post-drain shutdown bookkeeping; never go below the original 10s.
+    let drain_secs = std::env::var("XHJOB_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    let wait_secs = std::cmp::max(10u64, drain_secs.saturating_add(5));
+    let polls = wait_secs.saturating_mul(10);
     #[cfg(unix)]
     {
-        let rc = unsafe { kill(pid as i32, 15 /* SIGTERM */) };
+        let rc = unsafe {
+            kill(pid as i32, 15 /* SIGTERM */)
+        };
         if rc == 0 {
-            // wait up to 10 seconds for the process to exit
-            for _ in 0..100 {
-                if !is_process_alive(pid) {
+            // Poll for the process to exit. Using is_process_alive_with_starttime
+            // means: if the daemon exited and its PID was reused by an unrelated
+            // process, the starttime mismatch makes us return Ok(()) early
+            // WITHOUT escalating to SIGKILL on the innocent reused PID.
+            for _ in 0..polls {
+                if !is_process_alive_with_starttime(pid, expected_starttime) {
                     remove_pid_file(service_name, data_dir);
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            // force kill if still alive
-            let _ = unsafe { kill(pid as i32, 9 /* SIGKILL */) };
+            // force kill if still alive (same PID, same starttime, still running)
+            let _ = unsafe {
+                kill(pid as i32, 9 /* SIGKILL */)
+            };
             remove_pid_file(service_name, data_dir);
             Ok(())
         } else {
-            Err(XhjobError::Io(std::io::Error::other(
-                format!("failed to send SIGTERM to pid {}", pid),
-            )))
+            Err(XhjobError::Io(std::io::Error::other(format!(
+                "failed to send SIGTERM to pid {}",
+                pid
+            ))))
         }
     }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
         unsafe {
             let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
             if h.is_null() {
@@ -228,8 +359,8 @@ pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> R
                 )));
             }
             // wait for exit
-            for _ in 0..100 {
-                if !is_process_alive(pid) {
+            for _ in 0..polls {
+                if !is_process_alive_with_starttime(pid, expected_starttime) {
                     remove_pid_file(service_name, data_dir);
                     return Ok(());
                 }
@@ -244,9 +375,13 @@ pub fn send_terminate(pid: u32, service_name: &str, data_dir: Option<&str>) -> R
 /// Spawn the daemon process for `service_name` with optional `data_dir`.
 ///
 /// See `spawn_daemon` for the cross-platform strategy.
-pub fn spawn_daemon(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>) -> Result<()> {
-    if let Some(pid) = read_pid(service_name, data_dir) {
-        if is_process_alive(pid) {
+pub fn spawn_daemon(
+    daemon_main: fn() -> (),
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<()> {
+    if let Some((pid, starttime)) = read_pid(service_name, data_dir) {
+        if is_process_alive_with_starttime(pid, starttime) {
             return Err(XhjobError::DaemonAlreadyRunning);
         }
     }
@@ -268,8 +403,10 @@ pub fn start(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>
     // socket readiness — checking only PID is racy when the previous daemon is
     // shutting down (PID still alive, socket already closed). Without the
     // socket check, an immediate dispatch would fail with "Connection refused".
-    if let Some(pid) = read_pid(service_name, data_dir) {
-        if is_process_alive(pid) && ipc_socket_ready(service_name, data_dir) {
+    if let Some((pid, starttime)) = read_pid(service_name, data_dir) {
+        if is_process_alive_with_starttime(pid, starttime)
+            && ipc_socket_ready(service_name, data_dir)
+        {
             return Ok(true);
         }
     }
@@ -278,8 +415,10 @@ pub fn start(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>
     // connections. Waiting only on the PID file is racy: the daemon writes its
     // PID before binding the IPC listener, so an immediate dispatch would fail.
     for _ in 0..100 {
-        if let Some(pid) = read_pid(service_name, data_dir) {
-            if is_process_alive(pid) && ipc_socket_ready(service_name, data_dir) {
+        if let Some((pid, starttime)) = read_pid(service_name, data_dir) {
+            if is_process_alive_with_starttime(pid, starttime)
+                && ipc_socket_ready(service_name, data_dir)
+            {
                 return Ok(true);
             }
         }
@@ -295,9 +434,7 @@ fn ipc_socket_ready(service_name: &str, data_dir: Option<&str>) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::net::UnixStream;
-        UnixStream::connect(&path)
-            .map(|_| true)
-            .unwrap_or(false)
+        UnixStream::connect(&path).map(|_| true).unwrap_or(false)
     }
     #[cfg(windows)]
     {
@@ -312,8 +449,8 @@ fn ipc_socket_ready(service_name: &str, data_dir: Option<&str>) -> bool {
 /// Public entry point: called by PHP `xhjob_stop($name, $data_dir)`.
 pub fn stop(service_name: &str, data_dir: Option<&str>) -> Result<bool> {
     match read_pid(service_name, data_dir) {
-        Some(pid) if is_process_alive(pid) => {
-            send_terminate(pid, service_name, data_dir)?;
+        Some((pid, starttime)) if is_process_alive_with_starttime(pid, starttime) => {
+            send_terminate(pid, service_name, data_dir, starttime)?;
             Ok(true)
         }
         _ => {
@@ -324,8 +461,119 @@ pub fn stop(service_name: &str, data_dir: Option<&str>) -> Result<bool> {
 }
 
 /// Public entry point: called by PHP `xhjob_restart($name, $data_dir)`.
-pub fn restart(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>) -> Result<bool> {
+pub fn restart(
+    daemon_main: fn() -> (),
+    service_name: &str,
+    data_dir: Option<&str>,
+) -> Result<bool> {
     let _ = stop(service_name, data_dir);
     std::thread::sleep(Duration::from_millis(500));
     start(daemon_main, service_name, data_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a unique temp dir for a test invocation so concurrent
+    /// test runs (and the real daemon) cannot collide on PID file paths.
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "xhjob_test_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_process_starttime_returns_some_for_self() {
+        // The current test process must be readable via /proc/self/stat on
+        // Linux, so process_starttime should yield a concrete tick count.
+        let pid = std::process::id();
+        let st = process_starttime(pid);
+        assert!(
+            st.is_some(),
+            "expected Some(starttime) for self on Linux, got {:?}",
+            st
+        );
+    }
+
+    #[test]
+    fn test_process_starttime_returns_none_for_invalid_pid() {
+        // u32::MAX is never a valid PID; /proc/u32::MAX/stat does not exist
+        // on Linux (so the read fails), and non-Linux platforms always
+        // return None.
+        let st = process_starttime(u32::MAX);
+        assert_eq!(st, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_is_process_alive_with_starttime_rejects_mismatch() {
+        let pid = std::process::id();
+        let real_starttime = process_starttime(pid).expect("self starttime on Linux");
+        // Same PID, but a starttime off by one tick must NOT be considered
+        // alive — this is exactly the PID-reuse scenario we are guarding
+        // against (the numeric PID exists, but it is a different process).
+        let mismatched = real_starttime.wrapping_add(1);
+        assert_ne!(mismatched, real_starttime, "starttime wraparound collided");
+        assert!(
+            !is_process_alive_with_starttime(pid, Some(mismatched)),
+            "PID + mismatched starttime must be rejected"
+        );
+        // Sanity: passing the real starttime back should accept the process.
+        assert!(
+            is_process_alive_with_starttime(pid, Some(real_starttime)),
+            "PID + matching starttime must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_legacy_pid_file_backward_compat() {
+        // Old single-line PID file format: just the PID number on one line.
+        // read_pid must still parse it and report starttime=None.
+        let dir = unique_test_dir("legacy");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let service = "test_legacy_pid_compat";
+        let pid = std::process::id();
+        let path = pid_file_path(service, Some(&dir_str));
+        // Write the legacy single-line format (no newline, no starttime).
+        std::fs::write(&path, pid.to_string()).expect("write legacy pid file");
+        let result = read_pid(service, Some(&dir_str));
+        assert_eq!(
+            result,
+            Some((pid, None)),
+            "legacy single-line PID file must parse with starttime=None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_new_pid_file_format() {
+        // New two-line PID file format: `pid\nstarttime`.
+        // read_pid must parse both and verify the live process's starttime.
+        let dir = unique_test_dir("newfmt");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let service = "test_new_pid_format";
+        let pid = std::process::id();
+        let starttime = process_starttime(pid).expect("self starttime on Linux");
+        let path = pid_file_path(service, Some(&dir_str));
+        std::fs::write(&path, format!("{}\n{}", pid, starttime)).expect("write new pid file");
+        let result = read_pid(service, Some(&dir_str));
+        assert_eq!(
+            result,
+            Some((pid, Some(starttime))),
+            "two-line PID file must parse with pid + starttime"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

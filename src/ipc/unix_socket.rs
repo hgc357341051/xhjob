@@ -1,9 +1,9 @@
 //! Unix domain socket implementation.
 
+use super::{ipc_path, IpcListener, IpcStream};
+use crate::errors::{Result, XhjobError};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use tokio::net::{UnixListener, UnixStream};
-use crate::errors::{Result, XhjobError};
-use super::{IpcListener, IpcStream, ipc_path};
 
 pub struct UnixListenerWrapper {
     inner: UnixListener,
@@ -50,9 +50,15 @@ impl UnixListenerWrapper {
 }
 
 impl IpcListener for UnixListenerWrapper {
-    fn accept<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>> {
+    fn accept<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>>
+    {
         Box::pin(async move {
-            let (stream, _addr) = self.inner.accept().await
+            let (stream, _addr) = self
+                .inner
+                .accept()
+                .await
                 .map_err(|e| XhjobError::ipc(format!("accept: {}", e)))?;
             // Fix 5: SO_PEERCRED peer authentication.
             //
@@ -89,7 +95,8 @@ impl IpcListener for UnixListenerWrapper {
 ///
 /// Allows: root (uid 0), same uid as daemon, same gid as daemon.
 fn verify_peer_cred(stream: &UnixStream) -> Result<()> {
-    let cred = stream.peer_cred()
+    let cred = stream
+        .peer_cred()
         .map_err(|e| XhjobError::ipc(format!("peer_cred: {}", e)))?;
     let peer_uid = cred.uid();
     let peer_gid = cred.gid();

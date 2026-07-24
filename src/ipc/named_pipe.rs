@@ -1,8 +1,8 @@
 //! Windows Named Pipe implementation.
 
-use tokio::net::windows::named_pipe::{ServerOptions, NamedPipeServer, NamedPipeClient};
+use super::{ipc_path, IpcListener, IpcStream};
 use crate::errors::{Result, XhjobError};
-use super::{IpcListener, IpcStream, ipc_path};
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio::sync::Mutex;
 
 pub struct NamedPipeListenerWrapper {
@@ -25,7 +25,10 @@ impl NamedPipeListenerWrapper {
 }
 
 impl IpcListener for NamedPipeListenerWrapper {
-    fn accept<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>> {
+    fn accept<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>>
+    {
         Box::pin(async move {
             // Use the first pre-created instance if available, otherwise create new.
             let server = {
@@ -38,7 +41,9 @@ impl IpcListener for NamedPipeListenerWrapper {
                     .create(&self.pipe_name)
                     .map_err(|e| XhjobError::ipc(format!("create pipe instance: {}", e)))?,
             };
-            server.connect().await
+            server
+                .connect()
+                .await
                 .map_err(|e| XhjobError::ipc(format!("pipe connect: {}", e)))?;
             Ok(Box::new(server) as Box<dyn IpcStream>)
         })

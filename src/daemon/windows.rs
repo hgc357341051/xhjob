@@ -5,8 +5,8 @@
 //! and the DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP flags. The relaunched
 //! process runs `daemon_main()` directly.
 
+use super::{remove_pid_file, write_pid};
 use crate::errors::{Result, XhjobError};
-use super::{write_pid, remove_pid_file};
 
 pub fn spawn_via_create_process(
     _daemon_main: fn() -> (),
@@ -32,9 +32,7 @@ pub fn spawn_via_create_process(
     // names are validated to be `[a-zA-Z][a-zA-Z0-9_-]{0,31}` so neither
     // character is legal, but we escape defensively anyway. data_dir is also
     // shell-escaped here for safety.
-    let escaped_name = service_name
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'");
+    let escaped_name = service_name.replace('\\', "\\\\").replace('\'', "\\'");
     let code = if let Some(dir) = data_dir {
         if !dir.is_empty() {
             let escaped_dir = dir.replace('\\', "\\\\").replace('\'', "\\'");

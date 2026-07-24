@@ -14,12 +14,24 @@ static RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static CANCEL_COUNT: AtomicU64 = AtomicU64::new(0);
 static IPC_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub fn record_dispatch() { DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn record_success() { SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn record_failure() { FAILURE_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn record_retry() { RETRY_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn record_cancel() { CANCEL_COUNT.fetch_add(1, Ordering::Relaxed); }
-pub fn record_ipc_request() { IPC_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed); }
+pub fn record_dispatch() {
+    DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_success() {
+    SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_failure() {
+    FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_retry() {
+    RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_cancel() {
+    CANCEL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn record_ipc_request() {
+    IPC_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 pub fn snapshot() -> serde_json::Value {
     serde_json::json!({

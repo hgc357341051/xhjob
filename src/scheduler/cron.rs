@@ -1,14 +1,14 @@
 //! Cron scheduler (reference: APScheduler CronTrigger).
 
+use crate::errors::{Result, XhjobError};
+use crate::store::{TaskState, TaskStore};
+use chrono::TimeZone;
+use chrono_tz::Tz;
+use cron::Schedule;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use cron::Schedule;
-use chrono::TimeZone;
-use chrono_tz::Tz;
-use crate::errors::{Result, XhjobError};
-use crate::store::{TaskState, TaskStore};
 
 /// Timestamp (Unix seconds) of the last `cleanup_expired_results` invocation
 /// in `scan_once`. Throttles result-TTL cleanup to at most once per 60s.
@@ -26,7 +26,8 @@ pub struct CronEntry {
 /// Validate that `tz_str` parses as a valid IANA timezone (e.g.
 /// `Asia/Shanghai`, `America/New_York`). Returns `Ok(())` on success.
 pub fn validate_timezone(tz_str: &str) -> Result<()> {
-    tz_str.parse::<Tz>()
+    tz_str
+        .parse::<Tz>()
         .map(|_| ())
         .map_err(|_| XhjobError::config(format!("invalid timezone: {}", tz_str)))
 }
@@ -42,11 +43,7 @@ pub fn validate_timezone(tz_str: &str) -> Result<()> {
 /// - `Some(tz_str)`: parse `tz_str` as an IANA timezone name via `chrono-tz`
 ///   (e.g. `Asia/Shanghai`). An unparseable string yields
 ///   `XhjobError::Config("invalid timezone: ...")`.
-pub fn next_fire(
-    cron_expr: &str,
-    from_ts: u64,
-    timezone: Option<&str>,
-) -> Result<u64> {
+pub fn next_fire(cron_expr: &str, from_ts: u64, timezone: Option<&str>) -> Result<u64> {
     let normalized = if cron_expr.split_whitespace().count() >= 6 {
         cron_expr.to_string()
     } else {
@@ -58,19 +55,32 @@ pub fn next_fire(
 
     let next_ts: i64 = match timezone {
         Some(tz_str) => {
-            let tz: Tz = tz_str.parse()
+            let tz: Tz = tz_str
+                .parse()
                 .map_err(|_| XhjobError::config(format!("invalid timezone: {}", tz_str)))?;
-            let from_dt = tz.timestamp_opt(from_ts as i64, 0).single()
+            let from_dt = tz
+                .timestamp_opt(from_ts as i64, 0)
+                .single()
                 .ok_or_else(|| XhjobError::CronParse(format!("invalid from_ts: {}", from_ts)))?;
-            schedule.after(&from_dt).next()
-                .ok_or_else(|| XhjobError::CronParse(format!("no future fire time for '{}'", cron_expr)))?
+            schedule
+                .after(&from_dt)
+                .next()
+                .ok_or_else(|| {
+                    XhjobError::CronParse(format!("no future fire time for '{}'", cron_expr))
+                })?
                 .timestamp()
         }
         None => {
-            let from_dt = chrono::Local.timestamp_opt(from_ts as i64, 0).single()
+            let from_dt = chrono::Local
+                .timestamp_opt(from_ts as i64, 0)
+                .single()
                 .ok_or_else(|| XhjobError::CronParse(format!("invalid from_ts: {}", from_ts)))?;
-            schedule.after(&from_dt).next()
-                .ok_or_else(|| XhjobError::CronParse(format!("no future fire time for '{}'", cron_expr)))?
+            schedule
+                .after(&from_dt)
+                .next()
+                .ok_or_else(|| {
+                    XhjobError::CronParse(format!("no future fire time for '{}'", cron_expr))
+                })?
                 .timestamp()
         }
     };
@@ -94,7 +104,11 @@ fn should_fire_due(next_fire: u64, now: u64, coalesce: bool, per_job_grace: u64)
     if coalesce {
         return true;
     }
-    let grace = if per_job_grace > 0 { per_job_grace } else { MISFIRE_GRACE_TIME_SECS };
+    let grace = if per_job_grace > 0 {
+        per_job_grace
+    } else {
+        MISFIRE_GRACE_TIME_SECS
+    };
     now.saturating_sub(next_fire) <= grace
 }
 
@@ -110,11 +124,21 @@ fn date_components_in_tz(ts: i64, tz_str: Option<&str>) -> Option<(i32, u32, u32
         Some(tz_str) => {
             let tz: Tz = tz_str.parse().ok()?;
             let dt = tz.timestamp_opt(ts, 0).single()?;
-            Some((dt.year(), dt.month(), dt.day(), dt.weekday().num_days_from_monday()))
+            Some((
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.weekday().num_days_from_monday(),
+            ))
         }
         None => {
             let dt = chrono::Local.timestamp_opt(ts, 0).single()?;
-            Some((dt.year(), dt.month(), dt.day(), dt.weekday().num_days_from_monday()))
+            Some((
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.weekday().num_days_from_monday(),
+            ))
         }
     }
 }
@@ -203,9 +227,7 @@ fn min_next_fire_across(
                 });
             }
             Err(e) => {
-                return Err(XhjobError::CronParse(format!(
-                    "parse '{}': {}", expr, e
-                )));
+                return Err(XhjobError::CronParse(format!("parse '{}': {}", expr, e)));
             }
         }
     }
@@ -298,7 +320,11 @@ impl CronScheduler {
             if task.max_executions > 0 && task.execution_count >= task.max_executions {
                 // Mark as Success terminal state if not already
                 if task.state != TaskState::Success {
-                    if let Err(e) = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await {
+                    if let Err(e) = self
+                        .store
+                        .update_state(&task.id, TaskState::Success, None, Some(now_ts()))
+                        .await
+                    {
                         tracing::warn!(task_id = %task.id, error = %e, "update_state to Success (max_executions) failed");
                     }
                 }
@@ -314,21 +340,19 @@ impl CronScheduler {
             if task.expires > 0 && task.state == TaskState::Pending {
                 let expiry_ts = task.created_at.saturating_add(task.expires);
                 if now > expiry_ts {
-                    if let Err(e) = self.store.update_state(
-                        &task.id,
-                        TaskState::Expired,
-                        None,
-                        Some(now_ts()),
-                    ).await {
+                    if let Err(e) = self
+                        .store
+                        .update_state(&task.id, TaskState::Expired, None, Some(now_ts()))
+                        .await
+                    {
                         tracing::warn!(task_id = %task.id, error = %e, "update_state to Expired failed");
                     }
                     // 记录 Expired 事件（A17）—— 终态过期。
-                    if let Err(e) = self.store.record_event(
-                        &task.id,
-                        crate::store::EventType::Expired,
-                        None,
-                        now as i64,
-                    ).await {
+                    if let Err(e) = self
+                        .store
+                        .record_event(&task.id, crate::store::EventType::Expired, None, now as i64)
+                        .await
+                    {
                         tracing::warn!(task_id = %task.id, error = %e, "record_event Expired failed");
                     }
                     continue;
@@ -351,7 +375,11 @@ impl CronScheduler {
             if let Some(end_ts) = task.end_date {
                 if (now as i64) > end_ts {
                     if task.state != TaskState::Success {
-                        if let Err(e) = self.store.update_state(&task.id, TaskState::Success, None, Some(now_ts())).await {
+                        if let Err(e) = self
+                            .store
+                            .update_state(&task.id, TaskState::Success, None, Some(now_ts()))
+                            .await
+                        {
                             tracing::warn!(task_id = %task.id, error = %e, "update_state to Success (end_date) failed");
                         }
                     }
@@ -411,7 +439,8 @@ impl CronScheduler {
                 // or_cron trigger set, so an active cron/or_cron task never
                 // also fires via interval.
                 if !has_cron_trigger(&task) {
-                    let next = task.next_fire
+                    let next = task
+                        .next_fire
                         .unwrap_or_else(|| task.created_at.saturating_add(secs));
                     if next <= now {
                         // F-2 / F-3: skip_dates / workdays_only. Skipping does
@@ -430,7 +459,8 @@ impl CronScheduler {
                         if task.jitter > 0 {
                             new_next += rand_jitter(task.jitter);
                         }
-                        if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
+                        if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await
+                        {
                             tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (interval) failed");
                         }
                     }
@@ -483,7 +513,11 @@ impl CronScheduler {
                             due.push(task.id.clone());
                         }
                     } else {
-                        let grace = if task.misfire_grace_time > 0 { task.misfire_grace_time } else { MISFIRE_GRACE_TIME_SECS };
+                        let grace = if task.misfire_grace_time > 0 {
+                            task.misfire_grace_time
+                        } else {
+                            MISFIRE_GRACE_TIME_SECS
+                        };
                         tracing::debug!(
                             task_id = %task.id,
                             gap_secs = now.saturating_sub(next),
@@ -491,12 +525,16 @@ impl CronScheduler {
                             "MISFIRE_SKIP (coalesce=false)"
                         );
                         // Record a `Missed` event so listeners can observe the misfire.
-                        if let Err(e) = self.store.record_event(
-                            &task.id,
-                            crate::store::EventType::Missed,
-                            None,
-                            now as i64,
-                        ).await {
+                        if let Err(e) = self
+                            .store
+                            .record_event(
+                                &task.id,
+                                crate::store::EventType::Missed,
+                                None,
+                                now as i64,
+                            )
+                            .await
+                        {
                             tracing::warn!(task_id = %task.id, error = %e, "record_event Missed failed");
                         }
                     }
@@ -510,7 +548,9 @@ impl CronScheduler {
                             if task.jitter > 0 {
                                 new_next += rand_jitter(task.jitter);
                             }
-                            if let Err(e) = self.store.update_next_fire(&task.id, Some(new_next)).await {
+                            if let Err(e) =
+                                self.store.update_next_fire(&task.id, Some(new_next)).await
+                            {
                                 tracing::warn!(task_id = %task.id, error = %e, "update_next_fire (cron roll-forward) failed");
                             }
                         }
@@ -598,8 +638,8 @@ fn rand_jitter(secs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Timelike;
     use crate::store::{InMemoryStore, Task, TaskType};
+    use chrono::Timelike;
 
     #[test]
     fn coalesce_true_always_fires_even_when_far_behind() {
@@ -660,12 +700,20 @@ mod tests {
 
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
-        assert!(due.is_empty(), "expected misfired task to be skipped, got {:?}", due);
+        assert!(
+            due.is_empty(),
+            "expected misfired task to be skipped, got {:?}",
+            due
+        );
 
         // next_fire should have been rolled forward past `now`.
         let updated = store.load_task("t-misfire").await.unwrap().unwrap();
         let new_next = updated.next_fire.expect("next_fire should be set");
-        assert!(new_next > now, "next_fire should be rolled forward past now, got {}", new_next);
+        assert!(
+            new_next > now,
+            "next_fire should be rolled forward past now, got {}",
+            new_next
+        );
     }
 
     #[tokio::test]
@@ -708,7 +756,11 @@ mod tests {
 
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
-        assert!(due.is_empty(), "paused task should be skipped, got {:?}", due);
+        assert!(
+            due.is_empty(),
+            "paused task should be skipped, got {:?}",
+            due
+        );
     }
 
     #[tokio::test]
@@ -723,7 +775,11 @@ mod tests {
 
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
-        assert!(due.is_empty(), "cancel_requested task should be skipped, got {:?}", due);
+        assert!(
+            due.is_empty(),
+            "cancel_requested task should be skipped, got {:?}",
+            due
+        );
     }
 
     #[test]
@@ -733,7 +789,12 @@ mod tests {
         // Local.timestamp_opt path.
         let now = now_ts();
         let next = next_fire("0 9 * * *", now, None).unwrap();
-        assert!(next > now, "next_fire should be in the future: now={} next={}", now, next);
+        assert!(
+            next > now,
+            "next_fire should be in the future: now={} next={}",
+            now,
+            next
+        );
     }
 
     /// Compute the wall-clock hour:minute:second in `tz_str` for a Unix
@@ -753,9 +814,20 @@ mod tests {
         let next = next_fire("0 9 * * *", now, Some("Asia/Shanghai"))
             .expect("Asia/Shanghai is a valid tz");
         let (h, m, s) = hms_in_tz(next, "Asia/Shanghai");
-        assert_eq!((h, m, s), (9, 0, 0),
-            "next_fire in Asia/Shanghai should be 09:00:00, got {:02}:{:02}:{:02}", h, m, s);
-        assert!(next > now, "next_fire should be in the future: now={} next={}", now, next);
+        assert_eq!(
+            (h, m, s),
+            (9, 0, 0),
+            "next_fire in Asia/Shanghai should be 09:00:00, got {:02}:{:02}:{:02}",
+            h,
+            m,
+            s
+        );
+        assert!(
+            next > now,
+            "next_fire should be in the future: now={} next={}",
+            now,
+            next
+        );
     }
 
     #[test]
@@ -793,8 +865,16 @@ mod tests {
         let res = next_fire("0 9 * * *", now, Some("Invalid/Zone"));
         match res {
             Err(XhjobError::Config { context: msg, .. }) => {
-                assert!(msg.contains("invalid timezone"), "unexpected message: {}", msg);
-                assert!(msg.contains("Invalid/Zone"), "message should mention the bad zone: {}", msg);
+                assert!(
+                    msg.contains("invalid timezone"),
+                    "unexpected message: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("Invalid/Zone"),
+                    "message should mention the bad zone: {}",
+                    msg
+                );
             }
             other => panic!("expected Err(Config(...)), got {:?}", other.map(|_| ())),
         }
@@ -806,7 +886,12 @@ mod tests {
         // (and not panic). Just ensure it returns a future timestamp.
         let now = now_ts();
         let next = next_fire("0 9 * * *", now, None).expect("None tz should not error");
-        assert!(next > now, "next_fire should be in the future: now={} next={}", now, next);
+        assert!(
+            next > now,
+            "next_fire should be in the future: now={} next={}",
+            now,
+            next
+        );
     }
 
     #[test]
@@ -846,16 +931,26 @@ mod tests {
         // After firing, next_fire should advance to roughly now+30.
         let updated = store.load_task("t-interval").await.unwrap().unwrap();
         let new_next = updated.next_fire.expect("next_fire should be set");
-        assert!(new_next >= now + 30,
+        assert!(
+            new_next >= now + 30,
             "next_fire should advance to at least now+30, got {} (now+30={})",
-            new_next, now + 30);
-        assert!(new_next <= now + 35,
+            new_next,
+            now + 30
+        );
+        assert!(
+            new_next <= now + 35,
             "next_fire should be near now+30, got {} (now+35={})",
-            new_next, now + 35);
+            new_next,
+            now + 35
+        );
 
         // A second scan immediately after should NOT re-fire (next_fire is in the future).
         let due2 = sched.scan_once().await.unwrap();
-        assert!(due2.is_empty(), "expected no re-fire after advancing next_fire, got {:?}", due2);
+        assert!(
+            due2.is_empty(),
+            "expected no re-fire after advancing next_fire, got {:?}",
+            due2
+        );
     }
 
     /// DateTrigger (runAt): fires once at the given timestamp and immediately
@@ -883,13 +978,18 @@ mod tests {
         // After firing, next_fire should be set to far-future sentinel.
         let updated = store.load_task("t-runat").await.unwrap().unwrap();
         assert_eq!(
-            updated.next_fire, Some(u64::MAX),
+            updated.next_fire,
+            Some(u64::MAX),
             "runAt task next_fire should be set to u64::MAX sentinel after firing"
         );
 
         // A second scan should NOT re-fire (next_fire is far future).
         let due2 = sched.scan_once().await.unwrap();
-        assert!(due2.is_empty(), "expected no re-fire for runAt task with sentinel next_fire, got {:?}", due2);
+        assert!(
+            due2.is_empty(),
+            "expected no re-fire for runAt task with sentinel next_fire, got {:?}",
+            due2
+        );
     }
 
     /// H4 fix: a `run_at` one-shot task left stuck by a daemon crash
@@ -915,7 +1015,10 @@ mod tests {
         // A normal scan should NOT re-fire the stuck task (sentinel is far future).
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
-        assert!(due.is_empty(), "stuck runAt task with sentinel should not fire");
+        assert!(
+            due.is_empty(),
+            "stuck runAt task with sentinel should not fire"
+        );
 
         // rearm_stuck_run_at_tasks should re-arm it (reset next_fire = now).
         let rearmed = sched.rearm_stuck_run_at_tasks().await.unwrap();
@@ -923,12 +1026,19 @@ mod tests {
 
         // Now next scan should fire it.
         let due2 = sched.scan_once().await.unwrap();
-        assert_eq!(due2, vec!["t-stuck".to_string()], "re-armed task should fire on next scan");
+        assert_eq!(
+            due2,
+            vec!["t-stuck".to_string()],
+            "re-armed task should fire on next scan"
+        );
 
         // Simulate process_one completing the task (transition to terminal),
         // so it's no longer stuck on the next rearm call. In the real daemon
         // flow, this is done by process_one after the executor runs.
-        store.update_state("t-stuck", TaskState::Success, None, Some(now_ts())).await.unwrap();
+        store
+            .update_state("t-stuck", TaskState::Success, None, Some(now_ts()))
+            .await
+            .unwrap();
 
         // Tasks that are NOT stuck must be left alone:
         // - runAt task that has NOT fired yet (next_fire = run_at, state=Pending)
@@ -936,7 +1046,7 @@ mod tests {
         fresh.id = "t-fresh".to_string();
         fresh.run_at = Some((now + 100) as i64);
         fresh.state = TaskState::Pending;
-        fresh.next_fire = Some((now + 100) as u64);
+        fresh.next_fire = Some(now + 100);
         store.insert_task(fresh).await.unwrap();
         // - cron task with sentinel next_fire (should not match run_at filter)
         let mut cron_sentinel = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo c"}));
@@ -954,7 +1064,10 @@ mod tests {
         store.insert_task(done).await.unwrap();
 
         let rearmed2 = sched.rearm_stuck_run_at_tasks().await.unwrap();
-        assert_eq!(rearmed2, 0, "non-stuck tasks (fresh/future, cron, terminal) should not be re-armed");
+        assert_eq!(
+            rearmed2, 0,
+            "non-stuck tasks (fresh/future, cron, terminal) should not be re-armed"
+        );
     }
 
     /// Jitter (A9): when set on an interval task, scan_once advances
@@ -987,7 +1100,9 @@ mod tests {
         assert!(
             new_next >= lower && new_next <= upper,
             "next_fire with jitter should be in [{}, {}], got {}",
-            lower, upper, new_next
+            lower,
+            upper,
+            new_next
         );
     }
 
@@ -1013,20 +1128,35 @@ mod tests {
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
         // Should NOT fire (expired instead).
-        assert!(due.is_empty(), "expired task should not fire, got {:?}", due);
+        assert!(
+            due.is_empty(),
+            "expired task should not fire, got {:?}",
+            due
+        );
 
         let updated = store.load_task("t-expires").await.unwrap().unwrap();
-        assert_eq!(updated.state, TaskState::Expired,
-            "Pending task past expires should transition to Expired");
-        assert!(updated.state.is_terminal(),
-            "Expired should be a terminal state");
-        assert!(updated.finished_at.is_some(),
-            "Expired task should have finished_at set");
+        assert_eq!(
+            updated.state,
+            TaskState::Expired,
+            "Pending task past expires should transition to Expired"
+        );
+        assert!(
+            updated.state.is_terminal(),
+            "Expired should be a terminal state"
+        );
+        assert!(
+            updated.finished_at.is_some(),
+            "Expired task should have finished_at set"
+        );
 
         // A second scan should NOT re-process the task (terminal tasks are
         // filtered out by load_active_tasks).
         let due2 = sched.scan_once().await.unwrap();
-        assert!(due2.is_empty(), "expired terminal task should not be re-scanned, got {:?}", due2);
+        assert!(
+            due2.is_empty(),
+            "expired terminal task should not be re-scanned, got {:?}",
+            due2
+        );
     }
 
     /// Task expires (C6): Running tasks are NOT affected by expires — only
@@ -1048,10 +1178,17 @@ mod tests {
 
         let sched = CronScheduler::new(Arc::clone(&store));
         let due = sched.scan_once().await.unwrap();
-        assert!(due.is_empty(), "running task should not fire, got {:?}", due);
+        assert!(
+            due.is_empty(),
+            "running task should not fire, got {:?}",
+            due
+        );
 
         let updated = store.load_task("t-expires-running").await.unwrap().unwrap();
-        assert_eq!(updated.state, TaskState::Running,
-            "Running tasks should NOT be expired; only Pending tasks are affected");
+        assert_eq!(
+            updated.state,
+            TaskState::Running,
+            "Running tasks should NOT be expired; only Pending tasks are affected"
+        );
     }
 }

@@ -1,9 +1,9 @@
 //! Task state and result query API (reference: Celery AsyncResult).
 
-use serde::{Serialize, Deserialize};
 use crate::errors::{Result, XhjobError};
-use crate::store::{Task, TaskResult, TaskStore};
 use crate::ipc::request as ipc_request;
+use crate::store::{Task, TaskResult, TaskStore};
+use serde::{Deserialize, Serialize};
 
 /// State info returned by `xhjob_state($id)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,15 +129,25 @@ impl StateInfo {
 }
 
 /// Daemon-side handler: query state from store.
-pub async fn handle_state(store: &std::sync::Arc<dyn TaskStore>, task_id: &str) -> Result<StateInfo> {
-    let task = store.load_task(task_id).await?
+pub async fn handle_state(
+    store: &std::sync::Arc<dyn TaskStore>,
+    task_id: &str,
+) -> Result<StateInfo> {
+    let task = store
+        .load_task(task_id)
+        .await?
         .ok_or_else(|| XhjobError::TaskNotFound(task_id.to_string()))?;
     Ok(StateInfo::from_task(&task))
 }
 
 /// Daemon-side handler: query result from store.
-pub async fn handle_result(store: &std::sync::Arc<dyn TaskStore>, task_id: &str) -> Result<TaskResult> {
-    let result = store.load_result(task_id).await?
+pub async fn handle_result(
+    store: &std::sync::Arc<dyn TaskStore>,
+    task_id: &str,
+) -> Result<TaskResult> {
+    let result = store
+        .load_result(task_id)
+        .await?
         .ok_or_else(|| XhjobError::TaskNotFound(format!("result for {}", task_id)))?;
     Ok(result)
 }
@@ -158,7 +168,9 @@ pub async fn query_state(
     let payload = serde_json::json!({ "task_id": task_id });
     let resp = ipc_request("state", payload, &validated, data_dir).await?;
     if !resp.ok {
-        return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
+        return Err(XhjobError::ipc(
+            resp.err.unwrap_or_else(|| "unknown".to_string()),
+        ));
     }
     let info: StateInfo = serde_json::from_value(resp.data)
         .map_err(|e| XhjobError::ipc(format!("deserialize state: {}", e)))?;
@@ -177,7 +189,9 @@ pub async fn query_result(
     let payload = serde_json::json!({ "task_id": task_id });
     let resp = ipc_request("result", payload, &validated, data_dir).await?;
     if !resp.ok {
-        return Err(XhjobError::ipc(resp.err.unwrap_or_else(|| "unknown".to_string())));
+        return Err(XhjobError::ipc(
+            resp.err.unwrap_or_else(|| "unknown".to_string()),
+        ));
     }
     let result: TaskResult = serde_json::from_value(resp.data)
         .map_err(|e| XhjobError::ipc(format!("deserialize result: {}", e)))?;

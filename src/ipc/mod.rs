@@ -1,13 +1,13 @@
 //! Cross-platform IPC: Unix domain socket (Unix) + Named Pipe (Windows).
 
-use serde::{Serialize, Deserialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::errors::{Result, XhjobError};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[cfg(unix)]
-pub mod unix_socket;
 #[cfg(windows)]
 pub mod named_pipe;
+#[cfg(unix)]
+pub mod unix_socket;
 
 /// IPC path derived from `service_name` and optional `data_dir`.
 ///
@@ -24,11 +24,23 @@ pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String {
     #[cfg(unix)]
     {
         let dir = if let Some(d) = data_dir {
-            if !d.is_empty() { d.to_string() } else { fallback_sock_dir() }
+            if !d.is_empty() {
+                d.to_string()
+            } else {
+                fallback_sock_dir()
+            }
         } else if let Ok(d) = std::env::var("XHJOB_SOCK_DIR") {
-            if !d.is_empty() { d } else { fallback_sock_dir() }
+            if !d.is_empty() {
+                d
+            } else {
+                fallback_sock_dir()
+            }
         } else if let Ok(d) = std::env::var("XHJOB_DATA_DIR") {
-            if !d.is_empty() { d } else { fallback_sock_dir() }
+            if !d.is_empty() {
+                d
+            } else {
+                fallback_sock_dir()
+            }
         } else {
             fallback_sock_dir()
         };
@@ -39,7 +51,7 @@ pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String {
     }
     #[cfg(windows)]
     {
-        let _ = data_dir;  // named pipes don't use filesystem paths
+        let _ = data_dir; // named pipes don't use filesystem paths
         format!(r"\\.\pipe\xhjob-{}", service_name)
     }
 }
@@ -98,10 +110,20 @@ pub struct Response {
 
 impl Response {
     pub fn success(id: u64, data: serde_json::Value) -> Self {
-        Self { id, ok: true, data, err: None }
+        Self {
+            id,
+            ok: true,
+            data,
+            err: None,
+        }
     }
     pub fn error(id: u64, msg: impl Into<String>) -> Self {
-        Self { id, ok: false, data: serde_json::Value::Null, err: Some(msg.into()) }
+        Self {
+            id,
+            ok: false,
+            data: serde_json::Value::Null,
+            err: Some(msg.into()),
+        }
     }
 }
 
@@ -116,8 +138,7 @@ pub struct Event {
 
 /// Write a length-prefixed JSON frame.
 pub async fn write_frame<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
-    let json = serde_json::to_vec(msg)
-        .map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
+    let json = serde_json::to_vec(msg).map_err(|e| XhjobError::ipc(format!("serialize: {}", e)))?;
     // D-6: guard against silent truncation when the serialized JSON exceeds
     // u32::MAX (4 GiB). The wire format encodes the length as a 4-byte
     // big-endian u32, so any larger payload would wrap and corrupt the
@@ -131,19 +152,25 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg:
         )));
     }
     let len = json.len() as u32;
-    w.write_all(&len.to_be_bytes()).await
+    w.write_all(&len.to_be_bytes())
+        .await
         .map_err(|e| XhjobError::ipc(format!("write len: {}", e)))?;
-    w.write_all(&json).await
+    w.write_all(&json)
+        .await
         .map_err(|e| XhjobError::ipc(format!("write body: {}", e)))?;
-    w.flush().await
+    w.flush()
+        .await
         .map_err(|e| XhjobError::ipc(format!("flush: {}", e)))?;
     Ok(())
 }
 
 /// Read a length-prefixed JSON frame.
-pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T> {
+pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
+    r: &mut R,
+) -> Result<T> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).await
+    r.read_exact(&mut len_buf)
+        .await
         .map_err(|e| XhjobError::ipc(format!("read len: {}", e)))?;
     let len = u32::from_be_bytes(len_buf) as usize;
     // P0 fix: lowered from 64 MB to 8 MB. A legitimate IPC request (dispatch
@@ -151,13 +178,16 @@ pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r
     // for large payloads while preventing a single malicious connection from
     // allocating 64 MB of memory per frame.
     if len > 8 * 1024 * 1024 {
-        return Err(XhjobError::ipc(format!("frame too large: {} (max 8MB)", len)));
+        return Err(XhjobError::ipc(format!(
+            "frame too large: {} (max 8MB)",
+            len
+        )));
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await
+    r.read_exact(&mut buf)
+        .await
         .map_err(|e| XhjobError::ipc(format!("read body: {}", e)))?;
-    serde_json::from_slice(&buf)
-        .map_err(|e| XhjobError::ipc(format!("deserialize: {}", e)))
+    serde_json::from_slice(&buf).map_err(|e| XhjobError::ipc(format!("deserialize: {}", e)))
 }
 
 /// Server-side listener abstraction.
@@ -165,7 +195,9 @@ pub async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(r
 pub trait IpcListener: Send + Sync {
     /// Accept one connection. Returns an owned AsyncRead+AsyncWrite stream.
     #[allow(clippy::type_complexity)]
-    fn accept<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>>;
+    fn accept<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn IpcStream>>> + Send + 'a>>;
 }
 
 /// Stream abstraction (read + write).
@@ -184,11 +216,15 @@ pub async fn bind_listener() -> Result<Box<dyn IpcListener>> {
     let data_dir_ref = data_dir.as_deref();
     #[cfg(unix)]
     {
-        Ok(Box::new(unix_socket::UnixListenerWrapper::bind(&service_name, data_dir_ref).await?))
+        Ok(Box::new(
+            unix_socket::UnixListenerWrapper::bind(&service_name, data_dir_ref).await?,
+        ))
     }
     #[cfg(windows)]
     {
-        Ok(Box::new(named_pipe::NamedPipeListenerWrapper::bind(&service_name)?))
+        Ok(Box::new(named_pipe::NamedPipeListenerWrapper::bind(
+            &service_name,
+        )?))
     }
 }
 
@@ -201,7 +237,7 @@ pub async fn connect(service_name: &str, data_dir: Option<&str>) -> Result<Box<d
     }
     #[cfg(windows)]
     {
-        let _ = data_dir;  // named pipe path doesn't depend on filesystem dir
+        let _ = data_dir; // named pipe path doesn't depend on filesystem dir
         named_pipe::NamedPipeClientWrapper::connect(service_name)
     }
 }
@@ -252,7 +288,7 @@ pub fn default_ipc_timeout_secs() -> u64 {
 
 fn rand_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

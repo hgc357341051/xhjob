@@ -130,6 +130,6 @@ mod tests {
             tasks_executed: AtomicU64::new(0),
         };
         assert!(!l.record_task_execution()); // 1
-        assert!(l.record_task_execution());  // 2 -> reached
+        assert!(l.record_task_execution()); // 2 -> reached
     }
 }

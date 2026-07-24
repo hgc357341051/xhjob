@@ -17,10 +17,10 @@
 //! instance. Cron triggers happen at most a few times per second per task,
 //! so contention is negligible.
 
+use crate::store::Task;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::store::Task;
 
 /// Per-task rate limiter keyed by task id.
 #[derive(Debug, Default)]
@@ -31,7 +31,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Check whether `task` is allowed to fire at `now_ts`. Returns

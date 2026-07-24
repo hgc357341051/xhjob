@@ -172,14 +172,17 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<
         None => pool::coroutine_pool::init_global_runtime(),
     };
     let result: std::result::Result<String, String> = rt.block_on(async move {
-        let payload: serde_json::Value = serde_json::from_str(&task_json)
-            .map_err(|e| format!("invalid json: {}", e))?;
-        let resp = ipc_request("dispatch", payload, &service_name, data_dir.as_deref()).await
+        let payload: serde_json::Value =
+            serde_json::from_str(&task_json).map_err(|e| format!("invalid json: {}", e))?;
+        let resp = ipc_request("dispatch", payload, &service_name, data_dir.as_deref())
+            .await
             .map_err(|e| format!("{}", e))?;
         if !resp.ok {
             return Err(resp.err.unwrap_or_else(|| "unknown".to_string()));
         }
-        let task_id = resp.data.get("task_id")
+        let task_id = resp
+            .data
+            .get("task_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing task_id".to_string())?
             .to_string();
@@ -192,7 +195,11 @@ pub fn xhjob_dispatch(task_json: String, name: Option<String>, data_dir: Option<
 }
 
 #[php_function]
-pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -> Vec<(String, String)> {
+pub fn xhjob_state(
+    id: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -214,42 +221,113 @@ pub fn xhjob_state(id: String, name: Option<String>, data_dir: Option<String>) -
         out.push(("state".to_string(), info.state));
         out.push(("attempts".to_string(), info.attempts.to_string()));
         out.push(("created_at".to_string(), info.created_at.to_string()));
-        if let Some(s) = info.started_at { out.push(("started_at".to_string(), s.to_string())); }
-        if let Some(f) = info.finished_at { out.push(("finished_at".to_string(), f.to_string())); }
-        if let Some(e) = info.last_error { out.push(("last_error".to_string(), e)); }
-        out.push(("execution_count".to_string(), info.execution_count.to_string()));
-        out.push(("max_executions".to_string(), info.max_executions.to_string()));
+        if let Some(s) = info.started_at {
+            out.push(("started_at".to_string(), s.to_string()));
+        }
+        if let Some(f) = info.finished_at {
+            out.push(("finished_at".to_string(), f.to_string()));
+        }
+        if let Some(e) = info.last_error {
+            out.push(("last_error".to_string(), e));
+        }
+        out.push((
+            "execution_count".to_string(),
+            info.execution_count.to_string(),
+        ));
+        out.push((
+            "max_executions".to_string(),
+            info.max_executions.to_string(),
+        ));
         out.push(("paused".to_string(), info.paused.to_string()));
-        out.push(("start_date".to_string(), info.start_date.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
-        out.push(("end_date".to_string(), info.end_date.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
-        out.push(("meta".to_string(), info.meta.clone().unwrap_or_else(|| "null".to_string())));
-        out.push(("interval".to_string(), info.interval.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
-        out.push(("run_at".to_string(), info.run_at.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push((
+            "start_date".to_string(),
+            info.start_date
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+        out.push((
+            "end_date".to_string(),
+            info.end_date
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+        out.push((
+            "meta".to_string(),
+            info.meta.clone().unwrap_or_else(|| "null".to_string()),
+        ));
+        out.push((
+            "interval".to_string(),
+            info.interval
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+        out.push((
+            "run_at".to_string(),
+            info.run_at
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
         out.push(("jitter".to_string(), info.jitter.to_string()));
         out.push(("expires".to_string(), info.expires.to_string()));
         out.push(("retry_backoff".to_string(), info.retry_backoff.to_string()));
         out.push(("ignore_result".to_string(), info.ignore_result.to_string()));
         out.push(("acks_late".to_string(), info.acks_late.to_string()));
-        out.push(("soft_timeout".to_string(), info.soft_timeout.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string())));
+        out.push((
+            "soft_timeout".to_string(),
+            info.soft_timeout
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
         // 追加 StateInfo 中已有但之前未透出的字段
-        out.push(("misfire_grace_time".to_string(), info.misfire_grace_time.to_string()));
-        out.push(("tags".to_string(), serde_json::to_string(&info.tags).unwrap_or_else(|_| "[]".to_string())));
-        out.push(("rate_limit_count".to_string(), info.rate_limit_count.to_string()));
-        out.push(("rate_limit_window".to_string(), info.rate_limit_window.to_string()));
-        out.push(("acks_on_failure".to_string(), info.acks_on_failure.to_string()));
-        out.push(("timezone".to_string(), info.timezone.clone().unwrap_or_default()));
+        out.push((
+            "misfire_grace_time".to_string(),
+            info.misfire_grace_time.to_string(),
+        ));
+        out.push((
+            "tags".to_string(),
+            serde_json::to_string(&info.tags).unwrap_or_else(|_| "[]".to_string()),
+        ));
+        out.push((
+            "rate_limit_count".to_string(),
+            info.rate_limit_count.to_string(),
+        ));
+        out.push((
+            "rate_limit_window".to_string(),
+            info.rate_limit_window.to_string(),
+        ));
+        out.push((
+            "acks_on_failure".to_string(),
+            info.acks_on_failure.to_string(),
+        ));
+        out.push((
+            "timezone".to_string(),
+            info.timezone.clone().unwrap_or_default(),
+        ));
         out.push(("coalesce".to_string(), info.coalesce.to_string()));
-        out.push(("progress".to_string(), info.progress.map(|p| p.to_string()).unwrap_or_default()));
-        out.push(("progress_meta".to_string(), info.progress_meta.clone().unwrap_or_default()));
+        out.push((
+            "progress".to_string(),
+            info.progress.map(|p| p.to_string()).unwrap_or_default(),
+        ));
+        out.push((
+            "progress_meta".to_string(),
+            info.progress_meta.clone().unwrap_or_default(),
+        ));
     } else {
         out.push(("state".to_string(), "UNKNOWN".to_string()));
-        out.push(("error".to_string(), "task not found or daemon not running".to_string()));
+        out.push((
+            "error".to_string(),
+            "task not found or daemon not running".to_string(),
+        ));
     }
     out
 }
 
 #[php_function]
-pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) -> Vec<(String, String)> {
+pub fn xhjob_result(
+    id: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> Vec<(String, String)> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -267,12 +345,24 @@ pub fn xhjob_result(id: String, name: Option<String>, data_dir: Option<String>) 
     });
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(r) = result {
-        if let Some(b) = r.body { out.push(("body".to_string(), b)); }
-        if let Some(b) = r.body_b64 { out.push(("body_b64".to_string(), b)); }
-        if let Some(c) = r.status_code { out.push(("status_code".to_string(), c.to_string())); }
-        if let Some(o) = r.stdout { out.push(("stdout".to_string(), o)); }
-        if let Some(e) = r.stderr { out.push(("stderr".to_string(), e)); }
-        if let Some(c) = r.exit_code { out.push(("exit_code".to_string(), c.to_string())); }
+        if let Some(b) = r.body {
+            out.push(("body".to_string(), b));
+        }
+        if let Some(b) = r.body_b64 {
+            out.push(("body_b64".to_string(), b));
+        }
+        if let Some(c) = r.status_code {
+            out.push(("status_code".to_string(), c.to_string()));
+        }
+        if let Some(o) = r.stdout {
+            out.push(("stdout".to_string(), o));
+        }
+        if let Some(e) = r.stderr {
+            out.push(("stderr".to_string(), e));
+        }
+        if let Some(c) = r.exit_code {
+            out.push(("exit_code".to_string(), c.to_string()));
+        }
     } else {
         out.push(("error".to_string(), "no result record for this task (it may have failed before producing output; check xhjob_state() last_error)".to_string()));
     }
@@ -427,9 +517,13 @@ pub fn xhjob_list(
         match ipc_request("list", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("tasks")
+                resp.data
+                    .get("tasks")
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "[]".to_string())
             }
@@ -465,7 +559,8 @@ pub fn xhjob_requeue(id: String, name: Option<String>, data_dir: Option<String>)
                 if !resp.ok {
                     return false;
                 }
-                resp.data.get("requeued")
+                resp.data
+                    .get("requeued")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
             }
@@ -485,7 +580,12 @@ pub fn xhjob_requeue(id: String, name: Option<String>, data_dir: Option<String>)
 /// Reference: APScheduler reschedule_job.
 /// PHP: `xhjob_reschedule(string $id, string $cron, string $name = "default", string $data_dir = null): bool`
 #[php_function]
-pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir: Option<String>) -> bool {
+pub fn xhjob_reschedule(
+    id: String,
+    cron: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -505,7 +605,8 @@ pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir
                 if !resp.ok {
                     return false;
                 }
-                resp.data.get("rescheduled")
+                resp.data
+                    .get("rescheduled")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
             }
@@ -521,7 +622,12 @@ pub fn xhjob_reschedule(id: String, cron: String, name: Option<String>, data_dir
 /// Modify any task field at runtime (F-5). The patch JSON is an object whose
 /// keys map to Task fields (cron, interval, priority, tags, etc.).
 #[php_function]
-pub fn xhjob_modify(id: String, patch_json: String, name: Option<String>, data_dir: Option<String>) -> bool {
+pub fn xhjob_modify(
+    id: String,
+    patch_json: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -548,7 +654,8 @@ pub fn xhjob_modify(id: String, patch_json: String, name: Option<String>, data_d
                 if !resp.ok {
                     return false;
                 }
-                resp.data.get("modified")
+                resp.data
+                    .get("modified")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
             }
@@ -594,14 +701,15 @@ pub fn xhjob_get(id: String, name: Option<String>, data_dir: Option<String>) -> 
                 if !resp.ok {
                     return None;
                 }
-                let ok = resp.data.get("ok")
+                let ok = resp
+                    .data
+                    .get("ok")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !ok {
                     return None;
                 }
-                resp.data.get("data")
-                    .map(|d| d.to_string())
+                resp.data.get("data").map(|d| d.to_string())
             }
             Err(e) => {
                 tracing::error!("xhjob_get ipc: {}", e);
@@ -659,8 +767,8 @@ pub fn xhjob_run_daemon(service_name: Option<String>, data_dir: Option<String>) 
 
 #[cfg(unix)]
 fn reopen_std_streams_for_daemon() {
-    use std::os::unix::io::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
     let service_name = crate::service::current();
     let data_dir = crate::service::current_data_dir();
     let log = daemon::log_file_path(&service_name, data_dir.as_deref());
@@ -668,14 +776,19 @@ fn reopen_std_streams_for_daemon() {
         let _ = std::fs::create_dir_all(parent);
     }
     let f = std::fs::OpenOptions::new()
-        .create(true).append(true).read(false).mode(0o644)
+        .create(true)
+        .append(true)
+        .read(false)
+        .mode(0o644)
         .open(&log);
     if let Ok(f) = f {
         let log_fd = f.as_raw_fd();
         let devnull = std::fs::OpenOptions::new().read(true).open("/dev/null");
         if let Ok(devnull) = devnull {
             unsafe {
-                extern "C" { fn dup2(oldfd: i32, newfd: i32) -> i32; }
+                extern "C" {
+                    fn dup2(oldfd: i32, newfd: i32) -> i32;
+                }
                 dup2(devnull.as_raw_fd(), 0);
                 dup2(log_fd, 1);
                 dup2(log_fd, 2);
@@ -699,7 +812,9 @@ pub struct Xhjob {
 #[php_impl]
 impl Xhjob {
     pub fn task() -> Xhjob {
-        Xhjob { builder: task::TaskBuilder::new() }
+        Xhjob {
+            builder: task::TaskBuilder::new(),
+        }
     }
 
     /// Bind this Xhjob instance to a named service. Subsequent `dispatch()`
@@ -961,11 +1076,7 @@ impl Xhjob {
     /// PHP: `softTimeout(int $secs): $this` (snake→camel auto-conversion)
     /// Reference: Celery soft_time_limit.
     pub fn soft_timeout(&mut self, secs: i64) -> &mut Self {
-        self.builder.soft_timeout = if secs <= 0 {
-            None
-        } else {
-            Some(secs as u64)
-        };
+        self.builder.soft_timeout = if secs <= 0 { None } else { Some(secs as u64) };
         self
     }
 
@@ -1001,9 +1112,9 @@ impl Xhjob {
         }
         // Validate charset: A-Z a-z 0-9 _ - only, length 1..=64.
         let valid = id.len() <= 64
-            && id.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-            });
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if !valid {
             tracing::warn!(
                 id = %id,
@@ -1075,9 +1186,7 @@ impl Xhjob {
             None => pool::coroutine_pool::init_global_runtime(),
         };
         let builder = std::mem::take(&mut self.builder);
-        let result = rt.block_on(async move {
-            builder.dispatch().await
-        });
+        let result = rt.block_on(async move { builder.dispatch().await });
         match result {
             Ok(id) => id,
             Err(e) => format!("error: {}", e),
@@ -1115,9 +1224,13 @@ pub fn xhjob_events(
         match ipc_request("events", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("events")
+                resp.data
+                    .get("events")
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "[]".to_string())
             }
@@ -1160,7 +1273,14 @@ pub fn xhjob_report_progress(
             "percent": percent,
             "meta": meta_json,
         });
-        match ipc_request("report_progress", payload, &service_name, data_dir.as_deref()).await {
+        match ipc_request(
+            "report_progress",
+            payload,
+            &service_name,
+            data_dir.as_deref(),
+        )
+        .await
+        {
             Ok(resp) => resp.ok,
             Err(e) => {
                 tracing::error!("xhjob_report_progress ipc: {}", e);
@@ -1200,9 +1320,13 @@ pub fn xhjob_pull_events(
         match ipc_request("pull_events", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("events")
+                resp.data
+                    .get("events")
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "[]".to_string())
             }
@@ -1223,11 +1347,7 @@ pub fn xhjob_pull_events(
 /// Reference: Celery inspect active / registered / scheduled / stats.
 /// PHP: `xhjob_inspect(string $mode, ?string $name = "default", ?string $data_dir = null): string`
 #[php_function]
-pub fn xhjob_inspect(
-    mode: String,
-    name: Option<String>,
-    data_dir: Option<String>,
-) -> String {
+pub fn xhjob_inspect(mode: String, name: Option<String>, data_dir: Option<String>) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => return format!("error: {}", e),
@@ -1242,9 +1362,13 @@ pub fn xhjob_inspect(
         match ipc_request("inspect", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("data")
+                resp.data
+                    .get("data")
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "null".to_string())
             }
@@ -1287,9 +1411,13 @@ pub fn xhjob_chain(tasks_json: String, name: Option<String>, data_dir: Option<St
         match ipc_request("chain", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("chain_id")
+                resp.data
+                    .get("chain_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "error: missing chain_id".to_string())
@@ -1306,7 +1434,11 @@ pub fn xhjob_chain(tasks_json: String, name: Option<String>, data_dir: Option<St
 /// Reference: Celery chain inspection.
 /// PHP: `xhjob_chain_state(string $chain_id, string $name = "default", string $data_dir = null): ?string`
 #[php_function]
-pub fn xhjob_chain_state(chain_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+pub fn xhjob_chain_state(
+    chain_id: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> Option<String> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -1326,7 +1458,9 @@ pub fn xhjob_chain_state(chain_id: String, name: Option<String>, data_dir: Optio
                 if !resp.ok {
                     return None;
                 }
-                let ok = resp.data.get("ok")
+                let ok = resp
+                    .data
+                    .get("ok")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !ok {
@@ -1373,9 +1507,13 @@ pub fn xhjob_group(tasks_json: String, name: Option<String>, data_dir: Option<St
         match ipc_request("group", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("group_id")
+                resp.data
+                    .get("group_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "error: missing group_id".to_string())
@@ -1393,7 +1531,11 @@ pub fn xhjob_group(tasks_json: String, name: Option<String>, data_dir: Option<St
 /// Reference: Celery group inspection.
 /// PHP: `xhjob_group_state(string $group_id, string $name = "default", string $data_dir = null): ?string`
 #[php_function]
-pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+pub fn xhjob_group_state(
+    group_id: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> Option<String> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -1413,7 +1555,9 @@ pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Optio
                 if !resp.ok {
                     return None;
                 }
-                let ok = resp.data.get("ok")
+                let ok = resp
+                    .data
+                    .get("ok")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !ok {
@@ -1444,7 +1588,12 @@ pub fn xhjob_group_state(group_id: String, name: Option<String>, data_dir: Optio
 /// Reference: Celery `chord(header, body)`.
 /// PHP: `xhjob_chord(string $header_json, string $callback_json, string $name = "default", string $data_dir = null): string`
 #[php_function]
-pub fn xhjob_chord(header_json: String, callback_json: String, name: Option<String>, data_dir: Option<String>) -> String {
+pub fn xhjob_chord(
+    header_json: String,
+    callback_json: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> String {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => return format!("error: {}", e),
@@ -1467,9 +1616,13 @@ pub fn xhjob_chord(header_json: String, callback_json: String, name: Option<Stri
         match ipc_request("chord", payload, &service_name, data_dir.as_deref()).await {
             Ok(resp) => {
                 if !resp.ok {
-                    return format!("error: {}", resp.err.unwrap_or_else(|| "unknown".to_string()));
+                    return format!(
+                        "error: {}",
+                        resp.err.unwrap_or_else(|| "unknown".to_string())
+                    );
                 }
-                resp.data.get("chord_id")
+                resp.data
+                    .get("chord_id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "error: missing chord_id".to_string())
@@ -1487,7 +1640,11 @@ pub fn xhjob_chord(header_json: String, callback_json: String, name: Option<Stri
 /// Reference: Celery chord inspection.
 /// PHP: `xhjob_chord_state(string $chord_id, string $name = "default", string $data_dir = null): ?string`
 #[php_function]
-pub fn xhjob_chord_state(chord_id: String, name: Option<String>, data_dir: Option<String>) -> Option<String> {
+pub fn xhjob_chord_state(
+    chord_id: String,
+    name: Option<String>,
+    data_dir: Option<String>,
+) -> Option<String> {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
@@ -1507,7 +1664,9 @@ pub fn xhjob_chord_state(chord_id: String, name: Option<String>, data_dir: Optio
                 if !resp.ok {
                     return None;
                 }
-                let ok = resp.data.get("ok")
+                let ok = resp
+                    .data
+                    .get("ok")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !ok {

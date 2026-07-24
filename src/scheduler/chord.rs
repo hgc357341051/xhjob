@@ -20,10 +20,10 @@
 //! completion hook) is responsible for enqueuing it on the in-memory queue.
 
 use crate::errors::Result;
-use crate::store::{ChordRecord, TaskState, TaskStore, now_ts};
+use crate::store::{now_ts, ChordRecord, TaskState, TaskStore};
 use crate::task::TaskBuilder;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// P0 fix: per-chord mutex map. Prevents the check-then-act race in
@@ -32,7 +32,8 @@ use tokio::sync::Mutex;
 /// update_chord_state to "success" — resulting in a duplicate callback
 /// dispatch. The guard serializes refresh_state per chord_id so only one
 /// caller at a time can observe "all succeeded" and insert the callback.
-static CHORD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+static CHORD_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::OnceLock::new();
 
 fn chord_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
     CHORD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -61,10 +62,7 @@ pub struct ChordRefreshResult {
 }
 
 /// Inspect the chord record by id.
-pub async fn inspect(
-    store: &Arc<dyn TaskStore>,
-    chord_id: &str,
-) -> Result<Option<ChordRecord>> {
+pub async fn inspect(store: &Arc<dyn TaskStore>, chord_id: &str) -> Result<Option<ChordRecord>> {
     store.get_chord(chord_id).await
 }
 
@@ -159,7 +157,9 @@ pub async fn refresh_state(
     let now = now_ts() as i64;
 
     if failed > 0 {
-        store.update_chord_state(chord_id, "partial_failed", None, now).await?;
+        store
+            .update_chord_state(chord_id, "partial_failed", None, now)
+            .await?;
         return Ok(ChordRefreshResult {
             new_state: "partial_failed",
             callback_task_id: None,
@@ -169,8 +169,10 @@ pub async fn refresh_state(
     if succeeded == total && total > 0 {
         // All header tasks succeeded — dispatch the callback.
         // The per-chord mutex guarantees we only get here once.
-        let mut callback: TaskBuilder = serde_json::from_str(&record.callback_json)
-            .map_err(|e| crate::errors::XhjobError::store(format!("chord callback parse: {}", e)))?;
+        let mut callback: TaskBuilder =
+            serde_json::from_str(&record.callback_json).map_err(|e| {
+                crate::errors::XhjobError::store(format!("chord callback parse: {}", e))
+            })?;
         let meta_json = serde_json::to_string(&results)
             .map_err(|e| crate::errors::XhjobError::store(format!("chord meta encode: {}", e)))?;
         callback = callback.meta(meta_json);
@@ -192,7 +194,9 @@ pub async fn refresh_state(
     }
 
     // Still in flight.
-    store.update_chord_state(chord_id, "running", None, now).await?;
+    store
+        .update_chord_state(chord_id, "running", None, now)
+        .await?;
     Ok(ChordRefreshResult {
         new_state: "running",
         callback_task_id: None,
@@ -211,7 +215,10 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_empty_chord_returns_pending() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
-        store.create_chord("c-empty", &[], "{}", now_ts() as i64).await.unwrap();
+        store
+            .create_chord("c-empty", &[], "{}", now_ts() as i64)
+            .await
+            .unwrap();
         let r = refresh_state(&store, "c-empty").await.unwrap();
         assert_eq!(r.new_state, "running");
         assert!(r.callback_task_id.is_none());
@@ -226,25 +233,42 @@ mod tests {
         t1.id = "h1".to_string();
         t1.state = TaskState::Success;
         store.insert_task(t1).await.unwrap();
-        store.save_result("h1", crate::store::TaskResult {
-            stdout: Some("ok1".to_string()),
-            exit_code: Some(0),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "h1",
+                crate::store::TaskResult {
+                    stdout: Some("ok1".to_string()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let mut t2 = Task::new(TaskType::Shell, json!({"cmd":"b"}));
         t2.id = "h2".to_string();
         t2.state = TaskState::Success;
         store.insert_task(t2).await.unwrap();
-        store.save_result("h2", crate::store::TaskResult {
-            stdout: Some("ok2".to_string()),
-            exit_code: Some(0),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "h2",
+                crate::store::TaskResult {
+                    stdout: Some("ok2".to_string()),
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let callback = TaskBuilder::new().via_shell("echo done").to_json();
         store
-            .create_chord("c-ok", &["h1".to_string(), "h2".to_string()], &callback, now_ts() as i64)
+            .create_chord(
+                "c-ok",
+                &["h1".to_string(), "h2".to_string()],
+                &callback,
+                now_ts() as i64,
+            )
             .await
             .unwrap();
 
@@ -281,7 +305,12 @@ mod tests {
 
         let callback = TaskBuilder::new().via_shell("echo done").to_json();
         store
-            .create_chord("c-pf", &["h1".to_string(), "h2".to_string()], &callback, now_ts() as i64)
+            .create_chord(
+                "c-pf",
+                &["h1".to_string(), "h2".to_string()],
+                &callback,
+                now_ts() as i64,
+            )
             .await
             .unwrap();
 
@@ -309,7 +338,12 @@ mod tests {
 
         let callback = TaskBuilder::new().via_shell("echo done").to_json();
         store
-            .create_chord("c-run", &["h1".to_string(), "h2".to_string()], &callback, now_ts() as i64)
+            .create_chord(
+                "c-run",
+                &["h1".to_string(), "h2".to_string()],
+                &callback,
+                now_ts() as i64,
+            )
             .await
             .unwrap();
 
@@ -328,7 +362,10 @@ mod tests {
             .create_chord("c-term", &["h1".to_string()], &callback, now_ts() as i64)
             .await
             .unwrap();
-        store.update_chord_state("c-term", "partial_failed", None, now_ts() as i64).await.unwrap();
+        store
+            .update_chord_state("c-term", "partial_failed", None, now_ts() as i64)
+            .await
+            .unwrap();
         let r = refresh_state(&store, "c-term").await.unwrap();
         assert_eq!(r.new_state, "partial_failed");
         assert!(r.callback_task_id.is_none());

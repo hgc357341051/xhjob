@@ -1,20 +1,24 @@
 //! HTTP executor based on reqwest.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
-use crate::errors::{Result, XhjobError};
-use crate::store::{Task, TaskResult, HttpPayload};
 use super::Executor;
+use crate::errors::{Result, XhjobError};
+use crate::store::{HttpPayload, Task, TaskResult};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct HttpExecutor;
 
 impl HttpExecutor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for HttpExecutor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Parsed components of a proxy URL.
@@ -38,7 +42,8 @@ pub(crate) struct ParsedProxy {
 /// `host_port` excludes them (so it can be passed directly to
 /// `reqwest::Proxy::socks5` / `socks5h`).
 pub(crate) fn parse_proxy_url(url: &str) -> Result<ParsedProxy> {
-    let (scheme, rest) = url.split_once("://")
+    let (scheme, rest) = url
+        .split_once("://")
         .ok_or_else(|| XhjobError::exec(format!("invalid proxy url (no scheme): {}", url)))?;
 
     // Split `user:pass@host:port` (if present). We use `rfind` so a password
@@ -50,7 +55,11 @@ pub(crate) fn parse_proxy_url(url: &str) -> Result<ParsedProxy> {
             Some((u, p)) => (u.to_string(), p.to_string()),
             None => (auth.to_string(), String::new()),
         };
-        (Some(u), if p.is_empty() { None } else { Some(p) }, hp.to_string())
+        (
+            Some(u),
+            if p.is_empty() { None } else { Some(p) },
+            hp.to_string(),
+        )
     } else {
         (None, None, rest.to_string())
     };
@@ -93,7 +102,12 @@ fn build_proxy(proxy_str: &str) -> Result<reqwest::Proxy> {
             let url = format!("socks5h://{}", parsed.host_port);
             reqwest::Proxy::all(url.as_str())
         }
-        other => return Err(XhjobError::exec(format!("unsupported proxy scheme: {}", other))),
+        other => {
+            return Err(XhjobError::exec(format!(
+                "unsupported proxy scheme: {}",
+                other
+            )))
+        }
     }
     .map_err(|e| XhjobError::exec(format!("parse proxy {}: {}", proxy_str, e)))?;
 
@@ -108,7 +122,10 @@ fn build_proxy(proxy_str: &str) -> Result<reqwest::Proxy> {
 }
 
 impl Executor for HttpExecutor {
-    fn execute<'a>(&'a self, task: &'a Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+    fn execute<'a>(
+        &'a self,
+        task: &'a Task,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
         let proxy = task.proxy.clone();
@@ -125,9 +142,10 @@ impl Executor for HttpExecutor {
                 // retransmits alone exceed this for unreachable hosts.
                 .connect_timeout(Duration::from_secs(
                     std::env::var("XHJOB_HTTP_CONNECT_TIMEOUT")
-                        .ok().and_then(|s| s.parse::<u64>().ok())
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
                         .filter(|n| *n > 0)
-                        .unwrap_or(10)
+                        .unwrap_or(10),
                 ))
                 // MEDIUM fix: explicit redirect policy. Previously relied on
                 // reqwest's default (follow up to 10 redirects silently).
@@ -136,8 +154,9 @@ impl Executor for HttpExecutor {
                 // the redirect budget visible to operators. Default 5.
                 .redirect(reqwest::redirect::Policy::limited(
                     std::env::var("XHJOB_HTTP_MAX_REDIRECTS")
-                        .ok().and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(5)
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(5),
                 ));
 
             if let Some(proxy_str) = &proxy {
@@ -145,7 +164,8 @@ impl Executor for HttpExecutor {
                 client_builder = client_builder.proxy(p);
             }
 
-            let client = client_builder.build()
+            let client = client_builder
+                .build()
                 .map_err(|e| XhjobError::exec(format!("build client: {}", e)))?;
 
             let method = match payload.method.to_uppercase().as_str() {
@@ -169,7 +189,9 @@ impl Executor for HttpExecutor {
                 req = req.body(body.clone());
             }
 
-            let resp = req.send().await
+            let resp = req
+                .send()
+                .await
                 .map_err(|e| XhjobError::exec(format!("http send: {}", e)))?;
             let status = resp.status().as_u16() as i32;
 
@@ -194,8 +216,8 @@ impl Executor for HttpExecutor {
             let mut body_buf: Vec<u8> = Vec::new();
             let mut exceeded = false;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|e| XhjobError::exec(format!("read body chunk: {}", e)))?;
+                let chunk =
+                    chunk.map_err(|e| XhjobError::exec(format!("read body chunk: {}", e)))?;
                 if body_buf.len() + chunk.len() > MAX_BODY_BYTES as usize {
                     exceeded = true;
                     break;
@@ -237,6 +259,9 @@ impl Executor for HttpExecutor {
                 stdout: None,
                 stderr: None,
                 exit_code: None,
+                // HTTP tasks have no child process; worker_pid is None so
+                // crash recovery's lease check never blocks a reset.
+                worker_pid: None,
             })
         })
     }
@@ -246,7 +271,11 @@ impl Executor for HttpExecutor {
     /// the reqwest future is dropped (aborting the in-flight TCP connection),
     /// and we return a "cancelled" error so the queue can record the event
     /// and not retry (cancel_requested is checked upstream).
-    fn execute_with_cancel<'a>(&'a self, task: &'a Task, cancel_flag: Option<Arc<AtomicBool>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+    fn execute_with_cancel<'a>(
+        &'a self,
+        task: &'a Task,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(flag) = &cancel_flag {
                 if flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -349,6 +378,87 @@ mod tests {
     fn build_proxy_unsupported_scheme() {
         let err = build_proxy("ftp://example.com:21").unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("unsupported proxy scheme"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("unsupported proxy scheme"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    /// H3 fix: `execute_with_cancel` wraps the reqwest future in
+    /// `tokio::select!` + `biased` against a cancel flag polled every 200ms.
+    /// When cancel is requested mid-flight, the reqwest future is dropped
+    /// (aborting the in-flight TCP connection) and we return
+    /// "cancelled during http request".
+    ///
+    /// We verify this against a slow TCP server that accepts the connection
+    /// but never sends an HTTP response — so the only way the test finishes
+    /// within 5s is via the cancel path.
+    #[tokio::test]
+    async fn test_execute_with_cancel_aborts_request() {
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::net::TcpListener;
+
+        // Bind a TCP server on an OS-assigned port. The server accepts one
+        // connection but never sends an HTTP response, forcing reqwest to
+        // hang until its own 30s timeout — which we never reach because
+        // cancel kicks in within ~400ms.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let url = format!("http://{}/", addr);
+
+        tokio::spawn(async move {
+            // Accept the connection then hold it open for 30s without
+            // responding. The kept-open connection is what keeps reqwest
+            // waiting for a response.
+            if let Ok((_stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({
+                "method": "GET",
+                "url": url,
+            }),
+        );
+        task.timeout = 30;
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&cancel_flag);
+
+        // Simulate xhjob_cancel: set the flag 200ms after execution starts.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let result = HttpExecutor
+            .execute_with_cancel(&task, Some(cancel_flag))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected Err after cancel");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("cancelled during http request"),
+            "error should mention 'cancelled during http request': {}",
+            msg
+        );
+
+        // Cancel poll interval is 200ms; flag set at 200ms; worst case ~400ms.
+        // 5s upper bound is generous and proves cancel actually fired (vs
+        // the 30s reqwest timeout).
+        assert!(
+            elapsed.as_secs() < 5,
+            "cancel should abort request quickly, took {:?}",
+            elapsed
+        );
     }
 }

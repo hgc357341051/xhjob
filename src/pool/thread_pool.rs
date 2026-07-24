@@ -17,10 +17,10 @@
 //!
 //! Built on top of `std::thread` + `crossbeam-channel`.
 
-use std::sync::Arc;
-use std::thread;
 use crossbeam_channel::{bounded, unbounded, Sender};
 use once_cell::sync::OnceCell;
+use std::sync::Arc;
+use std::thread;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -140,7 +140,9 @@ impl Drop for ThreadPool {
 pub fn configured_size() -> usize {
     if let Ok(s) = std::env::var("XHJOB_THREAD_POOL_SIZE") {
         if let Ok(n) = s.parse::<usize>() {
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
     }
     num_cpus::get()

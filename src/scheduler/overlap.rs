@@ -8,11 +8,11 @@
 //! - `coalesce(false)`: use `misfire_grace_time` (default 60s) to decide whether
 //!   to fire missed triggers.
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::collections::HashMap;
 use crate::errors::Result;
 use crate::store::{Task, TaskStore};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct OverlapController {
     /// In-memory count of currently running instances per task id.
@@ -26,7 +26,9 @@ pub struct OverlapController {
 
 impl OverlapController {
     pub fn new() -> Self {
-        Self { running: Mutex::new(HashMap::new()) }
+        Self {
+            running: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Check whether a task may be dispatched now.
@@ -90,12 +92,15 @@ impl OverlapController {
                     // observe the concurrency cap being hit (previously this
                     // EventType variant was defined but never emitted).
                     let now = crate::store::now_ts() as i64;
-                    if let Err(e) = store.record_event(
-                        &task.id,
-                        crate::store::EventType::MaxInstancesReached,
-                        None,
-                        now,
-                    ).await {
+                    if let Err(e) = store
+                        .record_event(
+                            &task.id,
+                            crate::store::EventType::MaxInstancesReached,
+                            None,
+                            now,
+                        )
+                        .await
+                    {
                         tracing::warn!(task_id = %task.id, error = %e, "record_event MaxInstancesReached failed");
                     }
                     return Ok(false);
@@ -115,8 +120,12 @@ impl OverlapController {
     pub async fn on_finish(&self, task_id: &str) {
         let mut g = self.running.lock().await;
         if let Some(c) = g.get_mut(task_id) {
-            if *c > 0 { *c -= 1; }
-            if *c == 0 { g.remove(task_id); }
+            if *c > 0 {
+                *c -= 1;
+            }
+            if *c == 0 {
+                g.remove(task_id);
+            }
         }
     }
 
@@ -145,7 +154,9 @@ impl OverlapController {
 }
 
 impl Default for OverlapController {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -223,7 +234,10 @@ mod tests {
         );
 
         // Running (count=1): 1 >= 1 → skip.
-        store.update_state(&task.id, TaskState::Running, Some(0), None).await.unwrap();
+        store
+            .update_state(&task.id, TaskState::Running, Some(0), None)
+            .await
+            .unwrap();
         assert!(
             !overlap.should_fire(&store, &task).await.unwrap(),
             "default max_instances=1 + allow_overlap=false with 1 running should skip"
@@ -251,7 +265,10 @@ mod tests {
         );
 
         // Running (count=1): should STILL fire (unlimited concurrency backcompat).
-        store.update_state(&task.id, TaskState::Running, Some(0), None).await.unwrap();
+        store
+            .update_state(&task.id, TaskState::Running, Some(0), None)
+            .await
+            .unwrap();
         assert!(
             overlap.should_fire(&store, &task).await.unwrap(),
             "allow_overlap=true with 1 running should still fire (unlimited backcompat)"

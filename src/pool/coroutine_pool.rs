@@ -11,10 +11,10 @@
 //!   accurate term is "async task pool": M async tasks multiplexed onto N tokio
 //!   worker threads (N = num_cpus) via cooperative `await` yield points.
 
+use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use once_cell::sync::OnceCell;
 
 pub struct CoroutinePool {
     semaphore: Arc<Semaphore>,
@@ -64,7 +64,9 @@ pub fn configured_max() -> usize {
     for var in ["XHJOB_ASYNC_POOL_SIZE", "XHJOB_COROUTINE_POOL_SIZE"] {
         if let Ok(s) = std::env::var(var) {
             if let Ok(n) = s.parse::<usize>() {
-                if n > 0 { return n; }
+                if n > 0 {
+                    return n;
+                }
             }
         }
     }

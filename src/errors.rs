@@ -66,37 +66,58 @@ impl XhjobError {
     /// Build an `Ipc` error from a context string only (no source).
     #[inline]
     pub fn ipc(context: impl Into<String>) -> Self {
-        XhjobError::Ipc { context: context.into(), source: None }
+        XhjobError::Ipc {
+            context: context.into(),
+            source: None,
+        }
     }
     /// Build an `Ipc` error preserving the underlying cause.
     #[inline]
     pub fn ipc_with_source(context: impl Into<String>, source: BoxedSource) -> Self {
-        XhjobError::Ipc { context: context.into(), source: Some(source) }
+        XhjobError::Ipc {
+            context: context.into(),
+            source: Some(source),
+        }
     }
     /// Build a `Store` error from a context string only.
     #[inline]
     pub fn store(context: impl Into<String>) -> Self {
-        XhjobError::Store { context: context.into(), source: None }
+        XhjobError::Store {
+            context: context.into(),
+            source: None,
+        }
     }
     /// Build a `Store` error preserving the underlying cause.
     #[inline]
     pub fn store_with_source(context: impl Into<String>, source: BoxedSource) -> Self {
-        XhjobError::Store { context: context.into(), source: Some(source) }
+        XhjobError::Store {
+            context: context.into(),
+            source: Some(source),
+        }
     }
     /// Build an `Exec` error from a context string only.
     #[inline]
     pub fn exec(context: impl Into<String>) -> Self {
-        XhjobError::Exec { context: context.into(), source: None }
+        XhjobError::Exec {
+            context: context.into(),
+            source: None,
+        }
     }
     /// Build an `Exec` error preserving the underlying cause.
     #[inline]
     pub fn exec_with_source(context: impl Into<String>, source: BoxedSource) -> Self {
-        XhjobError::Exec { context: context.into(), source: Some(source) }
+        XhjobError::Exec {
+            context: context.into(),
+            source: Some(source),
+        }
     }
     /// Build a `Config` error from a context string only.
     #[inline]
     pub fn config(context: impl Into<String>) -> Self {
-        XhjobError::Config { context: context.into(), source: None }
+        XhjobError::Config {
+            context: context.into(),
+            source: None,
+        }
     }
 }
 

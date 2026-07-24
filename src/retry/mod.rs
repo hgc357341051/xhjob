@@ -4,7 +4,7 @@
 //! Retry only on specific error types (HTTP 5xx, shell non-zero exit).
 
 use crate::errors::Result;
-use crate::store::{Task, TaskState, TaskResult, TaskType, TaskStore};
+use crate::store::{Task, TaskResult, TaskState, TaskStore, TaskType};
 use std::sync::Arc;
 
 /// Retry policy configuration.
@@ -94,9 +94,9 @@ impl RetryPolicy {
                 None => true, // network error: retryable (request likely never reached server)
             },
             TaskType::Shell => match result.exit_code {
-                Some(0) => false, // success: not retryable
+                Some(0) => false,                                  // success: not retryable
                 Some(code) => Self::is_retryable_shell_exit(code), // any non-zero
-                None => true, // dispatch error: retryable
+                None => true,                                      // dispatch error: retryable
             },
         }
     }
@@ -137,11 +137,12 @@ pub fn is_failure(task: &Task, result: &TaskResult) -> bool {
     match task.task_type {
         TaskType::Http => {
             // 2xx = success
-            result.status_code.map(|c| !(200..300).contains(&c)).unwrap_or(true)
+            result
+                .status_code
+                .map(|c| !(200..300).contains(&c))
+                .unwrap_or(true)
         }
-        TaskType::Shell => {
-            result.exit_code.map(|c| c != 0).unwrap_or(true)
-        }
+        TaskType::Shell => result.exit_code.map(|c| c != 0).unwrap_or(true),
     }
 }
 
@@ -198,23 +199,31 @@ pub async fn schedule_retry(
 ) -> Result<bool> {
     if task.attempts >= effective_max_attempts {
         // Mark as FAILED permanently
-        store.update_state(
-            &task.id,
-            TaskState::Failed,
-            None,
-            Some(crate::store::now_ts()),
-        ).await?;
+        store
+            .update_state(
+                &task.id,
+                TaskState::Failed,
+                None,
+                Some(crate::store::now_ts()),
+            )
+            .await?;
         // P2 fix: saturating_add prevents u32 wraparound at u32::MAX. With
         // acks_on_failure=false (effective_max_attempts=u32::MAX) a task can
         // accumulate attempts up to u32::MAX; a plain +1 would wrap to 0,
         // resetting the backoff sequence and creating a retry storm.
-        store.set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error)).await?;
+        store
+            .set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error))
+            .await?;
         return Ok(false);
     }
 
     let next = next_retry_ts(task);
-    store.set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error)).await?;
-    store.update_state(&task.id, TaskState::Pending, None, None).await?;
+    store
+        .set_attempts_and_error(&task.id, task.attempts.saturating_add(1), Some(error))
+        .await?;
+    store
+        .update_state(&task.id, TaskState::Pending, None, None)
+        .await?;
     store.update_next_fire(&task.id, Some(next)).await?;
     Ok(true)
 }
@@ -235,7 +244,10 @@ mod tests {
     #[test]
     fn test_should_retry() {
         // Use GET (safe method) so retry is allowed by default.
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"GET","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"GET","url":"http://x"}),
+        );
         task.retry_max = 3;
         task.attempts = 0;
         // Use RetryPolicy::new (max_attempts=3) instead of Default (max_attempts=0).
@@ -244,18 +256,24 @@ mod tests {
         let p = RetryPolicy::new(3, 1);
 
         // HTTP 200 -> success, not retryable
-        let mut ok = TaskResult::default();
-        ok.status_code = Some(200);
+        let ok = TaskResult {
+            status_code: Some(200),
+            ..Default::default()
+        };
         assert!(!p.should_retry(&task, &ok));
 
         // HTTP 500 -> retryable (GET is a safe method)
-        let mut server_err = TaskResult::default();
-        server_err.status_code = Some(500);
+        let server_err = TaskResult {
+            status_code: Some(500),
+            ..Default::default()
+        };
         assert!(p.should_retry(&task, &server_err));
 
         // HTTP 404 -> not retryable (4xx)
-        let mut not_found = TaskResult::default();
-        not_found.status_code = Some(404);
+        let not_found = TaskResult {
+            status_code: Some(404),
+            ..Default::default()
+        };
         assert!(!p.should_retry(&task, &not_found));
 
         // attempts >= retry_max -> never retryable
@@ -265,56 +283,82 @@ mod tests {
 
     #[test]
     fn test_should_retry_http_404_not_retryable() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"GET","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"GET","url":"http://x"}),
+        );
         task.retry_max = 3;
         task.attempts = 0;
         let p = RetryPolicy::new(3, 1);
-        let mut result = TaskResult::default();
-        result.status_code = Some(404);
-        assert!(!p.should_retry(&task, &result),
-            "HTTP 404 must not be retryable (only 5xx)");
+        let result = TaskResult {
+            status_code: Some(404),
+            ..Default::default()
+        };
+        assert!(
+            !p.should_retry(&task, &result),
+            "HTTP 404 must not be retryable (only 5xx)"
+        );
     }
 
     #[test]
     fn test_should_retry_network_error_retryable() {
         // Network errors are always retryable regardless of method (even POST),
         // because the request likely never reached the server.
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"POST","url":"http://x"}),
+        );
         task.retry_max = 3;
         task.attempts = 0;
         let p = RetryPolicy::new(3, 1);
         // Network error: no status_code at all -> retryable.
         let result = TaskResult::default();
-        assert!(p.should_retry(&task, &result),
-            "network error (status_code=None) should be retryable even for POST");
+        assert!(
+            p.should_retry(&task, &result),
+            "network error (status_code=None) should be retryable even for POST"
+        );
     }
 
     /// Fix 6: POST without idempotent flag must NOT be retried on 5xx.
     #[test]
     fn test_should_retry_post_without_idempotent_not_retryable() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"POST","url":"http://x"}),
+        );
         task.retry_max = 3;
         task.attempts = 0;
         // idempotent defaults to false
         let p = RetryPolicy::new(3, 1);
-        let mut result = TaskResult::default();
-        result.status_code = Some(500);
-        assert!(!p.should_retry(&task, &result),
-            "POST without idempotent=true must NOT be retried on 5xx (duplicate side effects)");
+        let result = TaskResult {
+            status_code: Some(500),
+            ..Default::default()
+        };
+        assert!(
+            !p.should_retry(&task, &result),
+            "POST without idempotent=true must NOT be retried on 5xx (duplicate side effects)"
+        );
     }
 
     /// Fix 6: POST with idempotent=true IS retried on 5xx.
     #[test]
     fn test_should_retry_post_with_idempotent_retryable() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"POST","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"POST","url":"http://x"}),
+        );
         task.retry_max = 3;
         task.attempts = 0;
         task.idempotent = true; // user opted in
         let p = RetryPolicy::new(3, 1);
-        let mut result = TaskResult::default();
-        result.status_code = Some(500);
-        assert!(p.should_retry(&task, &result),
-            "POST with idempotent=true should be retried on 5xx");
+        let result = TaskResult {
+            status_code: Some(500),
+            ..Default::default()
+        };
+        assert!(
+            p.should_retry(&task, &result),
+            "POST with idempotent=true should be retried on 5xx"
+        );
     }
 
     /// Fix 6: PUT/DELETE/PATCH without idempotent flag must NOT be retried.
@@ -328,10 +372,15 @@ mod tests {
             );
             task.retry_max = 3;
             task.attempts = 0;
-            let mut result = TaskResult::default();
-            result.status_code = Some(500);
-            assert!(!p.should_retry(&task, &result),
-                "{} without idempotent=true must NOT be retried on 5xx", method);
+            let result = TaskResult {
+                status_code: Some(500),
+                ..Default::default()
+            };
+            assert!(
+                !p.should_retry(&task, &result),
+                "{} without idempotent=true must NOT be retried on 5xx",
+                method
+            );
         }
     }
 
@@ -347,10 +396,15 @@ mod tests {
             task.retry_max = 3;
             task.attempts = 0;
             // idempotent=false (default), but safe methods are always retryable
-            let mut result = TaskResult::default();
-            result.status_code = Some(500);
-            assert!(p.should_retry(&task, &result),
-                "{} is a safe method and should always be retryable on 5xx", method);
+            let result = TaskResult {
+                status_code: Some(500),
+                ..Default::default()
+            };
+            assert!(
+                p.should_retry(&task, &result),
+                "{} is a safe method and should always be retryable on 5xx",
+                method
+            );
         }
     }
 
@@ -364,21 +418,29 @@ mod tests {
         task.retry_max = 1;
         task.attempts = 5; // already past retry_max
         let p = RetryPolicy::new(u32::MAX, 1);
-        let mut result = TaskResult::default();
-        result.exit_code = Some(1);
-        assert!(p.should_retry(&task, &result),
-            "acks_on_failure=false should keep retrying past retry_max");
+        let result = TaskResult {
+            exit_code: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            p.should_retry(&task, &result),
+            "acks_on_failure=false should keep retrying past retry_max"
+        );
         // Even at attempts=1000, should still retry.
         task.attempts = 1000;
-        assert!(p.should_retry(&task, &result),
-            "acks_on_failure=false should keep retrying indefinitely");
+        assert!(
+            p.should_retry(&task, &result),
+            "acks_on_failure=false should keep retrying indefinitely"
+        );
     }
 
     #[test]
     fn test_is_failure() {
         let mut task = Task::new(TaskType::Http, serde_json::json!({}));
-        let mut result = TaskResult::default();
-        result.status_code = Some(200);
+        let mut result = TaskResult {
+            status_code: Some(200),
+            ..Default::default()
+        };
         assert!(!is_failure(&task, &result));
 
         result.status_code = Some(500);
@@ -429,10 +491,18 @@ mod tests {
         assert_eq!(backoff_delay(&task), 32, "attempts=5 should give 32s delay");
         // attempts=6 → 1 * 2^6 = 64, capped at 60
         task.attempts = 6;
-        assert_eq!(backoff_delay(&task), 60, "attempts=6 should hit the 60s cap");
+        assert_eq!(
+            backoff_delay(&task),
+            60,
+            "attempts=6 should hit the 60s cap"
+        );
         // attempts=10 → 1 * 2^10 = 1024, capped at 60
         task.attempts = 10;
-        assert_eq!(backoff_delay(&task), 60, "attempts=10 should remain at 60s cap");
+        assert_eq!(
+            backoff_delay(&task),
+            60,
+            "attempts=10 should remain at 60s cap"
+        );
     }
 
     /// Exponential backoff (C8): when `retry_backoff=false` (default), the
@@ -444,8 +514,12 @@ mod tests {
         task.retry_backoff = false;
         for a in 0..5 {
             task.attempts = a;
-            assert_eq!(backoff_delay(&task), 5,
-                "attempts={} with backoff off should give fixed 5s delay", a);
+            assert_eq!(
+                backoff_delay(&task),
+                5,
+                "attempts={} with backoff off should give fixed 5s delay",
+                a
+            );
         }
     }
 
@@ -460,6 +534,10 @@ mod tests {
         assert_eq!(backoff_delay(&task), 64);
         // attempts=6 → 2 * 2^6 = 128, capped at 120
         task.attempts = 6;
-        assert_eq!(backoff_delay(&task), 120, "attempts=6 with retry_delay=2 should cap at 120");
+        assert_eq!(
+            backoff_delay(&task),
+            120,
+            "attempts=6 with retry_delay=2 should cap at 120"
+        );
     }
 }

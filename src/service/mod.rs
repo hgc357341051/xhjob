@@ -69,19 +69,33 @@ impl std::fmt::Display for ServiceName {
 /// illegal characters, or over-length names yield `XhjobError::Config`.
 pub fn validate(name: &str) -> Result<String> {
     if name.is_empty() || name.len() > 32 {
-        return Err(XhjobError::config(format!("invalid service name: {}", name)));
+        return Err(XhjobError::config(format!(
+            "invalid service name: {}",
+            name
+        )));
     }
     let mut chars = name.chars();
     let first = match chars.next() {
         Some(c) => c,
-        None => return Err(XhjobError::config(format!("invalid service name: {}", name))),
+        None => {
+            return Err(XhjobError::config(format!(
+                "invalid service name: {}",
+                name
+            )))
+        }
     };
     if !first.is_ascii_alphabetic() {
-        return Err(XhjobError::config(format!("invalid service name: {}", name)));
+        return Err(XhjobError::config(format!(
+            "invalid service name: {}",
+            name
+        )));
     }
     for c in chars {
         if !c.is_ascii_alphanumeric() && c != '_' && c != '-' {
-            return Err(XhjobError::config(format!("invalid service name: {}", name)));
+            return Err(XhjobError::config(format!(
+                "invalid service name: {}",
+                name
+            )));
         }
     }
     Ok(name.to_string())

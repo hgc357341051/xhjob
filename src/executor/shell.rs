@@ -3,30 +3,56 @@
 //! Unix: runs `bash -c "<cmd>"` via tokio::process::Command.
 //! Windows: runs `cmd /C "<cmd>"` via tokio::process::Command.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use crate::errors::{Result, XhjobError};
-use crate::store::{Task, TaskResult, ShellPayload};
 use super::Executor;
+use crate::errors::{Result, XhjobError};
+use crate::store::{ShellPayload, Task, TaskResult, TaskStore};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ShellExecutor;
 
 impl ShellExecutor {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for ShellExecutor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Executor for ShellExecutor {
-    fn execute<'a>(&'a self, task: &'a Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+    fn execute<'a>(
+        &'a self,
+        task: &'a Task,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         // 委托给 execute_with_cancel，不传 cancel 标志（向后兼容）。
         self.execute_with_cancel(task, None)
     }
 
-    fn execute_with_cancel<'a>(&'a self, task: &'a Task, cancel_flag: Option<Arc<AtomicBool>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+    // Change N: override execute_with_cancel to delegate to execute_with_lease
+    // with store=None. This preserves backward compat for callers that still
+    // invoke execute_with_cancel directly (e.g. existing tests), and also
+    // keeps `execute` -> `execute_with_cancel(None)` working without infinite
+    // recursion via the trait's default `execute_with_cancel` (which would
+    // otherwise just call `execute` again).
+    fn execute_with_cancel<'a>(
+        &'a self,
+        task: &'a Task,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
+        self.execute_with_lease(task, cancel_flag, None)
+    }
+
+    fn execute_with_lease<'a>(
+        &'a self,
+        task: &'a Task,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        store: Option<Arc<dyn TaskStore>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult>> + Send + 'a>> {
         let payload_val = task.payload.clone();
         let timeout = task.timeout;
         let encoding = task.encoding.clone();
@@ -47,11 +73,39 @@ impl Executor for ShellExecutor {
             };
 
             // Spawn the child process
-            let mut child = cmd.stdout(std::process::Stdio::piped())
+            let mut child = cmd
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .stdin(stdin_cfg)
                 .spawn()
                 .map_err(|e| XhjobError::exec(format!("spawn: {}", e)))?;
+            // execution_lease (Task 2): capture the child PID right after
+            // spawn so we can surface it in TaskResult. The queue persists it
+            // via update_worker_pid; on daemon crash recovery,
+            // reset_running_to_pending checks whether this PID is still alive
+            // and skips re-dispatch if so (preventing duplicate execution by
+            // the new daemon while the orphan child is still running).
+            let child_pid = child.id();
+
+            // execution_lease: write worker_pid + worker_starttime to the store
+            // immediately after spawn (NOT after task completion) so daemon
+            // crash recovery can detect an orphan child still running the task.
+            // Uses tokio::spawn (fire-and-forget) so the lease write does not
+            // block task execution; the write completes before any crash could
+            // matter because spawn happens before wait.
+            if let (Some(pid), Some(store)) = (child_pid, &store) {
+                let store = Arc::clone(store);
+                let task_id = task.id.clone();
+                let starttime = crate::daemon::process_starttime(pid);
+                tokio::spawn(async move {
+                    if let Err(e) = store
+                        .update_worker_pid(&task_id, Some(pid), starttime)
+                        .await
+                    {
+                        tracing::warn!(task_id = %task_id, error = %e, "update_worker_pid at spawn failed");
+                    }
+                });
+            }
 
             // Feed stdin to the child in its own task so it does not block
             // the stdout/stderr drain tasks or the wait future. Best-effort:
@@ -100,7 +154,9 @@ impl Executor for ShellExecutor {
                                 let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
                             }
                             // Phase 2: wait grace period for graceful exit after SIGTERM.
-                            match tokio::time::timeout(Duration::from_secs(grace), child.wait()).await {
+                            match tokio::time::timeout(Duration::from_secs(grace), child.wait())
+                                .await
+                            {
                                 Ok(s) => s.map_err(|e| XhjobError::exec(format!("wait: {}", e))),
                                 Err(_) => {
                                     // SIGKILL after grace period — reap the child
@@ -171,44 +227,45 @@ impl Executor for ShellExecutor {
             // 与 cancel 检查循环并发：当提供 cancel_flag 时，每 200ms 检查一次；
             // 检测到取消则终止子进程并返回 cancelled 错误。
             // Reference: Celery revoke (terminate=true).
-            let status_result: std::result::Result<std::process::ExitStatus, XhjobError> = if let Some(flag) = cancel_flag.as_ref() {
-                let flag = Arc::clone(flag);
-                let cancel_watcher = async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        if flag.load(Ordering::SeqCst) {
-                            return;
-                        }
-                    }
-                };
-                tokio::select! {
-                    r = wait_fut => r,
-                    _ = cancel_watcher => {
-                        // cancel 触发：发送 SIGTERM，给 500ms grace 等待优雅退出；
-                        // 超时则 SIGKILL 并 reap，避免僵尸进程。
-                        // P1: signal the whole process group (negative pid) so
-                        // grandchildren are also terminated.
-                        #[cfg(unix)]
-                        if let Some(pid) = child.id() {
-                            use nix::sys::signal::{kill, Signal};
-                            use nix::unistd::Pid;
-                            let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
-                        }
-                        #[cfg(not(unix))]
-                        { let _ = child.start_kill(); }
-                        match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
-                            Ok(_) => {}
-                            Err(_) => {
-                                let _ = child.start_kill();
-                                let _ = child.wait().await;
+            let status_result: std::result::Result<std::process::ExitStatus, XhjobError> =
+                if let Some(flag) = cancel_flag.as_ref() {
+                    let flag = Arc::clone(flag);
+                    let cancel_watcher = async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if flag.load(Ordering::SeqCst) {
+                                return;
                             }
                         }
-                        Err(XhjobError::exec("cancelled".to_string()))
+                    };
+                    tokio::select! {
+                        r = wait_fut => r,
+                        _ = cancel_watcher => {
+                            // cancel 触发：发送 SIGTERM，给 500ms grace 等待优雅退出；
+                            // 超时则 SIGKILL 并 reap，避免僵尸进程。
+                            // P1: signal the whole process group (negative pid) so
+                            // grandchildren are also terminated.
+                            #[cfg(unix)]
+                            if let Some(pid) = child.id() {
+                                use nix::sys::signal::{kill, Signal};
+                                use nix::unistd::Pid;
+                                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+                            }
+                            #[cfg(not(unix))]
+                            { let _ = child.start_kill(); }
+                            match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+                                Ok(_) => {}
+                                Err(_) => {
+                                    let _ = child.start_kill();
+                                    let _ = child.wait().await;
+                                }
+                            }
+                            Err(XhjobError::exec("cancelled".to_string()))
+                        }
                     }
-                }
-            } else {
-                wait_fut.await
-            };
+                } else {
+                    wait_fut.await
+                };
 
             // Collect whatever the read tasks captured (they may still be
             // running if the child was killed before EOF; await them with a
@@ -222,20 +279,16 @@ impl Executor for ShellExecutor {
             // already exited successfully — we just take whatever partial
             // output was captured. On the error path (status_result is Err)
             // we already tolerate partial output below.
-            let stdout_buf = match tokio::time::timeout(
-                Duration::from_millis(500),
-                stdout_task,
-            ).await {
-                Ok(Ok(Some(buf))) => buf,
-                _ => Vec::new(), // timeout, join error, or None: no captured output
-            };
-            let stderr_buf = match tokio::time::timeout(
-                Duration::from_millis(500),
-                stderr_task,
-            ).await {
-                Ok(Ok(Some(buf))) => buf,
-                _ => Vec::new(),
-            };
+            let stdout_buf =
+                match tokio::time::timeout(Duration::from_millis(500), stdout_task).await {
+                    Ok(Ok(Some(buf))) => buf,
+                    _ => Vec::new(), // timeout, join error, or None: no captured output
+                };
+            let stderr_buf =
+                match tokio::time::timeout(Duration::from_millis(500), stderr_task).await {
+                    Ok(Ok(Some(buf))) => buf,
+                    _ => Vec::new(),
+                };
             if status_result.is_ok() {
                 // Log when we dropped output due to drain timeout on a
                 // successful task, so operators can diagnose missing stdout.
@@ -292,6 +345,7 @@ impl Executor for ShellExecutor {
                 stdout: Some(stdout_text),
                 stderr: Some(stderr_text),
                 exit_code: Some(exit_code),
+                worker_pid: child_pid,
             })
         })
     }
@@ -456,7 +510,9 @@ fn build_command(payload: &ShellPayload) -> tokio::process::Command {
 pub fn configured_timeout() -> u64 {
     if let Ok(s) = std::env::var("XHJOB_SHELL_TIMEOUT") {
         if let Ok(n) = s.parse::<u64>() {
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
     }
     300
@@ -514,7 +570,11 @@ mod tests {
         let result = decode_bytes(&[0x41u8], "INVALID");
         assert!(result.is_err(), "expected Err for unsupported encoding");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("unsupported encoding"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("unsupported encoding"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     /// softTimeout (C11) SubTask 41.9 — SIGTERM graceful exit:
@@ -536,11 +596,21 @@ mod tests {
         task.timeout = 5;
         task.soft_timeout = Some(2);
 
-        let result = ShellExecutor.execute(&task).await
+        let result = ShellExecutor
+            .execute(&task)
+            .await
             .expect("execute should succeed (graceful SIGTERM exit)");
-        assert_eq!(result.exit_code, Some(0), "exit_code should be 0 (graceful exit via trap)");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "exit_code should be 0 (graceful exit via trap)"
+        );
         let stdout = result.stdout.as_deref().unwrap_or("");
-        assert!(stdout.contains("CAUGHT"), "stdout should contain CAUGHT: {}", stdout);
+        assert!(
+            stdout.contains("CAUGHT"),
+            "stdout should contain CAUGHT: {}",
+            stdout
+        );
     }
 
     /// softTimeout (C11) SubTask 41.10 — SIGKILL after grace period:
@@ -564,7 +634,11 @@ mod tests {
         let result = ShellExecutor.execute(&task).await;
         assert!(result.is_err(), "expected Err (SIGKILL after grace period)");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SIGKILL"), "error message should mention SIGKILL: {}", msg);
+        assert!(
+            msg.contains("SIGKILL"),
+            "error message should mention SIGKILL: {}",
+            msg
+        );
     }
 
     /// cancel 修复验证：对一个长时间运行的 shell 任务设置 cancel_flag 后，
@@ -577,11 +651,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_cancel_flag_terminates_running_child() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        use std::time::{Duration, Instant};
         use crate::executor::Executor;
         use crate::store::{Task, TaskType};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
 
         // sleep 30 — 如果 cancel 不生效，测试会因 timeout=10s 而失败（耗时 10s）；
         // 如果 cancel 生效，应在 ~1s 内返回。
@@ -598,18 +672,27 @@ mod tests {
         });
 
         let start = Instant::now();
-        let result = ShellExecutor.execute_with_cancel(&task, Some(cancel_flag)).await;
+        let result = ShellExecutor
+            .execute_with_cancel(&task, Some(cancel_flag))
+            .await;
         let elapsed = start.elapsed();
 
         // 应返回 Err 且错误信息包含 "cancelled"
         assert!(result.is_err(), "expected Err after cancel");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("cancelled"), "error should mention cancelled: {}", msg);
+        assert!(
+            msg.contains("cancelled"),
+            "error should mention cancelled: {}",
+            msg
+        );
 
         // 应在远小于 30s 内返回（cancel 轮询间隔 200ms + 500ms 延迟 + grace 500ms）。
         // 上限给 5s 足够宽松，只要远小于 timeout=10s 即说明 cancel 生效。
-        assert!(elapsed.as_secs() < 5,
-            "cancel should terminate child quickly, took {:?}s", elapsed);
+        assert!(
+            elapsed.as_secs() < 5,
+            "cancel should terminate child quickly, took {:?}s",
+            elapsed
+        );
     }
 
     /// 验证不提供 cancel_flag 时，execute_with_cancel 行为与 execute 一致
@@ -623,10 +706,53 @@ mod tests {
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hello"}));
         task.timeout = 5;
 
-        let result = ShellExecutor.execute_with_cancel(&task, None).await
+        let result = ShellExecutor
+            .execute_with_cancel(&task, None)
+            .await
             .expect("execute_with_cancel(None) should succeed");
         assert_eq!(result.exit_code, Some(0));
-        assert!(result.stdout.as_deref().unwrap_or("").contains("hello"),
-            "stdout should contain hello: {:?}", result.stdout);
+        assert!(
+            result.stdout.as_deref().unwrap_or("").contains("hello"),
+            "stdout should contain hello: {:?}",
+            result.stdout
+        );
+    }
+
+    /// 纯 hard timeout 路径（无 soft_timeout）单测。
+    /// 构建 `sleep 30` + timeout=2 + soft_timeout=None，验证 executor 走
+    /// 无 soft_timeout 分支（L118-128）：等待 2s 后 SIGKILL 子进程并 reap，
+    /// 返回 Err 含 "timeout after 2s"。
+    /// 现有 soft_timeout 测试只间接覆盖该分支，这里直接锁定。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hard_timeout_sigkill() {
+        use crate::executor::Executor;
+        use crate::store::{Task, TaskType};
+        use std::time::Instant;
+
+        // sleep 30 — 若 hard timeout 未触发，测试会挂住 30s；
+        // timeout=2 意味着 executor 应在 2s 时 SIGKILL 子进程并返回 Err。
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "sleep 30"}));
+        task.timeout = 2;
+        task.soft_timeout = None;
+
+        let start = Instant::now();
+        let result = ShellExecutor.execute(&task).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected Err on hard timeout");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("timeout after 2s"),
+            "error should mention 'timeout after 2s': {}",
+            msg
+        );
+
+        // hard timeout 应在 ~2s 触发，5s 上限足够宽松（兼容 CI 抖动）。
+        assert!(
+            elapsed.as_secs() < 5,
+            "hard timeout should fire at ~2s, took {:?}",
+            elapsed
+        );
     }
 }

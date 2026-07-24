@@ -1,9 +1,12 @@
 //! Default in-memory task store.
 
+use super::{
+    ChainRecord, ChordRecord, GroupRecord, Task, TaskEvent, TaskResult, TaskState, TaskStore,
+    TaskSummary, WorkerStats,
+};
+use crate::errors::{Result, XhjobError};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
-use crate::errors::{Result, XhjobError};
-use super::{Task, TaskResult, TaskState, TaskStore, TaskSummary, TaskEvent, ChainRecord, GroupRecord, ChordRecord, WorkerStats};
 
 pub struct InMemoryStore {
     tasks: RwLock<HashMap<String, Task>>,
@@ -28,11 +31,16 @@ impl InMemoryStore {
 }
 
 impl Default for InMemoryStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskStore for InMemoryStore {
-    fn insert_task(&self, task: Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn insert_task(
+        &self,
+        task: Task,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
             guard.insert(task.id.clone(), task);
@@ -40,20 +48,53 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn update_state(&self, id: &str, state: TaskState, started_at: Option<u64>, finished_at: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        started_at: Option<u64>,
+        finished_at: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
             if let Some(t) = guard.get_mut(&id) {
                 t.state = state;
-                if let Some(s) = started_at { t.started_at = Some(s); }
-                if let Some(f) = finished_at { t.finished_at = Some(f); }
+                if let Some(s) = started_at {
+                    t.started_at = Some(s);
+                }
+                if let Some(f) = finished_at {
+                    t.finished_at = Some(f);
+                }
             }
             Ok(())
         })
     }
 
-    fn save_result(&self, task_id: &str, result: TaskResult) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_worker_pid(
+        &self,
+        id: &str,
+        worker_pid: Option<u32>,
+        starttime: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let mut guard = self.tasks.write().await;
+            if let Some(t) = guard.get_mut(&id) {
+                t.worker_pid = worker_pid;
+                if starttime.is_some() {
+                    t.worker_starttime = starttime;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn save_result(
+        &self,
+        task_id: &str,
+        result: TaskResult,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let task_id = task_id.to_string();
         Box::pin(async move {
             let mut guard = self.results.write().await;
@@ -62,14 +103,24 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn load_active_tasks(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Task>>> + Send + '_>> {
+    fn load_active_tasks(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Task>>> + Send + '_>> {
         Box::pin(async move {
             let guard = self.tasks.read().await;
-            Ok(guard.values().filter(|t| !t.state.is_terminal()).cloned().collect())
+            Ok(guard
+                .values()
+                .filter(|t| !t.state.is_terminal())
+                .cloned()
+                .collect())
         })
     }
 
-    fn load_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Task>>> + Send + '_>> {
+    fn load_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Task>>> + Send + '_>>
+    {
         let id = id.to_string();
         Box::pin(async move {
             let guard = self.tasks.read().await;
@@ -77,7 +128,11 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn load_result(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<TaskResult>>> + Send + '_>> {
+    fn load_result(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<TaskResult>>> + Send + '_>>
+    {
         let id = id.to_string();
         Box::pin(async move {
             let guard = self.results.read().await;
@@ -85,18 +140,29 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn count_running_instances(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>> {
+    fn count_running_instances(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let guard = self.tasks.read().await;
             // In-memory: each task ID has only one task instance, but we treat
             // RUNNING state as "1 running instance".
-            let count = guard.get(&id).filter(|t| t.state.is_running()).map(|_| 1u32).unwrap_or(0);
+            let count = guard
+                .get(&id)
+                .filter(|t| t.state.is_running())
+                .map(|_| 1u32)
+                .unwrap_or(0);
             Ok(count)
         })
     }
 
-    fn update_next_fire(&self, id: &str, next_fire: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_next_fire(
+        &self,
+        id: &str,
+        next_fire: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
@@ -107,7 +173,12 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn set_attempts_and_error(&self, id: &str, attempts: u32, last_error: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn set_attempts_and_error(
+        &self,
+        id: &str,
+        attempts: u32,
+        last_error: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
@@ -119,7 +190,10 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn delete_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn delete_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
@@ -133,22 +207,30 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn increment_execution_count(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>> {
+    fn increment_execution_count(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
-            let task = guard.get_mut(&id)
+            let task = guard
+                .get_mut(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
             task.execution_count += 1;
             Ok(task.execution_count)
         })
     }
 
-    fn remove_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn remove_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
-            guard.remove(&id)
+            guard
+                .remove(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
             // Drop the tasks write guard before awaiting the results lock to
             // avoid holding two locks across an await boundary.
@@ -159,22 +241,31 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn set_paused(&self, id: &str, paused: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn set_paused(
+        &self,
+        id: &str,
+        paused: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
-            let task = guard.get_mut(&id)
+            let task = guard
+                .get_mut(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
             task.paused = paused;
             Ok(())
         })
     }
 
-    fn cancel_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn cancel_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
-            let task = guard.get_mut(&id)
+            let task = guard
+                .get_mut(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
             match task.state {
                 TaskState::Pending => {
@@ -183,7 +274,14 @@ impl TaskStore for InMemoryStore {
                     // H5 fix: record a Cancelled event so the audit log is
                     // complete for directly-cancelled pending tasks.
                     drop(guard);
-                    let _ = self.record_event(&id, super::EventType::Cancelled, None, crate::store::now_ts() as i64).await;
+                    let _ = self
+                        .record_event(
+                            &id,
+                            super::EventType::Cancelled,
+                            None,
+                            crate::store::now_ts() as i64,
+                        )
+                        .await;
                 }
                 TaskState::Running => {
                     task.cancel_requested = true;
@@ -199,7 +297,9 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn cleanup_expired_results(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    fn cleanup_expired_results(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
         Box::pin(async move {
             let now = crate::store::now_ts();
             // Snapshot the (result_ttl, finished_at) we need to consult, then
@@ -207,7 +307,8 @@ impl TaskStore for InMemoryStore {
             // to avoid holding two locks across an await boundary.
             let task_info: HashMap<String, (u64, Option<u64>)> = {
                 let tasks = self.tasks.read().await;
-                tasks.values()
+                tasks
+                    .values()
                     .map(|t| (t.id.clone(), (t.result_ttl, t.finished_at)))
                     .collect()
             };
@@ -234,16 +335,25 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>> {
+    fn list_tasks<'a>(
+        &'a self,
+        state_filter: Option<TaskState>,
+        tag_filter: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>>
+    {
         Box::pin(async move {
             let map = self.tasks.read().await;
             let mut result = Vec::new();
             for task in map.values() {
                 if let Some(filter) = state_filter {
-                    if task.state != filter { continue; }
+                    if task.state != filter {
+                        continue;
+                    }
                 }
                 if let Some(tag) = tag_filter {
-                    if !task.tags.iter().any(|t| t == tag) { continue; }
+                    if !task.tags.iter().any(|t| t == tag) {
+                        continue;
+                    }
                 }
                 result.push(TaskSummary::from(task));
             }
@@ -253,7 +363,10 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn requeue_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+    fn requeue_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
@@ -262,8 +375,10 @@ impl TaskStore for InMemoryStore {
                 None => return Ok(false),
             };
             // 仅终态 Cancelled / Failed / Expired / Success 任务可重新入队。
-            let requeueable = matches!(task.state,
-                TaskState::Cancelled | TaskState::Failed | TaskState::Expired | TaskState::Success);
+            let requeueable = matches!(
+                task.state,
+                TaskState::Cancelled | TaskState::Failed | TaskState::Expired | TaskState::Success
+            );
             if !requeueable {
                 return Ok(false);
             }
@@ -278,7 +393,11 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn reschedule_task(&self, id: &str, new_cron: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+    fn reschedule_task(
+        &self,
+        id: &str,
+        new_cron: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
         let id = id.to_string();
         let new_cron = new_cron.to_string();
         Box::pin(async move {
@@ -297,8 +416,11 @@ impl TaskStore for InMemoryStore {
             }
             // Validate the new cron by computing the next fire time.
             let now = crate::store::now_ts();
-            let new_next = crate::scheduler::cron::next_fire(&new_cron, now, task.timezone.as_deref())
-                .map_err(|e| XhjobError::CronParse(format!("invalid cron '{}': {}", new_cron, e)))?;
+            let new_next =
+                crate::scheduler::cron::next_fire(&new_cron, now, task.timezone.as_deref())
+                    .map_err(|e| {
+                        XhjobError::CronParse(format!("invalid cron '{}': {}", new_cron, e))
+                    })?;
             task.cron = Some(new_cron);
             task.next_fire = Some(new_next);
             // state / execution_count / attempts / meta preserved.
@@ -306,11 +428,18 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn reset_running_to_pending(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    fn reset_running_to_pending(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
             let now = crate::store::now_ts();
             let mut reset = 0u64;
+            // execution_lease (Task 2): collect ids of tasks whose worker_pid
+            // is still alive so we can record a LeaseHeld event AFTER
+            // releasing the tasks write lock (avoids holding the tasks +
+            // events locks across an await boundary).
+            let mut lease_held: Vec<String> = Vec::new();
             for task in guard.values_mut() {
                 if task.state == TaskState::Running || task.state == TaskState::Interrupted {
                     // P0 fix (C1): reset ALL running tasks on startup, not
@@ -327,6 +456,22 @@ impl TaskStore for InMemoryStore {
                     // daemon marks them Interrupted on shutdown so users can
                     // distinguish "interrupted by shutdown" from "crashed").
                     // On restart they should be re-enqueued.
+                    //
+                    // execution_lease (Task 2): if the orphan child is still
+                    // alive, do NOT re-queue — the new daemon would otherwise
+                    // duplicate the still-running task's side effects. Record
+                    // a LeaseHeld event and leave the task in its current
+                    // state so the orphan can finish naturally. Only when the
+                    // worker_pid is gone (or never set) do we reset.
+                    if let Some(pid) = task.worker_pid {
+                        if crate::daemon::is_process_alive_with_starttime(
+                            pid,
+                            task.worker_starttime,
+                        ) {
+                            lease_held.push(task.id.clone());
+                            continue;
+                        }
+                    }
                     task.state = TaskState::Pending;
                     task.next_fire = Some(now);
                     // Clear started_at / finished_at so the next execution
@@ -336,11 +481,24 @@ impl TaskStore for InMemoryStore {
                     reset += 1;
                 }
             }
+            drop(guard);
+            let now_i64 = now as i64;
+            for id in &lease_held {
+                if let Err(e) = self
+                    .record_event(id, super::EventType::LeaseHeld, None, now_i64)
+                    .await
+                {
+                    tracing::warn!(task_id = %id, error = %e, "record_event LeaseHeld failed");
+                }
+            }
             Ok(reset)
         })
     }
 
-    fn mark_running_as_interrupted(&self, reason: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    fn mark_running_as_interrupted(
+        &self,
+        reason: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
         let reason = reason.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
@@ -358,12 +516,10 @@ impl TaskStore for InMemoryStore {
             // Record an Interrupted event per task outside the tasks write
             // lock to avoid re-entrancy with the events lock.
             for id in &transitioned {
-                if let Err(e) = self.record_event(
-                    id,
-                    super::EventType::Interrupted,
-                    Some(&reason),
-                    now,
-                ).await {
+                if let Err(e) = self
+                    .record_event(id, super::EventType::Interrupted, Some(&reason), now)
+                    .await
+                {
                     tracing::warn!(task_id = %id, error = %e, "record_event Interrupted failed");
                 }
             }
@@ -373,21 +529,38 @@ impl TaskStore for InMemoryStore {
 
     // ----- Event log (A17) -----
 
-    fn record_event(&self, task_id: &str, event_type: super::EventType, payload: Option<&str>, ts: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn record_event(
+        &self,
+        task_id: &str,
+        event_type: super::EventType,
+        payload: Option<&str>,
+        ts: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let task_id = task_id.to_string();
         let payload = payload.map(|s| s.to_string());
         Box::pin(async move {
             let mut guard = self.events.write().await;
-            guard.push(TaskEvent { task_id, event_type, payload, ts });
+            guard.push(TaskEvent {
+                task_id,
+                event_type,
+                payload,
+                ts,
+            });
             Ok(())
         })
     }
 
-    fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>> {
+    fn list_events(
+        &self,
+        since_ts: i64,
+        task_id_filter: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>>
+    {
         let task_id_filter = task_id_filter.map(|s| s.to_string());
         Box::pin(async move {
             let guard = self.events.read().await;
-            let mut out: Vec<TaskEvent> = guard.iter()
+            let mut out: Vec<TaskEvent> = guard
+                .iter()
                 .filter(|e| e.ts >= since_ts)
                 .filter(|e| match &task_id_filter {
                     Some(id) => &e.task_id == id,
@@ -400,7 +573,10 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn cleanup_expired_events(&self, ttl_secs: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    fn cleanup_expired_events(
+        &self,
+        ttl_secs: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
         Box::pin(async move {
             let now = crate::store::now_ts() as i64;
             let cutoff = now.saturating_sub(ttl_secs as i64);
@@ -414,24 +590,36 @@ impl TaskStore for InMemoryStore {
 
     // ----- Task chain (C15) -----
 
-    fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn create_chain(
+        &self,
+        chain_id: &str,
+        tasks: &[serde_json::Value],
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let chain_id = chain_id.to_string();
         let tasks = tasks.to_vec();
         Box::pin(async move {
             let mut guard = self.chains.write().await;
-            guard.insert(chain_id.clone(), ChainRecord {
-                chain_id,
-                tasks,
-                current_step: 0,
-                state: "pending".to_string(),
-                created_at,
-                updated_at: created_at,
-            });
+            guard.insert(
+                chain_id.clone(),
+                ChainRecord {
+                    chain_id,
+                    tasks,
+                    current_step: 0,
+                    state: "pending".to_string(),
+                    created_at,
+                    updated_at: created_at,
+                },
+            );
             Ok(())
         })
     }
 
-    fn get_chain(&self, chain_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>> {
+    fn get_chain(
+        &self,
+        chain_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>>
+    {
         let chain_id = chain_id.to_string();
         Box::pin(async move {
             let guard = self.chains.read().await;
@@ -439,7 +627,13 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_chain_step(
+        &self,
+        chain_id: &str,
+        current_step: u32,
+        state: &str,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let chain_id = chain_id.to_string();
         let state = state.to_string();
         Box::pin(async move {
@@ -453,11 +647,16 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_chains_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>> {
+    fn list_chains_by_state(
+        &self,
+        state: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>>
+    {
         let state = state.to_string();
         Box::pin(async move {
             let guard = self.chains.read().await;
-            let mut out: Vec<ChainRecord> = guard.values()
+            let mut out: Vec<ChainRecord> = guard
+                .values()
                 .filter(|c| c.state == state)
                 .cloned()
                 .collect();
@@ -468,23 +667,35 @@ impl TaskStore for InMemoryStore {
 
     // ----- Task group (C16) -----
 
-    fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn create_group(
+        &self,
+        group_id: &str,
+        tasks: &[serde_json::Value],
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let group_id = group_id.to_string();
         let tasks = tasks.to_vec();
         Box::pin(async move {
             let mut guard = self.groups.write().await;
-            guard.insert(group_id.clone(), GroupRecord {
-                group_id,
-                tasks,
-                state: "pending".to_string(),
-                created_at,
-                updated_at: created_at,
-            });
+            guard.insert(
+                group_id.clone(),
+                GroupRecord {
+                    group_id,
+                    tasks,
+                    state: "pending".to_string(),
+                    created_at,
+                    updated_at: created_at,
+                },
+            );
             Ok(())
         })
     }
 
-    fn get_group(&self, group_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>> {
+    fn get_group(
+        &self,
+        group_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>>
+    {
         let group_id = group_id.to_string();
         Box::pin(async move {
             let guard = self.groups.read().await;
@@ -492,7 +703,12 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_group_state(
+        &self,
+        group_id: &str,
+        state: &str,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let group_id = group_id.to_string();
         let state = state.to_string();
         Box::pin(async move {
@@ -505,11 +721,16 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>> {
+    fn list_groups_by_state(
+        &self,
+        state: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>>
+    {
         let state = state.to_string();
         Box::pin(async move {
             let guard = self.groups.read().await;
-            let mut out: Vec<GroupRecord> = guard.values()
+            let mut out: Vec<GroupRecord> = guard
+                .values()
                 .filter(|g| g.state == state)
                 .cloned()
                 .collect();
@@ -520,26 +741,39 @@ impl TaskStore for InMemoryStore {
 
     // ----- Task chord (C16+) -----
 
-    fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn create_chord(
+        &self,
+        id: &str,
+        header_task_ids: &[String],
+        callback_json: &str,
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         let header_task_ids = header_task_ids.to_vec();
         let callback_json = callback_json.to_string();
         Box::pin(async move {
             let mut guard = self.chords.write().await;
-            guard.insert(id.clone(), ChordRecord {
-                id,
-                header_task_ids,
-                callback_json,
-                callback_task_id: None,
-                state: "pending".to_string(),
-                created_at,
-                updated_at: created_at,
-            });
+            guard.insert(
+                id.clone(),
+                ChordRecord {
+                    id,
+                    header_task_ids,
+                    callback_json,
+                    callback_task_id: None,
+                    state: "pending".to_string(),
+                    created_at,
+                    updated_at: created_at,
+                },
+            );
             Ok(())
         })
     }
 
-    fn get_chord(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>> {
+    fn get_chord(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>>
+    {
         let id = id.to_string();
         Box::pin(async move {
             let guard = self.chords.read().await;
@@ -547,7 +781,13 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_chord_state(
+        &self,
+        id: &str,
+        state: &str,
+        callback_task_id: Option<String>,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         let state = state.to_string();
         Box::pin(async move {
@@ -565,11 +805,17 @@ impl TaskStore for InMemoryStore {
 
     // ----- Progress / inspect (Task 1-5) -----
 
-    fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+    fn update_progress(
+        &self,
+        id: &str,
+        percent: u8,
+        meta: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut guard = self.tasks.write().await;
-            let task = guard.get_mut(&id)
+            let task = guard
+                .get_mut(&id)
                 .ok_or_else(|| XhjobError::TaskNotFound(id.clone()))?;
             task.progress = Some(percent);
             task.progress_meta = meta;
@@ -577,10 +823,14 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_active_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+    fn list_active_summary(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>
+    {
         Box::pin(async move {
             let guard = self.tasks.read().await;
-            let mut out: Vec<TaskSummary> = guard.values()
+            let mut out: Vec<TaskSummary> = guard
+                .values()
                 .filter(|t| t.state == TaskState::Running)
                 .map(TaskSummary::from)
                 .collect();
@@ -589,10 +839,14 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_registered_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+    fn list_registered_summary(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>
+    {
         Box::pin(async move {
             let guard = self.tasks.read().await;
-            let mut out: Vec<TaskSummary> = guard.values()
+            let mut out: Vec<TaskSummary> = guard
+                .values()
                 .filter(|t| t.cron.is_some() || t.interval.is_some())
                 .map(TaskSummary::from)
                 .collect();
@@ -601,10 +855,15 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn list_scheduled_summary(&self, now: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>> {
+    fn list_scheduled_summary(
+        &self,
+        now: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>
+    {
         Box::pin(async move {
             let guard = self.tasks.read().await;
-            let mut out: Vec<TaskSummary> = guard.values()
+            let mut out: Vec<TaskSummary> = guard
+                .values()
                 .filter(|t| t.next_fire.map(|nf| nf > now).unwrap_or(false))
                 .map(TaskSummary::from)
                 .collect();
@@ -613,7 +872,9 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>> {
+    fn worker_stats(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>> {
         Box::pin(async move {
             let guard = self.tasks.read().await;
             let mut stats = WorkerStats {
@@ -642,7 +903,11 @@ impl TaskStore for InMemoryStore {
         })
     }
 
-    fn modify_job(&self, id: &str, patch: &serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
+    fn modify_job(
+        &self,
+        id: &str,
+        patch: &serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>> {
         let id = id.to_string();
         let patch = patch.clone();
         Box::pin(async move {
@@ -665,7 +930,9 @@ impl TaskStore for InMemoryStore {
                         }
                         "or_cron" => {
                             task.or_cron = val.as_array().map(|arr| {
-                                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
                             });
                             trigger_changed = true;
                         }
@@ -681,31 +948,86 @@ impl TaskStore for InMemoryStore {
                             task.timezone = val.as_str().map(|s| s.to_string());
                             trigger_changed = true;
                         }
-                        "priority" => { if let Some(p) = val.as_i64() { task.priority = p as i32; } }
-                        "max_executions" => { if let Some(m) = val.as_u64() { task.max_executions = m as u32; } }
-                        "paused" => { if let Some(p) = val.as_bool() { task.paused = p; } }
-                        "timeout" => { if let Some(t) = val.as_u64() { task.timeout = t; } }
-                        "soft_timeout" => { task.soft_timeout = val.as_u64(); }
-                        "retry_max" => { if let Some(r) = val.as_u64() { task.retry_max = r as u32; } }
-                        "retry_delay" => { if let Some(r) = val.as_u64() { task.retry_delay = r; } }
-                        "retry_backoff" => { if let Some(b) = val.as_bool() { task.retry_backoff = b; } }
-                        "expires" => { if let Some(e) = val.as_u64() { task.expires = e; } }
-                        "jitter" => { if let Some(j) = val.as_u64() { task.jitter = j; } }
-                        "coalesce" => { if let Some(c) = val.as_bool() { task.coalesce = c; } }
-                        "misfire_grace_time" => { if let Some(m) = val.as_u64() { task.misfire_grace_time = m; } }
-                        "tags" => {
-                            if let Some(arr) = val.as_array() {
-                                task.tags = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                        "priority" => {
+                            if let Some(p) = val.as_i64() {
+                                task.priority = p as i32;
                             }
                         }
-                        "meta" => { task.meta = val.as_str().map(|s| s.to_string()); }
+                        "max_executions" => {
+                            if let Some(m) = val.as_u64() {
+                                task.max_executions = m as u32;
+                            }
+                        }
+                        "paused" => {
+                            if let Some(p) = val.as_bool() {
+                                task.paused = p;
+                            }
+                        }
+                        "timeout" => {
+                            if let Some(t) = val.as_u64() {
+                                task.timeout = t;
+                            }
+                        }
+                        "soft_timeout" => {
+                            task.soft_timeout = val.as_u64();
+                        }
+                        "retry_max" => {
+                            if let Some(r) = val.as_u64() {
+                                task.retry_max = r as u32;
+                            }
+                        }
+                        "retry_delay" => {
+                            if let Some(r) = val.as_u64() {
+                                task.retry_delay = r;
+                            }
+                        }
+                        "retry_backoff" => {
+                            if let Some(b) = val.as_bool() {
+                                task.retry_backoff = b;
+                            }
+                        }
+                        "expires" => {
+                            if let Some(e) = val.as_u64() {
+                                task.expires = e;
+                            }
+                        }
+                        "jitter" => {
+                            if let Some(j) = val.as_u64() {
+                                task.jitter = j;
+                            }
+                        }
+                        "coalesce" => {
+                            if let Some(c) = val.as_bool() {
+                                task.coalesce = c;
+                            }
+                        }
+                        "misfire_grace_time" => {
+                            if let Some(m) = val.as_u64() {
+                                task.misfire_grace_time = m;
+                            }
+                        }
+                        "tags" => {
+                            if let Some(arr) = val.as_array() {
+                                task.tags = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect();
+                            }
+                        }
+                        "meta" => {
+                            task.meta = val.as_str().map(|s| s.to_string());
+                        }
                         "skip_dates" => {
                             if let Some(arr) = val.as_array() {
                                 task.skip_dates = arr.iter().filter_map(|v| v.as_i64()).collect();
                             }
                             trigger_changed = true;
                         }
-                        "workdays_only" => { if let Some(w) = val.as_bool() { task.workdays_only = w; } }
+                        "workdays_only" => {
+                            if let Some(w) = val.as_bool() {
+                                task.workdays_only = w;
+                            }
+                        }
                         // Immutable fields (id, owner, state, attempts, created_at) are ignored.
                         _ => {}
                     }
@@ -713,16 +1035,32 @@ impl TaskStore for InMemoryStore {
             }
             // Recompute next_fire if a trigger field changed.
             if trigger_changed {
-                let cron_exprs: Vec<String> = task.cron.as_ref().cloned().into_iter()
-                    .chain(task.or_cron.clone().unwrap_or_default().into_iter().filter(|s| !s.is_empty()))
+                let cron_exprs: Vec<String> = task
+                    .cron
+                    .as_ref()
+                    .cloned()
+                    .into_iter()
+                    .chain(
+                        task.or_cron
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|s| !s.is_empty()),
+                    )
                     .collect();
                 if !cron_exprs.is_empty() {
                     let mut min_next: Option<u64> = None;
                     for expr in &cron_exprs {
-                        match crate::scheduler::cron::next_fire(expr, now, task.timezone.as_deref()) {
-                            Ok(t) => { min_next = Some(min_next.map_or(t, |m| m.min(t))); }
+                        match crate::scheduler::cron::next_fire(expr, now, task.timezone.as_deref())
+                        {
+                            Ok(t) => {
+                                min_next = Some(min_next.map_or(t, |m| m.min(t)));
+                            }
                             Err(e) => {
-                                return Err(XhjobError::CronParse(format!("invalid cron '{}': {}", expr, e)));
+                                return Err(XhjobError::CronParse(format!(
+                                    "invalid cron '{}': {}",
+                                    expr, e
+                                )));
                             }
                         }
                     }

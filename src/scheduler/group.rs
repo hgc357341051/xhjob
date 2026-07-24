@@ -18,8 +18,8 @@
 //! in the future.
 
 use crate::errors::Result;
-use crate::store::{GroupRecord, TaskState, TaskStore};
 use crate::store::now_ts;
+use crate::store::{GroupRecord, TaskState, TaskStore};
 
 /// Inspect the group record by id.
 pub async fn inspect(
@@ -47,7 +47,10 @@ pub async fn summarize(
     let mut failed = 0u32;
     let mut pending = 0u32;
     for task_json in &record.tasks {
-        let id = task_json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let id = task_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let Some(id) = id {
             total += 1;
             match store.load_task(&id).await {
@@ -81,7 +84,9 @@ pub async fn refresh_state(
     } else {
         "partial_failed"
     };
-    store.update_group_state(group_id, new_state, now_ts() as i64).await?;
+    store
+        .update_group_state(group_id, new_state, now_ts() as i64)
+        .await?;
     Ok(new_state)
 }
 
@@ -94,7 +99,10 @@ mod tests {
     #[tokio::test]
     async fn test_summarize_empty_group() {
         let store: std::sync::Arc<dyn TaskStore> = std::sync::Arc::new(InMemoryStore::new());
-        store.create_group("g-empty", &[], now_ts() as i64).await.unwrap();
+        store
+            .create_group("g-empty", &[], now_ts() as i64)
+            .await
+            .unwrap();
         let (total, ok, fail, pend) = summarize(&store, "g-empty").await.unwrap();
         assert_eq!((total, ok, fail, pend), (0, 0, 0, 0));
     }
@@ -111,7 +119,10 @@ mod tests {
         t2.state = TaskState::Success;
         store.insert_task(t2).await.unwrap();
         let tasks = vec![json!({"id":"t1"}), json!({"id":"t2"})];
-        store.create_group("g-ok", &tasks, now_ts() as i64).await.unwrap();
+        store
+            .create_group("g-ok", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
         let (total, ok, fail, pend) = summarize(&store, "g-ok").await.unwrap();
         assert_eq!((total, ok, fail, pend), (2, 2, 0, 0));
         let state = refresh_state(&store, "g-ok").await.unwrap();
@@ -130,7 +141,10 @@ mod tests {
         t2.state = TaskState::Failed;
         store.insert_task(t2).await.unwrap();
         let tasks = vec![json!({"id":"t1"}), json!({"id":"t2"})];
-        store.create_group("g-pf", &tasks, now_ts() as i64).await.unwrap();
+        store
+            .create_group("g-pf", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
         let state = refresh_state(&store, "g-pf").await.unwrap();
         assert_eq!(state, "partial_failed");
     }
@@ -143,7 +157,10 @@ mod tests {
         t1.state = TaskState::Failed;
         store.insert_task(t1).await.unwrap();
         let tasks = vec![json!({"id":"t1"})];
-        store.create_group("g-af", &tasks, now_ts() as i64).await.unwrap();
+        store
+            .create_group("g-af", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
         let state = refresh_state(&store, "g-af").await.unwrap();
         assert_eq!(state, "failed");
     }

@@ -6,11 +6,11 @@
 //! Instead, we spawn a fresh PHP process with `XHJOB_DAEMON_MODE=1`; the
 //! extension startup detects this and invokes `daemon_main()` directly.
 
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::path::PathBuf;
+use super::{remove_pid_file, write_pid};
 use crate::errors::{Result, XhjobError};
-use super::{write_pid, remove_pid_file};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Spawn the daemon by re-executing the PHP binary in a double-forked,
 /// detached grandchild. The grandchild re-runs PHP with `-r` invoking
@@ -36,7 +36,12 @@ pub fn spawn_via_double_fork(
         .or_else(|_| std::env::current_exe())
         .map_err(XhjobError::Io)?;
 
-    tracing::info!(?exe, service_name, data_dir, "spawn_via_double_fork invoking");
+    tracing::info!(
+        ?exe,
+        service_name,
+        data_dir,
+        "spawn_via_double_fork invoking"
+    );
 
     // Encode the service name and data_dir directly into the `-r` code string
     // so they are delivered as command-line arguments. Command-line args are
@@ -81,15 +86,19 @@ pub fn spawn_via_double_fork(
     let log_dir = data_dir
         .filter(|d| !d.is_empty())
         .map(|d| d.to_string())
-        .or_else(|| std::env::var("XHJOB_DATA_DIR").ok().filter(|d| !d.is_empty()))
+        .or_else(|| {
+            std::env::var("XHJOB_DATA_DIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+        })
         .unwrap_or_else(|| {
             // Same fallback as ipc::fallback_sock_dir
-            std::env::var("XHJOB_SOCK_DIR").ok()
+            std::env::var("XHJOB_SOCK_DIR")
+                .ok()
                 .filter(|d| !d.is_empty())
                 .unwrap_or_else(|| "/tmp".to_string())
         });
-    let log_path = std::path::PathBuf::from(&log_dir)
-        .join(format!("xhjob.{}.log", service_name));
+    let log_path = std::path::PathBuf::from(&log_dir).join(format!("xhjob.{}.log", service_name));
     // Try to open the log file for appending. If it fails (e.g. dir doesn't
     // exist yet), fall back to /dev/null to avoid blocking daemon startup.
     let log_stdio = std::fs::OpenOptions::new()
@@ -132,12 +141,23 @@ unsafe fn libc_setsid() -> i32 {
 
 /// Called by daemon_main on startup (already in daemon process).
 /// Reads the service name from `service::current()` and data_dir from
-/// `service::current_data_dir()`, then writes the PID file for that service
-/// in the resolved directory.
+/// `service::current_data_dir()`, then writes the PID file (with current
+/// process starttime, so future readers can detect PID reuse) for that
+/// service in the resolved directory.
 pub fn daemon_started() -> Result<()> {
     let service_name = crate::service::current();
     let data_dir = crate::service::current_data_dir();
-    write_pid(std::process::id(), &service_name, data_dir.as_deref())
+    // Capture our own starttime so a future reader can detect that this
+    // specific daemon instance is the PID-file owner (vs. an unrelated process
+    // that later recycled the same PID). Returns None on non-Linux, in which
+    // case write_pid emits the legacy single-line format.
+    let starttime = super::process_starttime(std::process::id());
+    write_pid(
+        std::process::id(),
+        starttime,
+        &service_name,
+        data_dir.as_deref(),
+    )
 }
 
 /// Called by daemon_main on exit: cleanup.

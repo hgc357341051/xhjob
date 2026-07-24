@@ -14,8 +14,8 @@
 //! （与 TaskState::as_str() 一致，统一为小写）。
 
 use crate::errors::{Result, XhjobError};
-use crate::store::{ChainRecord, TaskStore};
 use crate::store::now_ts;
+use crate::store::{ChainRecord, TaskStore};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
 
@@ -24,7 +24,8 @@ use tokio::sync::Mutex;
 /// current_step=N, both return tasks[N], and both increment current_step
 /// to N+2 — skipping a step and duplicating a step. The mutex serializes
 /// advance per chain_id so only one caller reads + increments current_step.
-static CHAIN_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+static CHAIN_LOCKS: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::OnceLock::new();
 
 fn chain_locks() -> &'static Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>> {
     CHAIN_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -53,7 +54,9 @@ pub async fn advance(
     let _guard = lock.lock().await;
 
     let now = now_ts() as i64;
-    let mut record = store.get_chain(chain_id).await?
+    let mut record = store
+        .get_chain(chain_id)
+        .await?
         .ok_or_else(|| XhjobError::store(format!("chain not found: {}", chain_id)))?;
     if record.state == "success" || record.state == "failed" {
         return Ok(None);
@@ -61,25 +64,28 @@ pub async fn advance(
     let next_step = record.current_step;
     if (next_step as usize) >= record.tasks.len() {
         // All steps done: mark as success.
-        store.update_chain_step(chain_id, next_step, "success", now).await?;
+        store
+            .update_chain_step(chain_id, next_step, "success", now)
+            .await?;
         return Ok(None);
     }
     // Mark as running (first time) and pick the next task config.
     if record.state == "pending" {
-        store.update_chain_step(chain_id, next_step, "running", now).await?;
+        store
+            .update_chain_step(chain_id, next_step, "running", now)
+            .await?;
         record.state = "running".to_string();
     }
     let next_task = record.tasks[next_step as usize].clone();
     // Advance current_step for the next call.
-    store.update_chain_step(chain_id, next_step + 1, &record.state, now).await?;
+    store
+        .update_chain_step(chain_id, next_step + 1, &record.state, now)
+        .await?;
     Ok(Some(next_task))
 }
 
 /// Mark the chain as failed (called when a step's task fails).
-pub async fn mark_failed(
-    store: &std::sync::Arc<dyn TaskStore>,
-    chain_id: &str,
-) -> Result<()> {
+pub async fn mark_failed(store: &std::sync::Arc<dyn TaskStore>, chain_id: &str) -> Result<()> {
     let now = now_ts() as i64;
     store.update_chain_step(chain_id, 0, "failed", now).await?;
     Ok(())
@@ -102,8 +108,15 @@ mod tests {
     #[tokio::test]
     async fn test_advance_returns_steps_in_order() {
         let store: std::sync::Arc<dyn TaskStore> = std::sync::Arc::new(InMemoryStore::new());
-        let tasks = vec![json!({"cmd":"step1"}), json!({"cmd":"step2"}), json!({"cmd":"step3"})];
-        store.create_chain("c1", &tasks, now_ts() as i64).await.unwrap();
+        let tasks = vec![
+            json!({"cmd":"step1"}),
+            json!({"cmd":"step2"}),
+            json!({"cmd":"step3"}),
+        ];
+        store
+            .create_chain("c1", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
         // First advance returns step 0.
         let s0 = advance(&store, "c1").await.unwrap().expect("step0");
         assert_eq!(s0, json!({"cmd":"step1"}));
@@ -125,7 +138,10 @@ mod tests {
     async fn test_mark_failed_sets_failed_state() {
         let store: std::sync::Arc<dyn TaskStore> = std::sync::Arc::new(InMemoryStore::new());
         let tasks = vec![json!({"cmd":"s1"}), json!({"cmd":"s2"})];
-        store.create_chain("c-fail", &tasks, now_ts() as i64).await.unwrap();
+        store
+            .create_chain("c-fail", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
         mark_failed(&store, "c-fail").await.unwrap();
         let record = store.get_chain("c-fail").await.unwrap().unwrap();
         assert_eq!(record.state, "failed");

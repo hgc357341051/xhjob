@@ -1,5 +1,5 @@
 //! Minimal configuration file support (P0-13).
-//! 
+//!
 //! Reads a simple KEY=VALUE config file (like .env) from the path
 //! specified by XHJOB_CONFIG_FILE env var (default: /etc/xhjob/config).
 //! Values are loaded into the process environment so existing
@@ -19,8 +19,8 @@ use std::collections::HashMap;
 /// Called once at daemon startup (before any env::var reads).
 /// If the config file doesn't exist, this is a no-op (backward compatible).
 pub fn load_config_file() {
-    let path = std::env::var("XHJOB_CONFIG_FILE")
-        .unwrap_or_else(|_| "/etc/xhjob/config".to_string());
+    let path =
+        std::env::var("XHJOB_CONFIG_FILE").unwrap_or_else(|_| "/etc/xhjob/config".to_string());
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return, // file doesn't exist — backward compatible

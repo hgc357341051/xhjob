@@ -1,16 +1,16 @@
 //! Task store abstraction: in-memory (default) and SQLite (optional `persist` feature).
 
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 use crate::errors::{Result, XhjobError};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "persist")]
+pub mod crypto;
 pub mod in_memory;
 #[cfg(feature = "persist")]
 pub mod sqlite;
-#[cfg(feature = "persist")]
-pub mod crypto;
 
 pub use in_memory::InMemoryStore;
 #[cfg(feature = "persist")]
@@ -36,7 +36,10 @@ impl TaskType {
         match s {
             "http" => Ok(TaskType::Http),
             "shell" => Ok(TaskType::Shell),
-            other => Err(XhjobError::InvalidTask(format!("unknown task type: {}", other))),
+            other => Err(XhjobError::InvalidTask(format!(
+                "unknown task type: {}",
+                other
+            ))),
         }
     }
 }
@@ -91,7 +94,10 @@ impl TaskState {
         }
     }
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskState::Success | TaskState::Failed | TaskState::Cancelled | TaskState::Expired)
+        matches!(
+            self,
+            TaskState::Success | TaskState::Failed | TaskState::Cancelled | TaskState::Expired
+        )
     }
     pub fn is_running(&self) -> bool {
         matches!(self, TaskState::Running)
@@ -149,7 +155,7 @@ pub struct Task {
     pub workdays_only: bool,
     pub retry_max: u32,
     pub retry_delay: u64, // seconds
-    pub timeout: u64, // seconds
+    pub timeout: u64,     // seconds
     pub priority: i32,
     pub allow_overlap: bool,
     pub max_instances: u32,
@@ -330,9 +336,26 @@ pub struct Task {
     /// all workers can access). When set, only the same owner can query/modify.
     #[serde(default)]
     pub owner: String,
+    /// execution_lease (Task 2): PID of the child process executing this
+    /// task, written by the queue at dispatch time. On daemon crash recovery,
+    /// `reset_running_to_pending` checks whether this PID is still alive; if
+    /// so, the task is NOT re-queued (an `EventType::LeaseHeld` event is
+    /// recorded) so the new daemon does not duplicate the still-running
+    /// orphan's side effects. None = not yet dispatched / not a shell task.
+    #[serde(default)]
+    pub worker_pid: Option<u32>,
+    /// execution_lease: Process starttime (field 22 of /proc/<pid>/stat)
+    /// captured at spawn time. Paired with worker_pid for PID-reuse
+    /// protection: on crash recovery, reset_running_to_pending passes this
+    /// to is_process_alive_with_starttime so a recycled PID (different
+    /// starttime) is treated as a dead orphan, not a live lease.
+    #[serde(default)]
+    pub worker_starttime: Option<u64>,
 }
 
-fn default_acks_on_failure_true() -> bool { true }
+fn default_acks_on_failure_true() -> bool {
+    true
+}
 
 impl Task {
     pub fn new(task_type: TaskType, payload: serde_json::Value) -> Self {
@@ -390,6 +413,8 @@ impl Task {
             progress_meta: None,
             chord_id: None,
             owner: String::new(),
+            worker_pid: None,
+            worker_starttime: None,
         }
     }
 }
@@ -408,6 +433,13 @@ pub struct TaskResult {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub exit_code: Option<i32>,
+    /// execution_lease (Task 2): PID of the child process that executed the
+    /// task. Set by the Shell executor after spawning the child; None for
+    /// HTTP tasks (no child process). The queue persists this into the
+    /// Task record via `update_worker_pid` so crash recovery can detect an
+    /// still-alive orphan and skip re-dispatch.
+    #[serde(default)]
+    pub worker_pid: Option<u32>,
 }
 
 /// Summary of a task for listing queries (lighter than full Task).
@@ -518,6 +550,17 @@ pub enum EventType {
     /// `reset_running_to_pending`, but the event log keeps the distinction
     /// for observability.
     Interrupted,
+    /// Watchdog detected task fake death (Task 1): a Running task exceeded
+    /// `timeout * factor` without completing, so the watchdog cancelled it
+    /// and marked it Interrupted. Covers the blind spot where a child
+    /// process hangs on IO (fifo / NFS / DNS) and never trips the tokio
+    /// hard-timeout future.
+    HungDetected,
+    /// execution_lease (Task 2): on daemon crash recovery, a Running task's
+    /// `worker_pid` was still alive, so `reset_running_to_pending` skipped
+    /// re-queueing it to avoid duplicate execution by the new daemon while
+    /// the orphan child is still running.
+    LeaseHeld,
 }
 
 impl EventType {
@@ -534,6 +577,8 @@ impl EventType {
             EventType::MaxInstancesReached => "max_instances_reached",
             EventType::RateLimited => "rate_limited",
             EventType::Interrupted => "interrupted",
+            EventType::HungDetected => "hung_detected",
+            EventType::LeaseHeld => "lease_held",
         }
     }
     #[allow(clippy::should_implement_trait)]
@@ -550,6 +595,8 @@ impl EventType {
             "max_instances_reached" => Ok(EventType::MaxInstancesReached),
             "rate_limited" => Ok(EventType::RateLimited),
             "interrupted" => Ok(EventType::Interrupted),
+            "hung_detected" => Ok(EventType::HungDetected),
+            "lease_held" => Ok(EventType::LeaseHeld),
             other => Err(XhjobError::store(format!("unknown event type: {}", other))),
         }
     }
@@ -616,44 +663,113 @@ pub struct ChordRecord {
 /// to avoid adding the `async-trait` crate dependency. Each method returns a
 /// boxed future that borrows `&self` for its lifetime (`'_`).
 pub trait TaskStore: Send + Sync {
-    fn insert_task(&self, task: Task) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    fn update_state(&self, id: &str, state: TaskState, started_at: Option<u64>, finished_at: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    fn save_result(&self, task_id: &str, result: TaskResult) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    fn load_active_tasks(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Task>>> + Send + '_>>;
-    fn load_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Task>>> + Send + '_>>;
-    fn load_result(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<TaskResult>>> + Send + '_>>;
-    fn count_running_instances(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>>;
-    fn update_next_fire(&self, id: &str, next_fire: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    fn set_attempts_and_error(&self, id: &str, attempts: u32, last_error: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-    fn delete_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn insert_task(
+        &self,
+        task: Task,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn update_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        started_at: Option<u64>,
+        finished_at: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    /// execution_lease (Task 2): persist the child process PID executing a
+    /// task. Called by the queue at dispatch time (after the executor
+    /// returns a TaskResult carrying `worker_pid`). On daemon crash
+    /// recovery, `reset_running_to_pending` consults this field to decide
+    /// whether to skip re-queueing (orphan still alive) or reset normally.
+    fn update_worker_pid(
+        &self,
+        id: &str,
+        worker_pid: Option<u32>,
+        starttime: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn save_result(
+        &self,
+        task_id: &str,
+        result: TaskResult,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn load_active_tasks(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Task>>> + Send + '_>>;
+    fn load_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Task>>> + Send + '_>>;
+    fn load_result(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<TaskResult>>> + Send + '_>>;
+    fn count_running_instances(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>>;
+    fn update_next_fire(
+        &self,
+        id: &str,
+        next_fire: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn set_attempts_and_error(
+        &self,
+        id: &str,
+        attempts: u32,
+        last_error: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn delete_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
     /// Increment execution_count for a task. Returns the new value.
-    fn increment_execution_count(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>>;
+    fn increment_execution_count(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32>> + Send + '_>>;
     /// Remove a task definition from the store (does not affect running instances).
     /// Reference: APScheduler remove_job.
-    fn remove_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn remove_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
     /// Set paused flag for a task (true=pause, false=resume).
     /// Reference: APScheduler pause_job / resume_job.
-    fn set_paused(&self, id: &str, paused: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn set_paused(
+        &self,
+        id: &str,
+        paused: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
     /// Cancel a task.
     /// - If state=Pending: transition to Cancelled (terminal).
     /// - If state=Running: set cancel_requested=true (running instance finishes, no retry/cron re-trigger).
     ///   Reference: Celery revoke.
-    fn cancel_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn cancel_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
     /// Delete result rows where (now - finished_at) > result_ttl, but only for tasks
     /// whose result_ttl > 0. Returns the number of deleted rows.
     /// Reference: Celery result_expires auto-cleanup.
-    fn cleanup_expired_results(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+    fn cleanup_expired_results(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
     /// List all tasks in this store, optionally filtered by state and/or tag.
     /// When `tag_filter` is `Some(tag)`, only tasks whose `tags` array
     /// contains `tag` are returned. Reference: APScheduler get_jobs +
     /// tag-based filtering.
-    fn list_tasks<'a>(&'a self, state_filter: Option<TaskState>, tag_filter: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>>;
+    fn list_tasks<'a>(
+        &'a self,
+        state_filter: Option<TaskState>,
+        tag_filter: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + 'a>>;
     /// 将终态任务（Cancelled / Failed / Expired / Success）重新入队为 Pending，
     /// 以便再次触发执行。重置 `attempts=0` 并设置 `next_fire=now`，
     /// 使下一次扫描立即拾取该任务。返回 `true` 表示已重新入队，
     /// `false` 表示任务不处于可重新入队的终态（或不存在）。
     /// Reference: Celery requeue.
-    fn requeue_task(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
+    fn requeue_task(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
 
     /// Reschedule a cron task's cron expression online (A11). Updates the
     /// cron field and re-computes `next_fire` from now using the task's
@@ -669,7 +785,11 @@ pub trait TaskStore: Send + Sync {
     ///   expression (the error message contains "invalid cron").
     ///
     /// Reference: APScheduler reschedule_job.
-    fn reschedule_task(&self, id: &str, new_cron: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
+    fn reschedule_task(
+        &self,
+        id: &str,
+        new_cron: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
 
     /// Reset Running tasks with `acks_late=true` to Pending and set
     /// `next_fire=now` so they will be re-triggered immediately. Used for
@@ -684,7 +804,9 @@ pub trait TaskStore: Send + Sync {
     /// Returns the number of tasks reset.
     ///
     /// Reference: Celery acks_late.
-    fn reset_running_to_pending(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+    fn reset_running_to_pending(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
 
     /// Mark all Running tasks as Interrupted. Called by the daemon on
     /// graceful shutdown AFTER the drain deadline (so still-running tasks
@@ -698,48 +820,97 @@ pub trait TaskStore: Send + Sync {
     /// recorded with the drain reason in the payload.
     ///
     /// Returns the number of tasks transitioned.
-    fn mark_running_as_interrupted(&self, reason: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+    fn mark_running_as_interrupted(
+        &self,
+        reason: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
 
     // ----- Event log (A17) -----
 
     /// Record a task lifecycle event (started / succeeded / failed / etc.).
     /// Reference: APScheduler add_listener + EVENT_JOB_*.
-    fn record_event(&self, task_id: &str, event_type: EventType, payload: Option<&str>, ts: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn record_event(
+        &self,
+        task_id: &str,
+        event_type: EventType,
+        payload: Option<&str>,
+        ts: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// List events since `since_ts` (Unix seconds), optionally filtered by
     /// `task_id_filter`. Ordered by ts ASC.
-    fn list_events(&self, since_ts: i64, task_id_filter: Option<&str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>>;
+    fn list_events(
+        &self,
+        since_ts: i64,
+        task_id_filter: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskEvent>>> + Send + '_>>;
 
     /// Delete events older than `ttl_secs` seconds. Returns the count deleted.
-    fn cleanup_expired_events(&self, ttl_secs: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
+    fn cleanup_expired_events(
+        &self,
+        ttl_secs: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>>;
 
     // ----- Task chain (C15) -----
 
     /// Create a new chain record with the given task configs.
-    fn create_chain(&self, chain_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn create_chain(
+        &self,
+        chain_id: &str,
+        tasks: &[serde_json::Value],
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// Load a chain record by id.
-    fn get_chain(&self, chain_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>>;
+    fn get_chain(
+        &self,
+        chain_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChainRecord>>> + Send + '_>>;
 
     /// Update chain step + state.
-    fn update_chain_step(&self, chain_id: &str, current_step: u32, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn update_chain_step(
+        &self,
+        chain_id: &str,
+        current_step: u32,
+        state: &str,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// List chains by state (for daemon restart recovery).
-    fn list_chains_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>>;
+    fn list_chains_by_state(
+        &self,
+        state: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ChainRecord>>> + Send + '_>>;
 
     // ----- Task group (C16) -----
 
     /// Create a new group record.
-    fn create_group(&self, group_id: &str, tasks: &[serde_json::Value], created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn create_group(
+        &self,
+        group_id: &str,
+        tasks: &[serde_json::Value],
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// Load a group record by id.
-    fn get_group(&self, group_id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>>;
+    fn get_group(
+        &self,
+        group_id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<GroupRecord>>> + Send + '_>>;
 
     /// Update group state.
-    fn update_group_state(&self, group_id: &str, state: &str, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn update_group_state(
+        &self,
+        group_id: &str,
+        state: &str,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// List groups by state (for daemon restart recovery).
-    fn list_groups_by_state(&self, state: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>>;
+    fn list_groups_by_state(
+        &self,
+        state: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<GroupRecord>>> + Send + '_>>;
 
     // ----- Task chord (C16+) -----
 
@@ -748,38 +919,67 @@ pub trait TaskStore: Send + Sync {
     /// "pending" state and transitions to "running" / "success" /
     /// "partial_failed" as header tasks complete.
     /// Reference: Celery chord.
-    fn create_chord(&self, id: &str, header_task_ids: &[String], callback_json: &str, created_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn create_chord(
+        &self,
+        id: &str,
+        header_task_ids: &[String],
+        callback_json: &str,
+        created_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// Load a chord record by id.
-    fn get_chord(&self, id: &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>>;
+    fn get_chord(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ChordRecord>>> + Send + '_>>;
 
     /// Update chord state and (optionally) record the dispatched callback
     /// task id. Pass `callback_task_id = None` to leave it unchanged; pass
     /// `Some(id)` when the body has just been dispatched.
-    fn update_chord_state(&self, id: &str, state: &str, callback_task_id: Option<String>, updated_at: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn update_chord_state(
+        &self,
+        id: &str,
+        state: &str,
+        callback_task_id: Option<String>,
+        updated_at: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     // ----- Progress / inspect (Task 1-5) -----
 
     /// Update progress (0-100) and optional meta JSON for a task.
     /// Reference: Celery update_state(state='PROGRESS', meta=...).
-    fn update_progress(&self, id: &str, percent: u8, meta: Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+    fn update_progress(
+        &self,
+        id: &str,
+        percent: u8,
+        meta: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
     /// List summaries of all currently running tasks.
     /// Reference: Celery inspect active.
-    fn list_active_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+    fn list_active_summary(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
 
     /// List summaries of all registered (cron / interval) tasks.
     /// Reference: Celery inspect registered.
-    fn list_registered_summary(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+    fn list_registered_summary(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
 
     /// List summaries of all tasks scheduled to fire after `now`
     /// (next_fire.is_some() && next_fire > now).
     /// Reference: Celery inspect scheduled.
-    fn list_scheduled_summary(&self, now: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
+    fn list_scheduled_summary(
+        &self,
+        now: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TaskSummary>>> + Send + '_>>;
 
     /// Aggregate worker / queue statistics.
     /// Reference: Celery inspect stats.
-    fn worker_stats(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>>;
+    fn worker_stats(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<WorkerStats>> + Send + '_>>;
 
     /// Modify any task field at runtime (F-5). Accepts a JSON patch object
     /// whose keys map to Task fields. Only non-terminal tasks (Pending /
@@ -787,7 +987,11 @@ pub trait TaskStore: Send + Sync {
     /// interval, run_at, timezone) is changed, next_fire is recomputed.
     /// Immutable fields (id, owner, state, attempts, created_at) are ignored.
     /// Reference: APScheduler modify_job.
-    fn modify_job(&self, id: &str, patch: &serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
+    fn modify_job(
+        &self,
+        id: &str,
+        patch: &serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + '_>>;
 }
 
 /// Choose store backend based on persist flag.
@@ -798,7 +1002,9 @@ pub trait TaskStore: Send + Sync {
 pub fn make_store(use_persist: bool, db_path: Option<&str>) -> Result<Arc<dyn TaskStore>> {
     #[cfg(feature = "persist")]
     if use_persist {
-        let path = db_path.map(|s| s.to_string()).unwrap_or_else(default_db_path);
+        let path = db_path
+            .map(|s| s.to_string())
+            .unwrap_or_else(default_db_path);
         let store = SqliteStore::open(&path)?;
         return Ok(Arc::new(store));
     }
@@ -818,11 +1024,23 @@ pub fn make_store(use_persist: bool, db_path: Option<&str>) -> Result<Arc<dyn Ta
 /// Windows: `<dir>\xhjob.{name}.db`
 pub fn db_path_for(service_name: &str, data_dir: Option<&str>) -> String {
     let dir = if let Some(d) = data_dir {
-        if !d.is_empty() { d.to_string() } else { fallback_db_dir() }
+        if !d.is_empty() {
+            d.to_string()
+        } else {
+            fallback_db_dir()
+        }
     } else if let Ok(d) = std::env::var("XHJOB_DB_DIR") {
-        if !d.is_empty() { d } else { fallback_db_dir() }
+        if !d.is_empty() {
+            d
+        } else {
+            fallback_db_dir()
+        }
     } else if let Ok(d) = std::env::var("XHJOB_DATA_DIR") {
-        if !d.is_empty() { d } else { fallback_db_dir() }
+        if !d.is_empty() {
+            d
+        } else {
+            fallback_db_dir()
+        }
     } else {
         fallback_db_dir()
     };
@@ -835,7 +1053,9 @@ pub fn db_path_for(service_name: &str, data_dir: Option<&str>) -> String {
 /// Fallback DB directory when no explicit dir is provided.
 fn fallback_db_dir() -> String {
     #[cfg(unix)]
-    { "/tmp".to_string() }
+    {
+        "/tmp".to_string()
+    }
     #[cfg(windows)]
     {
         std::env::temp_dir().to_string_lossy().to_string()
@@ -846,7 +1066,10 @@ fn fallback_db_dir() -> String {
 /// 未来若需根据配置动态选择 store 类型可启用此辅助函数。
 #[allow(dead_code)]
 fn default_db_path() -> String {
-    db_path_for(&crate::service::current(), crate::service::current_data_dir().as_deref())
+    db_path_for(
+        &crate::service::current(),
+        crate::service::current_data_dir().as_deref(),
+    )
 }
 
 pub fn now_ts() -> u64 {
@@ -881,10 +1104,7 @@ mod tests {
 
     #[test]
     fn test_builder_max_executions_default_zero() {
-        let task = TaskBuilder::new()
-            .via_shell("echo hi")
-            .build()
-            .unwrap();
+        let task = TaskBuilder::new().via_shell("echo hi").build().unwrap();
         assert_eq!(task.max_executions, 0);
     }
 
@@ -997,10 +1217,16 @@ mod tests {
         let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
         task.id = "t-remove".to_string();
         store.insert_task(task.clone()).await.unwrap();
-        store.save_result("t-remove", TaskResult {
-            stdout: Some("ok".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "t-remove",
+                TaskResult {
+                    stdout: Some("ok".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         // Remove
         store.remove_task("t-remove").await.unwrap();
         // Both task and result should be gone.
@@ -1054,10 +1280,16 @@ mod tests {
         task.finished_at = Some(now_ts().saturating_sub(100));
         task.state = TaskState::Success;
         store.insert_task(task).await.unwrap();
-        store.save_result("t-ttl", TaskResult {
-            stdout: Some("ok".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "t-ttl",
+                TaskResult {
+                    stdout: Some("ok".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let deleted = store.cleanup_expired_results().await.unwrap();
         assert_eq!(deleted, 1);
         assert!(store.load_result("t-ttl").await.unwrap().is_none());
@@ -1073,10 +1305,16 @@ mod tests {
         task.finished_at = Some(now_ts());
         task.state = TaskState::Success;
         store.insert_task(task).await.unwrap();
-        store.save_result("t-ttl-fresh", TaskResult {
-            stdout: Some("ok".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "t-ttl-fresh",
+                TaskResult {
+                    stdout: Some("ok".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let deleted = store.cleanup_expired_results().await.unwrap();
         assert_eq!(deleted, 0);
         assert!(store.load_result("t-ttl-fresh").await.unwrap().is_some());
@@ -1092,10 +1330,16 @@ mod tests {
         task.finished_at = Some(now_ts().saturating_sub(10_000));
         task.state = TaskState::Success;
         store.insert_task(task).await.unwrap();
-        store.save_result("t-ttl-zero", TaskResult {
-            stdout: Some("ok".to_string()),
-            ..Default::default()
-        }).await.unwrap();
+        store
+            .save_result(
+                "t-ttl-zero",
+                TaskResult {
+                    stdout: Some("ok".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let deleted = store.cleanup_expired_results().await.unwrap();
         assert_eq!(deleted, 0);
         assert!(store.load_result("t-ttl-zero").await.unwrap().is_some());
@@ -1151,11 +1395,17 @@ mod tests {
         t3.state = TaskState::Pending;
         store.insert_task(t3).await.unwrap();
 
-        let pending = store.list_tasks(Some(TaskState::Pending), None).await.unwrap();
+        let pending = store
+            .list_tasks(Some(TaskState::Pending), None)
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|s| s.state == TaskState::Pending));
 
-        let success = store.list_tasks(Some(TaskState::Success), None).await.unwrap();
+        let success = store
+            .list_tasks(Some(TaskState::Success), None)
+            .await
+            .unwrap();
         assert_eq!(success.len(), 1);
         assert_eq!(success[0].id, "t2");
     }
@@ -1163,7 +1413,10 @@ mod tests {
     /// `TaskSummary::from(&Task)` carries the expected fields.
     #[test]
     fn test_task_summary_from_task() {
-        let mut task = Task::new(TaskType::Http, serde_json::json!({"method":"GET","url":"http://x"}));
+        let mut task = Task::new(
+            TaskType::Http,
+            serde_json::json!({"method":"GET","url":"http://x"}),
+        );
         task.id = "abc".to_string();
         task.cron = Some("*/5 * * * *".to_string());
         task.attempts = 3;
@@ -1213,20 +1466,43 @@ mod tests {
             task.cancel_requested = true;
             store.insert_task(task).await.unwrap();
 
-            let ok = store.requeue_task(&format!("t-requeue-{:?}", state)).await.unwrap();
+            let ok = store
+                .requeue_task(&format!("t-requeue-{:?}", state))
+                .await
+                .unwrap();
             assert!(ok, "requeue of {:?} should return true", state);
 
-            let loaded = store.load_task(&format!("t-requeue-{:?}", state)).await.unwrap().unwrap();
-            assert_eq!(loaded.state, TaskState::Pending,
-                "after requeue, state should be Pending for {:?}", state);
-            assert_eq!(loaded.attempts, 0,
-                "after requeue, attempts should be reset to 0 for {:?}", state);
-            assert_eq!(loaded.last_error, None,
-                "after requeue, last_error should be cleared for {:?}", state);
-            assert_eq!(loaded.cancel_requested, false,
-                "after requeue, cancel_requested should be cleared for {:?}", state);
-            assert!(loaded.next_fire.is_some(),
-                "after requeue, next_fire should be set so scan picks it up for {:?}", state);
+            let loaded = store
+                .load_task(&format!("t-requeue-{:?}", state))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                loaded.state,
+                TaskState::Pending,
+                "after requeue, state should be Pending for {:?}",
+                state
+            );
+            assert_eq!(
+                loaded.attempts, 0,
+                "after requeue, attempts should be reset to 0 for {:?}",
+                state
+            );
+            assert_eq!(
+                loaded.last_error, None,
+                "after requeue, last_error should be cleared for {:?}",
+                state
+            );
+            assert!(
+                !loaded.cancel_requested,
+                "after requeue, cancel_requested should be cleared for {:?}",
+                state
+            );
+            assert!(
+                loaded.next_fire.is_some(),
+                "after requeue, next_fire should be set so scan picks it up for {:?}",
+                state
+            );
         }
     }
 
@@ -1246,7 +1522,11 @@ mod tests {
         assert!(!ok, "requeue of Running task should return false");
 
         let loaded = store.load_task("t-requeue-running").await.unwrap().unwrap();
-        assert_eq!(loaded.state, TaskState::Running, "Running state should be preserved");
+        assert_eq!(
+            loaded.state,
+            TaskState::Running,
+            "Running state should be preserved"
+        );
         assert_eq!(loaded.attempts, 1, "attempts should be unchanged");
 
         // Same for Pending.
@@ -1281,28 +1561,45 @@ mod tests {
         store.insert_task(task).await.unwrap();
 
         // Reschedule to every minute.
-        let ok = store.reschedule_task("t-resched", "*/1 * * * *").await.unwrap();
+        let ok = store
+            .reschedule_task("t-resched", "*/1 * * * *")
+            .await
+            .unwrap();
         assert!(ok, "reschedule of an active cron task should return true");
 
         let loaded = store.load_task("t-resched").await.unwrap().unwrap();
         // Cron field updated.
-        assert_eq!(loaded.cron.as_deref(), Some("*/1 * * * *"),
-            "cron should be updated to */1 * * * *");
+        assert_eq!(
+            loaded.cron.as_deref(),
+            Some("*/1 * * * *"),
+            "cron should be updated to */1 * * * *"
+        );
         // State, execution_count, attempts preserved.
-        assert_eq!(loaded.execution_count, 3,
-            "execution_count should be preserved (was 3)");
-        assert_eq!(loaded.attempts, 1,
-            "attempts should be preserved (was 1)");
-        assert_eq!(loaded.state, TaskState::Pending,
-            "state should be preserved as Pending");
+        assert_eq!(
+            loaded.execution_count, 3,
+            "execution_count should be preserved (was 3)"
+        );
+        assert_eq!(loaded.attempts, 1, "attempts should be preserved (was 1)");
+        assert_eq!(
+            loaded.state,
+            TaskState::Pending,
+            "state should be preserved as Pending"
+        );
         // next_fire re-computed for */1 * * * * (within the next minute or so).
         let now = now_ts();
         let new_next = loaded.next_fire.expect("next_fire should be set");
-        assert!(new_next > now,
-            "next_fire should be in the future, got {} (now={})", new_next, now);
-        assert!(new_next <= now + 65,
+        assert!(
+            new_next > now,
+            "next_fire should be in the future, got {} (now={})",
+            new_next,
+            now
+        );
+        assert!(
+            new_next <= now + 65,
             "next_fire for */1 * * * * should be within 65s, got {} (now+65={})",
-            new_next, now + 65);
+            new_next,
+            now + 65
+        );
     }
 
     /// Reschedule (A11): reschedule_task of a non-cron task (interval /
@@ -1317,8 +1614,14 @@ mod tests {
         task.state = TaskState::Pending;
         store.insert_task(task).await.unwrap();
 
-        let ok = store.reschedule_task("t-interval-resched", "*/1 * * * *").await.unwrap();
-        assert!(!ok, "reschedule of a non-cron interval task should return false");
+        let ok = store
+            .reschedule_task("t-interval-resched", "*/1 * * * *")
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "reschedule of a non-cron interval task should return false"
+        );
 
         // Same for runAt.
         let mut task2 = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo r"}));
@@ -1327,11 +1630,20 @@ mod tests {
         task2.state = TaskState::Pending;
         store.insert_task(task2).await.unwrap();
 
-        let ok = store.reschedule_task("t-runat-resched", "*/1 * * * *").await.unwrap();
-        assert!(!ok, "reschedule of a non-cron runAt task should return false");
+        let ok = store
+            .reschedule_task("t-runat-resched", "*/1 * * * *")
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "reschedule of a non-cron runAt task should return false"
+        );
 
         // Non-existent task also returns false (no error).
-        let ok = store.reschedule_task("does-not-exist", "*/1 * * * *").await.unwrap();
+        let ok = store
+            .reschedule_task("does-not-exist", "*/1 * * * *")
+            .await
+            .unwrap();
         assert!(!ok, "reschedule of non-existent task should return false");
     }
 
@@ -1339,7 +1651,12 @@ mod tests {
     /// Reference: APScheduler reschedule_job.
     #[tokio::test]
     async fn test_reschedule_rejects_terminal_task() {
-        for state in &[TaskState::Success, TaskState::Failed, TaskState::Cancelled, TaskState::Expired] {
+        for state in &[
+            TaskState::Success,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::Expired,
+        ] {
             let store = InMemoryStore::new();
             let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo t"}));
             task.id = format!("t-resched-{:?}", state);
@@ -1347,8 +1664,15 @@ mod tests {
             task.state = *state;
             store.insert_task(task).await.unwrap();
 
-            let ok = store.reschedule_task(&format!("t-resched-{:?}", state), "*/1 * * * *").await.unwrap();
-            assert!(!ok, "reschedule of {:?} terminal task should return false", state);
+            let ok = store
+                .reschedule_task(&format!("t-resched-{:?}", state), "*/1 * * * *")
+                .await
+                .unwrap();
+            assert!(
+                !ok,
+                "reschedule of {:?} terminal task should return false",
+                state
+            );
         }
     }
 
@@ -1367,16 +1691,24 @@ mod tests {
         store.insert_task(task).await.unwrap();
 
         // "not a valid cron ###" is not parseable: cron::Schedule::from_str rejects it.
-        let result = store.reschedule_task("t-resched-invalid", "not a valid cron ###").await;
+        let result = store
+            .reschedule_task("t-resched-invalid", "not a valid cron ###")
+            .await;
         assert!(result.is_err(), "invalid cron should return Err");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid cron") || msg.contains("cron parse"),
-            "error message should mention invalid cron, got: {}", msg);
+        assert!(
+            msg.contains("invalid cron") || msg.contains("cron parse"),
+            "error message should mention invalid cron, got: {}",
+            msg
+        );
 
         // The task's cron field should be UNCHANGED (not updated to the invalid value).
         let loaded = store.load_task("t-resched-invalid").await.unwrap().unwrap();
-        assert_eq!(loaded.cron.as_deref(), Some("*/5 * * * *"),
-            "cron field should be unchanged after invalid reschedule");
+        assert_eq!(
+            loaded.cron.as_deref(),
+            Some("*/5 * * * *"),
+            "cron field should be unchanged after invalid reschedule"
+        );
     }
 
     /// get_job (A12): the daemon handler serializes a Task to JSON; verify
@@ -1420,26 +1752,44 @@ mod tests {
         let obj = v.as_object().expect("task json should be an object");
 
         // Configuration fields that distinguish `get` from `state`.
-        assert_eq!(obj.get("cron").and_then(|v| v.as_str()), Some("*/5 * * * *"));
+        assert_eq!(
+            obj.get("cron").and_then(|v| v.as_str()),
+            Some("*/5 * * * *")
+        );
         assert_eq!(obj.get("retry_max").and_then(|v| v.as_u64()), Some(7));
         assert_eq!(obj.get("retry_delay").and_then(|v| v.as_u64()), Some(13));
         assert_eq!(obj.get("timeout").and_then(|v| v.as_u64()), Some(45));
         assert_eq!(obj.get("priority").and_then(|v| v.as_i64()), Some(9));
-        assert_eq!(obj.get("allow_overlap").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("allow_overlap").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(obj.get("max_instances").and_then(|v| v.as_u64()), Some(3));
         assert_eq!(obj.get("coalesce").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(obj.get("max_executions").and_then(|v| v.as_u64()), Some(5));
         assert_eq!(obj.get("result_ttl").and_then(|v| v.as_u64()), Some(120));
-        assert_eq!(obj.get("meta").and_then(|v| v.as_str()), Some(r#"{"k":"v"}"#));
+        assert_eq!(
+            obj.get("meta").and_then(|v| v.as_str()),
+            Some(r#"{"k":"v"}"#)
+        );
         assert_eq!(obj.get("interval").and_then(|v| v.as_u64()), Some(20));
         assert_eq!(obj.get("run_at").and_then(|v| v.as_i64()), Some(1234567));
         assert_eq!(obj.get("jitter").and_then(|v| v.as_u64()), Some(4));
         assert_eq!(obj.get("expires").and_then(|v| v.as_u64()), Some(60));
-        assert_eq!(obj.get("retry_backoff").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            obj.get("retry_backoff").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(obj.get("start_date").and_then(|v| v.as_i64()), Some(1000));
         assert_eq!(obj.get("end_date").and_then(|v| v.as_i64()), Some(2000));
-        assert_eq!(obj.get("timezone").and_then(|v| v.as_str()), Some("Asia/Shanghai"));
-        assert_eq!(obj.get("proxy").and_then(|v| v.as_str()), Some("http://proxy.example"));
+        assert_eq!(
+            obj.get("timezone").and_then(|v| v.as_str()),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(
+            obj.get("proxy").and_then(|v| v.as_str()),
+            Some("http://proxy.example")
+        );
         assert_eq!(obj.get("encoding").and_then(|v| v.as_str()), Some("GBK"));
         // Identity + execution metadata also present.
         // TaskState 通过 `#[serde(rename_all = "lowercase")]` 序列化为小写形式，
@@ -1468,8 +1818,10 @@ mod tests {
     async fn test_xhjob_get_nonexistent_returns_none() {
         let store = InMemoryStore::new();
         let loaded = store.load_task("does-not-exist").await.unwrap();
-        assert!(loaded.is_none(),
-            "load_task of a non-existent id should return None (translated to PHP null)");
+        assert!(
+            loaded.is_none(),
+            "load_task of a non-existent id should return None (translated to PHP null)"
+        );
     }
 
     /// acksLate (C10): `reset_running_to_pending` only resets Running tasks
@@ -1499,23 +1851,40 @@ mod tests {
         store.insert_task(t_early).await.unwrap();
 
         let reset = store.reset_running_to_pending().await.unwrap();
-        assert_eq!(reset, 2, "ALL running tasks should be reset on startup (C1 fix)");
+        assert_eq!(
+            reset, 2,
+            "ALL running tasks should be reset on startup (C1 fix)"
+        );
 
         let loaded_late = store.load_task("t-running-late").await.unwrap().unwrap();
-        assert_eq!(loaded_late.state, TaskState::Pending,
-            "acks_late=true Running task should be reset to Pending");
-        assert!(loaded_late.next_fire.is_some(),
-            "acks_late=true Running task should have next_fire set so scan picks it up");
-        assert!(loaded_late.started_at.is_none(),
-            "acks_late=true Running task should have started_at cleared");
-        assert!(loaded_late.finished_at.is_none(),
-            "acks_late=true Running task should have finished_at cleared");
+        assert_eq!(
+            loaded_late.state,
+            TaskState::Pending,
+            "acks_late=true Running task should be reset to Pending"
+        );
+        assert!(
+            loaded_late.next_fire.is_some(),
+            "acks_late=true Running task should have next_fire set so scan picks it up"
+        );
+        assert!(
+            loaded_late.started_at.is_none(),
+            "acks_late=true Running task should have started_at cleared"
+        );
+        assert!(
+            loaded_late.finished_at.is_none(),
+            "acks_late=true Running task should have finished_at cleared"
+        );
 
         let loaded_early = store.load_task("t-running-early").await.unwrap().unwrap();
-        assert_eq!(loaded_early.state, TaskState::Pending,
-            "acks_late=false Running task should ALSO be reset (C1 fix: orphan recovery)");
-        assert!(loaded_early.started_at.is_none(),
-            "acks_late=false Running task should have started_at cleared");
+        assert_eq!(
+            loaded_early.state,
+            TaskState::Pending,
+            "acks_late=false Running task should ALSO be reset (C1 fix: orphan recovery)"
+        );
+        assert!(
+            loaded_early.started_at.is_none(),
+            "acks_late=false Running task should have started_at cleared"
+        );
     }
 
     /// acksLate (C10): `reset_running_to_pending` does not affect Pending or
@@ -1557,8 +1926,11 @@ mod tests {
         // Verify states are unchanged.
         let p = store.load_task("t-pending").await.unwrap().unwrap();
         assert_eq!(p.state, TaskState::Pending);
-        assert_eq!(p.next_fire, Some(now + 60),
-            "Pending task next_fire should be unchanged");
+        assert_eq!(
+            p.next_fire,
+            Some(now + 60),
+            "Pending task next_fire should be unchanged"
+        );
 
         let s = store.load_task("t-success").await.unwrap().unwrap();
         assert_eq!(s.state, TaskState::Success);
@@ -1601,32 +1973,51 @@ mod tests {
         t3.next_fire = Some(now + 60);
         store.insert_task(t3).await.unwrap();
 
-        let count = store.mark_running_as_interrupted("drain deadline").await.unwrap();
+        let count = store
+            .mark_running_as_interrupted("drain deadline")
+            .await
+            .unwrap();
         assert_eq!(count, 2, "both Running tasks should be transitioned");
 
         // Verify state transition.
         let l1 = store.load_task("t-run-1").await.unwrap().unwrap();
-        assert_eq!(l1.state, TaskState::Interrupted,
-            "Running task should now be Interrupted");
-        assert!(l1.finished_at.is_some(),
-            "Interrupted task should have finished_at set");
+        assert_eq!(
+            l1.state,
+            TaskState::Interrupted,
+            "Running task should now be Interrupted"
+        );
+        assert!(
+            l1.finished_at.is_some(),
+            "Interrupted task should have finished_at set"
+        );
 
         let l2 = store.load_task("t-run-2").await.unwrap().unwrap();
         assert_eq!(l2.state, TaskState::Interrupted);
 
         let l3 = store.load_task("t-pending-3").await.unwrap().unwrap();
-        assert_eq!(l3.state, TaskState::Pending,
-            "Pending task should be untouched by mark_running_as_interrupted");
+        assert_eq!(
+            l3.state,
+            TaskState::Pending,
+            "Pending task should be untouched by mark_running_as_interrupted"
+        );
 
         // Verify one Interrupted event per transitioned task was emitted.
         let events = store.list_events(0, None).await.unwrap();
-        let interrupted_events: Vec<_> = events.iter()
+        let interrupted_events: Vec<_> = events
+            .iter()
             .filter(|e| e.event_type == EventType::Interrupted)
             .collect();
-        assert_eq!(interrupted_events.len(), 2,
-            "one Interrupted event per transitioned task should be emitted");
-        assert!(interrupted_events.iter().all(|e| e.payload.as_deref() == Some("drain deadline")),
-            "Interrupted event payload should carry the supplied reason");
+        assert_eq!(
+            interrupted_events.len(),
+            2,
+            "one Interrupted event per transitioned task should be emitted"
+        );
+        assert!(
+            interrupted_events
+                .iter()
+                .all(|e| e.payload.as_deref() == Some("drain deadline")),
+            "Interrupted event payload should carry the supplied reason"
+        );
     }
 
     /// Interrupted state recovery: on the next daemon startup,
@@ -1655,24 +2046,40 @@ mod tests {
         let n = store.mark_running_as_interrupted("shutdown").await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(
-            store.load_task("t-interrupted").await.unwrap().unwrap().state,
+            store
+                .load_task("t-interrupted")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             TaskState::Interrupted
         );
 
         // Daemon restart: reset_running_to_pending re-enqueues Interrupted.
         let reset = store.reset_running_to_pending().await.unwrap();
-        assert_eq!(reset, 1,
-            "Interrupted task should be reset to Pending on restart");
+        assert_eq!(
+            reset, 1,
+            "Interrupted task should be reset to Pending on restart"
+        );
 
         let loaded = store.load_task("t-interrupted").await.unwrap().unwrap();
-        assert_eq!(loaded.state, TaskState::Pending,
-            "Interrupted task should be back to Pending after restart");
-        assert!(loaded.next_fire.is_some(),
-            "Interrupted task should have next_fire set so scan picks it up");
-        assert!(loaded.started_at.is_none(),
-            "Interrupted task should have started_at cleared on reset");
-        assert!(loaded.finished_at.is_none(),
-            "Interrupted task should have finished_at cleared on reset");
+        assert_eq!(
+            loaded.state,
+            TaskState::Pending,
+            "Interrupted task should be back to Pending after restart"
+        );
+        assert!(
+            loaded.next_fire.is_some(),
+            "Interrupted task should have next_fire set so scan picks it up"
+        );
+        assert!(
+            loaded.started_at.is_none(),
+            "Interrupted task should have started_at cleared on reset"
+        );
+        assert!(
+            loaded.finished_at.is_none(),
+            "Interrupted task should have finished_at cleared on reset"
+        );
     }
 
     /// `EventType::Interrupted` round-trips through as_str / from_str.
@@ -1710,9 +2117,11 @@ mod tests {
         assert!(ok, "modify_job should report a change");
 
         let loaded = store.load_task("t-clear-cron").await.unwrap().unwrap();
-        assert!(loaded.cron.is_none(),
+        assert!(
+            loaded.cron.is_none(),
             "cron should be cleared after modify_job({{cron:null}}); got {:?}",
-            loaded.cron);
+            loaded.cron
+        );
     }
 
     /// P1 regression: modify_job with `interval: null` must CLEAR the
@@ -1732,9 +2141,11 @@ mod tests {
         assert!(ok);
 
         let loaded = store.load_task("t-clear-int").await.unwrap().unwrap();
-        assert!(loaded.interval.is_none(),
+        assert!(
+            loaded.interval.is_none(),
             "interval should be cleared after modify_job({{interval:null}}); got {:?}",
-            loaded.interval);
+            loaded.interval
+        );
     }
 
     /// P1 regression: an unrecognized task state in the DB must NOT resurrect
