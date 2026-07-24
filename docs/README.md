@@ -86,18 +86,6 @@ while (true) {
 print_r(xhjob_result($taskId));
 ```
 
-## 三种零构建部署方式
-
-本站基于 [Docsify](https://docsify.js.org/) 构建，**零编译、零流水线**，浏览器直接打开即可渲染。
-
-| 方式 | 命令 / 操作 | 适用场景 |
-|---|---|---|
-| ① 本地预览 | `python -m http.server 8080 -d docs` 后访问 `http://localhost:8080/` | 写文档时本地验证 |
-| ② GitHub Pages | 仓库 Settings → Pages → Source: **Deploy from a branch** → 分支 `main` / 目录 `/docs` | 公开托管，无需 Actions |
-| ③ 任意静态服务器 | nginx / apache / CDN 直接托管 `docs/` 目录 | 自建或内网部署 |
-
-> ⚠️ 由于 docsify 通过 fetch 加载 markdown，**直接双击 `index.html` 打开（file:// 协议）会被浏览器 CORS 拦截**，请用任意 http server 启动后访问。
-
 ## 技术栈
 
 | 组件 | 技术 |
