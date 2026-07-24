@@ -312,6 +312,21 @@ pub fn xhjob_state(
             "progress_meta".to_string(),
             info.progress_meta.clone().unwrap_or_default(),
         ));
+        // execution_lease: surface worker_pid + worker_starttime so PHP
+        // callers can observe that the lease was written at spawn time and
+        // verify crash-recovery / PID-reuse-protection behavior end-to-end.
+        out.push((
+            "worker_pid".to_string(),
+            info.worker_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
+        out.push((
+            "worker_starttime".to_string(),
+            info.worker_starttime
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+        ));
     } else {
         out.push(("state".to_string(), "UNKNOWN".to_string()));
         out.push((

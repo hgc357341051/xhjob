@@ -19,7 +19,8 @@ Route::get('hello/:name', 'index/hello');
 // +----------------------------------------------------------------------
 // | Xhjob 定时任务演示路由
 // | 路由前缀 /xhjob，对应 app\controller\XhjobTask
-// | stop / restart 同时支持 daemon（无 id）与单个任务（带 id）操作
+// | stop / restart 通过 ?scope=daemon（显式）操作 daemon，默认 scope=task 操作单个任务（需 id）
+// | demo 为状态变更操作（起停 daemon + 派发任务），使用 POST 避免 GET 触发
 // +----------------------------------------------------------------------
 Route::group('xhjob', function () {
     Route::get('index', 'XhjobTask/index');
@@ -46,5 +47,5 @@ Route::group('xhjob', function () {
     Route::delete('delete', 'XhjobTask/delete');
     Route::get('chainState', 'XhjobTask/chainState');
     Route::get('groupState', 'XhjobTask/groupState');
-    Route::get('demo', 'XhjobTask/demo');
+    Route::post('demo', 'XhjobTask/demo');
 })->middleware(\app\middleware\XhjobAuth::class);

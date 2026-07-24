@@ -58,7 +58,39 @@ function setupExtensionScanDir(): void
             $so = $alt;
         }
     }
-    $tmpDir = sys_get_temp_dir() . '/xhjob_ini_scan_' . posix_getpid();
+
+    // 清理过期的 ini scan dir，防止 /tmp 无限累积。
+    //
+    // 背景：每次运行本脚本都会在 sys_get_temp_dir() 下创建
+    //   xhjob_ini_scan_<pid>/xhjob.ini 并通过 putenv 注入 PHP_INI_SCAN_DIR，
+    //   供 daemon 子进程（re-exec PHP binary 加载 xhjob 扩展）启动时使用。
+    //   原实现既不在退出时删除该目录，也不清理历史残留，导致每次运行
+    //   （含 cron / 重启）都在 /tmp 留下一个孤儿目录，长期运行下无限增长。
+    //
+    // 为什么采用「启动时清理过期目录」而非「退出时删除当前目录」：
+    //   - 本脚本启动 daemon 后即 exit(0)，daemon 仍独立运行，并继承了
+    //     PHP_INI_SCAN_DIR 环境变量。daemon 自身启动时已读取该 ini scan
+    //     dir 加载扩展，但若它在退出后被外部重启、或派生需要读取该目录
+    //     的子进程，退出时删除当前目录存在破坏正在运行的 daemon 的风险。
+    //   - 因此仅在启动时扫描并删除「过期」（mtime 距今 > 3600s）的
+    //     xhjob_ini_scan_* 目录。过期目录必然属于早已退出的历史运行
+    //     （其 daemon 早已停止），删除安全；当前运行即将创建的目录 mtime
+    //     为最新，不会被误删。这样既避免无限累积，又不影响运行中的 daemon。
+    $tmpBase = sys_get_temp_dir();
+    $staleThreshold = 3600; // 1 小时
+    $now = time();
+    foreach ((glob($tmpBase . '/xhjob_ini_scan_*', GLOB_ONLYDIR) ?: []) as $oldDir) {
+        if (!is_dir($oldDir)) {
+            continue;
+        }
+        if (($now - (int) @filemtime($oldDir)) <= $staleThreshold) {
+            continue; // 未过期，跳过（含当前运行即将创建的目录）
+        }
+        @unlink($oldDir . '/xhjob.ini');
+        @rmdir($oldDir);
+    }
+
+    $tmpDir = $tmpBase . '/xhjob_ini_scan_' . posix_getpid();
     if (!is_dir($tmpDir)) {
         @mkdir($tmpDir, 0700, true);
     }
@@ -135,6 +167,8 @@ try {
 
     // 4. 等待就绪（start 内部已 wait，这里再补一次确保）
     if (!$svc->wait(10, true)) {
+        // 等待失败也尝试停止残留进程，避免 partially-started daemon 残留
+        $svc->ensureStopped();
         fwrite(STDERR, "ERROR: daemon 在 10s 内未进入 running 状态\n");
         exit(1);
     }

@@ -265,6 +265,25 @@ pub fn status(service_name: &str, data_dir: Option<&str>) -> DaemonStatus {
     }
 }
 
+/// Decide whether SIGKILL escalation is safe after the SIGTERM poll loop
+/// times out.
+///
+/// Returns `true` only when `expected_starttime` is `Some` — i.e. the PID
+/// file used the modern two-line format and `is_process_alive_with_starttime`
+/// has been continuously verifying the PID against its recorded starttime
+/// throughout the poll. With a validated starttime, a still-alive PID after
+/// the timeout is provably the same daemon process, so SIGKILL is safe.
+///
+/// Returns `false` when `expected_starttime` is `None` (legacy single-line
+/// PID file, or no starttime recorded). In that case the poll loop only
+/// checked `kill(pid, 0)` liveness — it cannot prove the PID was not reused
+/// by an unrelated process while we waited. Escalating to SIGKILL would risk
+/// killing the innocent reused process (catastrophic when run as root), so
+/// we fail SAFE: refuse SIGKILL and require manual operator investigation.
+fn should_sigkill(expected_starttime: Option<u64>) -> bool {
+    expected_starttime.is_some()
+}
+
 /// Send SIGTERM (Unix) or TerminateProcess (Windows) to the daemon.
 ///
 /// `expected_starttime` (when `Some`) is used to verify the target PID has not
@@ -272,6 +291,14 @@ pub fn status(service_name: &str, data_dir: Option<&str>) -> DaemonStatus {
 /// signal — if the daemon died and an unrelated process reused the PID, the
 /// starttime check causes the loop to exit early without raising SIGKILL on
 /// the innocent process.
+///
+/// When `expected_starttime` is `None` (legacy PID file with no recorded
+/// starttime), the SIGKILL escalation is suppressed: the poll loop only had
+/// plain `kill(pid, 0)` liveness to go on, so a still-alive PID after the
+/// timeout could be an unrelated reused process. Killing it with SIGKILL
+/// (especially when running as root) would be fail-DEADLY, so we instead
+/// fail-SAFE: log a warning and return without SIGKILL, leaving manual
+/// investigation to the operator. The initial SIGTERM was already sent.
 ///
 /// The SIGKILL grace period aligns with the daemon-side drain timeout
 /// (`XHJOB_SHUTDOWN_DRAIN_SECS`, default 30s): we wait `max(10, drain + 5)`
@@ -308,6 +335,16 @@ pub fn send_terminate(
     let polls = wait_secs.saturating_mul(10);
     #[cfg(unix)]
     {
+        // TOCTOU hardening: between the caller's read_pid (which validated
+        // the PID + starttime) and this kill(), a microsecond window exists
+        // in which the daemon could exit and the OS could reuse the PID for
+        // an unrelated process. Re-validate immediately before signalling;
+        // if the PID no longer matches (dead or reused with a mismatched
+        // starttime), do not send SIGTERM to a stranger.
+        if !is_process_alive_with_starttime(pid, expected_starttime) {
+            remove_pid_file(service_name, data_dir);
+            return Ok(());
+        }
         let rc = unsafe {
             kill(pid as i32, 15 /* SIGTERM */)
         };
@@ -323,11 +360,30 @@ pub fn send_terminate(
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            // force kill if still alive (same PID, same starttime, still running)
-            let _ = unsafe {
-                kill(pid as i32, 9 /* SIGKILL */)
-            };
-            remove_pid_file(service_name, data_dir);
+            // Poll loop timed out and the PID is still "alive". Only
+            // escalate to SIGKILL when we have a validated starttime (modern
+            // two-line PID file): that proves the still-alive PID is the
+            // same daemon, not a reused unrelated process. When
+            // expected_starttime is None (legacy PID file), the poll loop
+            // only checked plain liveness and cannot rule out PID reuse, so
+            // SIGKILL is refused to avoid killing an innocent reused PID
+            // (fail-SAFE). The operator must investigate manually; the
+            // SIGTERM was already delivered.
+            if should_sigkill(expected_starttime) {
+                let _ = unsafe {
+                    kill(pid as i32, 9 /* SIGKILL */)
+                };
+                remove_pid_file(service_name, data_dir);
+            } else {
+                tracing::warn!(
+                    pid,
+                    "PID file has no starttime (legacy format); refusing SIGKILL to avoid \
+                     killing an unrelated reused PID. Manual investigation required."
+                );
+                // Do NOT SIGKILL — return without escalating. The SIGTERM
+                // was already sent. Leave PID file removal to the operator
+                // since we cannot prove the live PID is still our daemon.
+            }
             Ok(())
         } else {
             Err(XhjobError::Io(std::io::Error::other(format!(
@@ -575,5 +631,27 @@ mod tests {
             "two-line PID file must parse with pid + starttime"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repro_send_terminate_no_sigkill_on_legacy_pid() {
+        // Regression for the High-severity PID-reuse bug: when the PID file
+        // is in legacy single-line format, read_pid yields starttime=None and
+        // send_terminate's poll loop degrades to plain kill(pid,0) liveness.
+        // After the poll timeout, escalating to SIGKILL on a still-alive PID
+        // would kill an UNRELATED reused process (catastrophic when run as
+        // root). The fix extracts the SIGKILL-escalation DECISION into
+        // should_sigkill(), which must refuse SIGKILL when starttime is None
+        // (fail-SAFE) and only permit it when a starttime was recorded (modern
+        // two-line PID file, where starttime validation proves the PID is
+        // still the daemon).
+        assert!(
+            !should_sigkill(None),
+            "legacy PID (no starttime) must not SIGKILL — possible PID reuse"
+        );
+        assert!(
+            should_sigkill(Some(123_456_789)),
+            "modern PID with starttime may SIGKILL after validation"
+        );
     }
 }

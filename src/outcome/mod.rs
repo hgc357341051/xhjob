@@ -86,6 +86,17 @@ pub struct StateInfo {
     /// workdays_only (F-3): fire only on Mon-Fri.
     #[serde(default)]
     pub workdays_only: bool,
+    /// execution_lease: PID of the worker process currently executing this
+    /// task (set at spawn time by the shell executor). None when the task is
+    /// not Running or the executor did not register a lease. Exposed via
+    /// `xhjob_state()` so PHP callers can observe that the lease was written
+    /// and verify crash-recovery behavior end-to-end.
+    #[serde(default)]
+    pub worker_pid: Option<u32>,
+    /// execution_lease: process starttime paired with worker_pid for PID-reuse
+    /// protection. None when worker_pid is None.
+    #[serde(default)]
+    pub worker_starttime: Option<u64>,
 }
 
 impl StateInfo {
@@ -124,6 +135,8 @@ impl StateInfo {
             or_cron: task.or_cron.clone(),
             skip_dates: task.skip_dates.clone(),
             workdays_only: task.workdays_only,
+            worker_pid: task.worker_pid,
+            worker_starttime: task.worker_starttime,
         }
     }
 }

@@ -55,14 +55,9 @@ try {
         $state = $st['state'] ?? '?';
         $workerPid = $st['worker_pid'] ?? null;
         echo "  state={$state} worker_pid=" . var_export($workerPid, true) . "\n";
-        // xhjob_state 当前未透出 worker_pid 字段（Rust 侧 StateInfo 未含此字段），
-        // 且 worker_pid 仅在任务完成后才写入 store。此处不阻断测试——
-        // 核心断言在后续的 failed + timeout after 2s + 无残留进程。
-        if ($workerPid === null) {
-            echo "  [INFO] xhjob_state 未返回 worker_pid（已知限制），跳过 worker_pid 断言\n";
-            return 'SKIP';
-        }
-        repro_assert($workerPid > 0, "worker_pid 应 > 0，实际: " . var_export($workerPid, true));
+        // execution_lease: worker_pid 现在通过 xhjob_state() 透出（StateInfo
+        // 已含此字段，shell executor 在 spawn 时同步写入 store）。断言 lease 已写入。
+        repro_assert($workerPid !== null && $workerPid > 0, "worker_pid 应 > 0，实际: " . var_export($workerPid, true));
     });
 
     // 等待硬超时触发（timeout=2s + reap 余量）

@@ -90,21 +90,28 @@ impl Executor for ShellExecutor {
             // execution_lease: write worker_pid + worker_starttime to the store
             // immediately after spawn (NOT after task completion) so daemon
             // crash recovery can detect an orphan child still running the task.
-            // Uses tokio::spawn (fire-and-forget) so the lease write does not
-            // block task execution; the write completes before any crash could
-            // matter because spawn happens before wait.
+            //
+            // P0 fix: the lease write is AWAITED inline (not fire-and-forget
+            // tokio::spawn) so the row is persisted before any crash window
+            // opens. The old code spawned the write and dropped the JoinHandle,
+            // claiming "the write completes before any crash could matter
+            // because spawn happens before wait" — this was FALSE: tokio::spawn
+            // only schedules the task and the runtime may delay it. If the
+            // daemon was SIGKILL'd/OOM-killed between child.spawn() and the
+            // SQLite UPDATE completing, the lease row was never persisted, and
+            // reset_running_to_pending saw worker_pid = NULL → reset the
+            // still-running orphan to Pending → DUPLICATE EXECUTION. Awaiting
+            // the single UPDATE here (sub-millisecond for SQLite / in-memory)
+            // guarantees the lease is durable before we enter the wait/timeout
+            // path, which is the entire point of execution_lease.
             if let (Some(pid), Some(store)) = (child_pid, &store) {
-                let store = Arc::clone(store);
-                let task_id = task.id.clone();
                 let starttime = crate::daemon::process_starttime(pid);
-                tokio::spawn(async move {
-                    if let Err(e) = store
-                        .update_worker_pid(&task_id, Some(pid), starttime)
-                        .await
-                    {
-                        tracing::warn!(task_id = %task_id, error = %e, "update_worker_pid at spawn failed");
-                    }
-                });
+                if let Err(e) = store
+                    .update_worker_pid(&task.id, Some(pid), starttime)
+                    .await
+                {
+                    tracing::warn!(task_id = %task.id, error = %e, "update_worker_pid at spawn failed");
+                }
             }
 
             // Feed stdin to the child in its own task so it does not block
@@ -753,6 +760,65 @@ mod tests {
             elapsed.as_secs() < 5,
             "hard timeout should fire at ~2s, took {:?}",
             elapsed
+        );
+    }
+
+    /// Repro / regression for the execution_lease P0 bug:
+    /// `execute_with_lease` previously wrote worker_pid via a fire-and-forget
+    /// `tokio::spawn` whose JoinHandle was dropped. `tokio::spawn` only
+    /// *schedules* the task; the runtime may defer it. If the daemon was
+    /// SIGKILL'd/OOM-killed between `child.spawn()` and the SQLite UPDATE
+    /// completing, the lease row was never persisted, so on recovery
+    /// `reset_running_to_pending` saw `worker_pid = NULL` → treated the
+    /// still-running orphan as dead → reset to Pending → re-dispatched →
+    /// DUPLICATE EXECUTION. This defeated the entire purpose of
+    /// execution_lease.
+    ///
+    /// The fix awaits `update_worker_pid` inline before entering the
+    /// wait/timeout path. This test LOCKS IN the synchronous-lease-write
+    /// invariant: after `execute_with_lease` returns, the store MUST already
+    /// have `worker_pid` set. With the old fire-and-forget code the spawned
+    /// update might not have run yet by the time the future resolved
+    /// (non-deterministic), so this assertion was racy; with the inline await
+    /// it is guaranteed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repro_lease_persisted_before_wait() {
+        use crate::executor::Executor;
+        use crate::store::{InMemoryStore, Task, TaskStore, TaskType};
+        use std::sync::Arc;
+
+        // Fast shell command; timeout=5 is a generous upper bound so the test
+        // never hits the hard-kill path.
+        let mut task = Task::new(TaskType::Shell, serde_json::json!({"cmd": "echo hi"}));
+        task.timeout = 5;
+
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        // insert_task is required: InMemoryStore::update_worker_pid silently
+        // no-ops on an unknown id, so the task row must exist before dispatch
+        // for the lease write to take effect.
+        store
+            .insert_task(task.clone())
+            .await
+            .expect("insert_task should succeed");
+
+        let _result = ShellExecutor
+            .execute_with_lease(&task, None, Some(Arc::clone(&store)))
+            .await
+            .expect("execute_with_lease should succeed");
+
+        // The lease (worker_pid) must be persisted synchronously, before
+        // execute_with_lease returns. A NULL worker_pid here means a crash in
+        // the spawn→wait window would lose the lease and cause duplicate
+        // execution on recovery.
+        let reloaded = store
+            .load_task(&task.id)
+            .await
+            .expect("load_task should succeed")
+            .expect("task should still be present in the store");
+        assert!(
+            reloaded.worker_pid.is_some(),
+            "lease (worker_pid) must be persisted before execute_with_lease returns; got None"
         );
     }
 }

@@ -363,6 +363,18 @@ impl CronScheduler {
             if task.paused || task.cancel_requested {
                 continue;
             }
+            // Skip Interrupted tasks. Interrupted is NOT terminal — the
+            // watchdog (hung task) or graceful-shutdown path
+            // (`mark_running_as_interrupted`) leaves the task in this state
+            // while the original executor future winds down or awaits
+            // restart recovery. Re-firing it from the cron tick would cause
+            // duplicate dispatch (allow_overlap=true) or a wasted dropped
+            // re-fire (max_instances=1). The task will resume firing only
+            // after `reset_running_to_pending` (daemon restart) or a manual
+            // `requeue_task` resets it to Pending.
+            if task.state == TaskState::Interrupted {
+                continue; // watchdog handling; do not re-fire
+            }
             // Skip if start_date is set and now < start_date (cron tick before start).
             // Reference: APScheduler start_date.
             if let Some(start_ts) = task.start_date {
@@ -779,6 +791,58 @@ mod tests {
             due.is_empty(),
             "cancel_requested task should be skipped, got {:?}",
             due
+        );
+    }
+
+    /// Repro: a cron task left in the `Interrupted` state by the watchdog
+    /// (hung task) or by graceful shutdown (`mark_running_as_interrupted`)
+    /// must NOT be re-fired by `scan_once`. Interrupted is NOT terminal, so
+    /// without an explicit skip guard the task falls through every existing
+    /// filter (paused / cancel_requested / start_date / end_date / expires —
+    /// expires only matches Pending) and — when `next_fire <= now` — gets
+    /// pushed to `due` and re-enqueued. For `allow_overlap=true` this causes
+    /// duplicate dispatch while the original executor future is still winding
+    /// down; for `max_instances=1` it becomes a wasted dropped re-fire.
+    ///
+    /// The fix adds a state-based skip guard: `if task.state ==
+    /// TaskState::Interrupted { continue; }`. The task resumes firing only
+    /// after `reset_running_to_pending` (daemon restart) or a manual
+    /// `requeue_task` resets it to Pending.
+    #[tokio::test]
+    async fn repro_scan_once_skips_interrupted_task() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let now = now_ts();
+        // next_fire in the past so the task is "due" by the time-based check.
+        let slightly_behind = now.saturating_sub(5);
+        let mut task = make_cron_task("t-interrupted", "*/1 * * * *", slightly_behind, true);
+        // Simulate the watchdog / graceful-shutdown path having left the task
+        // Interrupted (NOT terminal, so load_active_tasks still returns it).
+        task.state = TaskState::Interrupted;
+        store.insert_task(task).await.unwrap();
+
+        // Sanity: the Interrupted task is still in the active set (otherwise
+        // the bug would be invisible — terminal tasks are already filtered by
+        // load_active_tasks). This guarantees scan_once actually evaluates it.
+        let active = store.load_active_tasks().await.unwrap();
+        assert!(
+            active.iter().any(|t| t.id == "t-interrupted"),
+            "Interrupted task must still appear in load_active_tasks for the test to exercise scan_once"
+        );
+
+        let sched = CronScheduler::new(Arc::clone(&store));
+        let due = sched.scan_once().await.unwrap();
+        assert!(
+            due.is_empty(),
+            "Interrupted task must NOT be re-fired by scan_once (would cause duplicate dispatch / wasted re-fire), got {:?}",
+            due
+        );
+
+        // The task must remain Interrupted (scan_once must not transition it).
+        let loaded = store.load_task("t-interrupted").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.state,
+            TaskState::Interrupted,
+            "scan_once must not mutate the state of an Interrupted task"
         );
     }
 

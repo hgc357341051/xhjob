@@ -10,7 +10,7 @@ return [
     'service_name' => env('XHJOB_SERVICE', 'default'),
     // 数据目录（默认 null 由扩展内置）
     'data_dir'     => env('XHJOB_DATA_DIR', null),
-    // API Token（可选，用于后续 HTTP 网关鉴权）
+    // API Token（必填：/xhjob/* HTTP 网关鉴权用；未配置时 XhjobAuth 中间件 fail closed 拒绝所有请求）
     'api_token'    => env('XHJOB_API_TOKEN', null),
 
     // 任务执行池模式：

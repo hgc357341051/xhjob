@@ -49,22 +49,33 @@
 - [ ] 全量 repro 脚本与 cargo test 回归通过
 
 ## 阶段六：5 维度 100% 验证
-- [ ] 正确率：`php tp/repro/runner.php` 0 FAIL/0 CRASH
-- [ ] 正确率：`cargo test --all-features` 全通过
-- [ ] 代码质量：`cargo clippy --all-targets --all-features -- -D warnings` 零警告
-- [ ] 代码质量：`cargo fmt --all -- --check` 干净
-- [ ] 功能完善度：cron/interval/runAt 端到端跑通
-- [ ] 功能完善度：or_cron/skip_dates/workdays_only 端到端跑通
-- [ ] 功能完善度：retry/timeout/cancel 端到端跑通
-- [ ] 功能完善度：chain/group/chord 端到端跑通
-- [ ] 功能完善度：rate_limit/overlap/max_instances 端到端跑通
-- [ ] 功能完善度：persist+加密端到端跑通
-- [ ] 功能完善度：watchdog 假死检测端到端跑通
-- [ ] 功能完善度：execution_lease + crash recovery 端到端跑通
-- [ ] 功能完善度：progress 端到端跑通
-- [ ] 功能完善度：multi-tenant owner 端到端跑通
-- [ ] 功能完善度：token 鉴权端到端跑通
-- [ ] bug 率：已知 bug = 0（发现数 = 复现+修正数）
-- [ ] 错误率：全量执行零 panic
-- [ ] 错误率：全量执行零未捕获异常
-- [ ] 错误率：全量执行零进程残留（daemon/zombie 清理干净）
+- [x] 正确率：`php tp/repro/runner.php` 0 FAIL/0 CRASH（12 脚本 88 PASS / 0 FAIL / 0 SKIP）
+- [x] 正确率：`cargo test --all-features` 全通过（171 passed; 0 failed）
+- [x] 代码质量：`cargo clippy --all-targets --all-features -- -D warnings` 零警告
+- [x] 代码质量：`cargo fmt --all -- --check` 干净
+- [x] 功能完善度：cron/interval/runAt 端到端跑通
+- [x] 功能完善度：or_cron/skip_dates/workdays_only 端到端跑通
+- [x] 功能完善度：retry/timeout/cancel 端到端跑通
+- [x] 功能完善度：chain/group/chord 端到端跑通
+- [x] 功能完善度：rate_limit/overlap/max_instances 端到端跑通
+- [x] 功能完善度：persist+加密端到端跑通
+- [x] 功能完善度：watchdog 假死检测端到端跑通（repro_01）
+- [x] 功能完善度：execution_lease + crash recovery 端到端跑通（repro_03/11）
+- [x] 功能完善度：progress 端到端跑通
+- [x] 功能完善度：multi-tenant owner 端到端跑通
+- [x] 功能完善度：token 鉴权端到端跑通（repro_12）
+- [x] bug 率：已知 bug = 0（发现数 = 复现+修正数）
+- [x] 错误率：全量执行零 panic
+- [x] 错误率：全量执行零未捕获异常
+- [x] 错误率：全量执行零进程残留（daemon/zombie 清理干净）
+
+## 阶段六附注：本轮修复的关键根因
+1. **构建配置**：`persist` feature 为 optional，必须用 `cargo build --release --all-features`
+   才能启用 SqliteStore；否则 daemon 退回 InMemoryStore，崩溃后任务全丢，lease/watchdog/
+   crash-recovery 全部失效。runner.php 已依赖 --all-features 产物。
+2. **EventType serde 不一致（本轮新发现并修复）**：`#[serde(rename_all = "lowercase")]`
+   将 `LeaseHeld` 序列化为 `"leaseheld"`，而 `as_str()` 返回 `"lease_held"`（DB 存后者）。
+   导致 PHP 客户端 `xhjob_events()` 拿到的 event_type 与 DB/文档不一致，`lease_held` /
+   `hung_detected` / `rate_limited` / `max_instances_reached` 事件在 PHP 侧无法匹配。
+   修复：手写 Serialize/Deserialize 委托 `as_str()`/`from_str()`，保证 DB-JSON 字节一致。
+   回归：repro_03 LeaseHeld 断言由 FAIL 转 PASS；171 cargo test 全绿。

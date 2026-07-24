@@ -66,14 +66,10 @@ try {
         repro_assert(($st['state'] ?? '') === 'running', "任务应为 running，实际: " . ($st['state'] ?? '?'));
         $workerPid = $st['worker_pid'] ?? null;
         echo "  worker_pid=" . var_export($workerPid, true) . "\n";
-        // 已知限制：xhjob_state 未在 Running 期间透出 worker_pid（Rust 侧
-        // StateInfo 未含此字段，store 仅任务完成后写入）。SKIP 此断言，
-        // 后续 lease 相关断言也相应 SKIP。
-        if ($workerPid === null) {
-            echo "  [INFO] xhjob_state 未返回 worker_pid（Rust 侧已知限制），SKIP lease 相关断言\n";
-            return 'SKIP';
-        }
-        repro_assert($workerPid > 0, "worker_pid 应 > 0，实际: " . var_export($workerPid, true));
+        // execution_lease: worker_pid + worker_starttime 现在通过
+        // xhjob_state() 透出（StateInfo 已含这两个字段，由 shell executor
+        // 在 spawn 时同步写入 store）。断言 lease 已写入。
+        repro_assert($workerPid !== null && $workerPid > 0, "worker_pid 应 > 0，实际: " . var_export($workerPid, true));
     });
 
     // 记录 orphan PID 用于清理（若 worker_pid 可用）

@@ -122,6 +122,31 @@ pub async fn refresh_state(
         _ => {}
     }
 
+    let total = record.header_task_ids.len() as u32;
+    let now = now_ts() as i64;
+
+    // Bug 2: empty chord (header = []). Per Celery semantics `chord([])` is
+    // a no-op that completes immediately. There is no header work to
+    // aggregate and no results to pass to a callback, so transition straight
+    // to the terminal "success" state WITHOUT dispatching the callback.
+    // Dispatching here would require parsing `callback_json`, which for an
+    // empty chord is often a placeholder (e.g. "{}") that fails
+    // `TaskBuilder::build()` (no task_type set) — so the minimal safe fix is
+    // to mark success and let the caller dispatch the callback if it
+    // actually needs one. Without this guard the chord falls through to
+    // "running" (because `failed > 0` is false and
+    // `succeeded == total && total > 0` is false) and is stuck "running"
+    // forever — the callback never dispatches.
+    if total == 0 {
+        store
+            .update_chord_state(chord_id, "success", None, now)
+            .await?;
+        return Ok(ChordRefreshResult {
+            new_state: "success",
+            callback_task_id: None,
+        });
+    }
+
     let mut succeeded = 0u32;
     let mut failed = 0u32;
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -147,14 +172,20 @@ pub async fn refresh_state(
                         results.push(serde_json::json!({"id": tid, "result": null}));
                     }
                 }
-                TaskState::Failed | TaskState::Expired | TaskState::Cancelled => failed += 1,
+                // Bug 1: `Interrupted` (hung task killed by the watchdog, or a
+                // Running task left behind on graceful shutdown) is a failure
+                // outcome for the chord header. It is deliberately NOT in
+                // `is_terminal()` (store/mod.rs) so crash recovery can reset
+                // it, but here we must treat it as failed — otherwise
+                // `succeeded < total` forever and the callback never dispatches.
+                TaskState::Failed
+                | TaskState::Expired
+                | TaskState::Cancelled
+                | TaskState::Interrupted => failed += 1,
                 _ => {}
             }
         } // else: task not found — treat as pending
     }
-
-    let total = record.header_task_ids.len() as u32;
-    let now = now_ts() as i64;
 
     if failed > 0 {
         store
@@ -209,18 +240,20 @@ mod tests {
     use crate::store::{InMemoryStore, Task, TaskType};
     use serde_json::json;
 
-    /// Empty chord (no header tasks) — refresh_state returns "pending" and
-    /// never dispatches the callback (nothing to wait for, nothing to
-    /// aggregate). This matches Celery's `chord([])` no-op behavior.
+    /// Empty chord (no header tasks) — per Celery `chord([])` no-op
+    /// semantics, refresh_state completes immediately: it transitions the
+    /// chord to the terminal "success" state and does NOT dispatch a
+    /// callback (no header work to aggregate). Previously this fell through
+    /// to "running" and hung forever.
     #[tokio::test]
-    async fn test_refresh_empty_chord_returns_pending() {
+    async fn test_refresh_empty_chord_completes() {
         let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
         store
             .create_chord("c-empty", &[], "{}", now_ts() as i64)
             .await
             .unwrap();
         let r = refresh_state(&store, "c-empty").await.unwrap();
-        assert_eq!(r.new_state, "running");
+        assert_eq!(r.new_state, "success");
         assert!(r.callback_task_id.is_none());
     }
 
@@ -369,5 +402,57 @@ mod tests {
         let r = refresh_state(&store, "c-term").await.unwrap();
         assert_eq!(r.new_state, "partial_failed");
         assert!(r.callback_task_id.is_none());
+    }
+
+    /// Bug 1 repro: a chord whose sole header task is `Interrupted` (e.g. a
+    /// hung task the watchdog killed) must reach a failure terminal state
+    /// (`partial_failed`) with the callback NOT dispatched, instead of
+    /// hanging in "running" forever (because `Interrupted` used to fall into
+    /// the `_ => {}` arm and `succeeded < total` never resolved).
+    #[tokio::test]
+    async fn repro_chord_interrupted_header_completes() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        let mut t1 = Task::new(TaskType::Shell, json!({"cmd":"a"}));
+        t1.id = "h1".to_string();
+        t1.state = TaskState::Interrupted;
+        store.insert_task(t1).await.unwrap();
+
+        let callback = TaskBuilder::new().via_shell("echo done").to_json();
+        store
+            .create_chord("c-int", &["h1".to_string()], &callback, now_ts() as i64)
+            .await
+            .unwrap();
+
+        let r = refresh_state(&store, "c-int").await.unwrap();
+        assert_ne!(r.new_state, "running");
+        assert_eq!(r.new_state, "partial_failed");
+        assert!(
+            r.callback_task_id.is_none(),
+            "callback must NOT dispatch when a header task failed/interrupted"
+        );
+        let rec = store.get_chord("c-int").await.unwrap().unwrap();
+        assert_eq!(rec.state, "partial_failed");
+        assert!(rec.callback_task_id.is_none());
+    }
+
+    /// Bug 2 repro: an empty chord (header = `&[]`) must complete
+    /// immediately (per Celery `chord([])` no-op semantics) by reaching the
+    /// terminal "success" state, instead of being stuck in "running" forever
+    /// (because `failed > 0` was false and `succeeded == total && total > 0`
+    /// was false, so it fell through to "running").
+    #[tokio::test]
+    async fn repro_empty_chord_completes() {
+        let store: Arc<dyn TaskStore> = Arc::new(InMemoryStore::new());
+        store
+            .create_chord("c-empty-repro", &[], "{}", now_ts() as i64)
+            .await
+            .unwrap();
+        let r = refresh_state(&store, "c-empty-repro").await.unwrap();
+        assert_ne!(r.new_state, "running");
+        assert_eq!(r.new_state, "success");
+        assert!(r.callback_task_id.is_none());
+        let rec = store.get_chord("c-empty-repro").await.unwrap().unwrap();
+        assert_eq!(rec.state, "success");
+        assert!(rec.callback_task_id.is_none());
     }
 }

@@ -56,7 +56,17 @@ pub async fn summarize(
             match store.load_task(&id).await {
                 Ok(Some(t)) => match t.state {
                     TaskState::Success => succeeded += 1,
-                    TaskState::Failed | TaskState::Cancelled | TaskState::Expired => failed += 1,
+                    // Bug 1: `Interrupted` (a hung task the watchdog killed, or
+                    // a Running task left behind on graceful shutdown) is a
+                    // failure outcome for the group. It is deliberately NOT in
+                    // `is_terminal()` (store/mod.rs) so crash recovery can
+                    // reset it, but here we must treat it as failed —
+                    // otherwise `pending > 0` keeps the group "running"
+                    // forever and it never reaches success/failed/partial_failed.
+                    TaskState::Failed
+                    | TaskState::Cancelled
+                    | TaskState::Expired
+                    | TaskState::Interrupted => failed += 1,
                     _ => pending += 1,
                 },
                 _ => pending += 1,
@@ -162,6 +172,30 @@ mod tests {
             .await
             .unwrap();
         let state = refresh_state(&store, "g-af").await.unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    /// Bug 1 repro: a group whose sole member task is `Interrupted` (e.g. a
+    /// hung task the watchdog killed) must reach a failure terminal state
+    /// (`failed` when all members failed) instead of hanging in "running"
+    /// forever (because `Interrupted` used to fall into the `_ => pending`
+    /// arm and `pending > 0` kept the group "running").
+    #[tokio::test]
+    async fn repro_group_interrupted_member_completes() {
+        let store: std::sync::Arc<dyn TaskStore> = std::sync::Arc::new(InMemoryStore::new());
+        let mut t1 = Task::new(TaskType::Shell, json!({"cmd":"a"}));
+        t1.id = "t1".to_string();
+        t1.state = TaskState::Interrupted;
+        store.insert_task(t1).await.unwrap();
+        let tasks = vec![json!({"id":"t1"})];
+        store
+            .create_group("g-int", &tasks, now_ts() as i64)
+            .await
+            .unwrap();
+        let (total, ok, fail, pend) = summarize(&store, "g-int").await.unwrap();
+        assert_eq!((total, ok, fail, pend), (1, 0, 1, 0));
+        let state = refresh_state(&store, "g-int").await.unwrap();
+        assert_ne!(state, "running");
         assert_eq!(state, "failed");
     }
 }

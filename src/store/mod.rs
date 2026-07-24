@@ -530,8 +530,17 @@ pub struct WorkerStats {
 
 /// Event types emitted during task lifecycle (A17).
 /// Reference: APScheduler EVENT_JOB_* constants.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+///
+/// Serialization: implemented manually via `as_str()` / `from_str()` so the
+/// JSON wire format is byte-identical to the string stored in the SQLite
+/// `events.event_type` column. The previous `#[serde(rename_all =
+/// "lowercase")]` derived impl lowercased the Rust variant identifier
+/// verbatim, producing mismatched strings for multi-word variants
+/// (`LeaseHeld` -> `"leaseheld"` in JSON vs `"lease_held"` in the DB). That
+/// mismatch made PHP clients unable to match `lease_held` / `hung_detected`
+/// / `rate_limited` / `max_instances_reached` events returned by
+/// `xhjob_events()`, silently dropping them from filters and dashboards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     Started,
     Succeeded,
@@ -561,6 +570,31 @@ pub enum EventType {
     /// re-queueing it to avoid duplicate execution by the new daemon while
     /// the orphan child is still running.
     LeaseHeld,
+    /// Unknown event type. Used as a placeholder when an event row in the
+    /// store carries an `event_type` string that does not parse to any known
+    /// variant (e.g. an event recorded by a newer daemon version, or a
+    /// corrupted/migrated row). Surfacing it as `Unknown` (rather than
+    /// silently rewriting it as `Started`) keeps dashboards / audit logs
+    /// honest: the row is preserved but explicitly flagged as unrecognized.
+    Unknown,
+}
+
+impl Serialize for EventType {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        EventType::from_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 impl EventType {
@@ -579,6 +613,7 @@ impl EventType {
             EventType::Interrupted => "interrupted",
             EventType::HungDetected => "hung_detected",
             EventType::LeaseHeld => "lease_held",
+            EventType::Unknown => "unknown",
         }
     }
     #[allow(clippy::should_implement_trait)]
@@ -597,6 +632,7 @@ impl EventType {
             "interrupted" => Ok(EventType::Interrupted),
             "hung_detected" => Ok(EventType::HungDetected),
             "lease_held" => Ok(EventType::LeaseHeld),
+            "unknown" => Ok(EventType::Unknown),
             other => Err(XhjobError::store(format!("unknown event type: {}", other))),
         }
     }
