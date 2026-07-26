@@ -51,6 +51,55 @@ extension=/path/to/libxhjob.so
 
 或运行时通过 `-d extension=target/release/libxhjob.so` 加载。
 
+### 确认加载的 .so 版本（重要）
+
+PHP-FPM 替换 `.so` 后**必须重启 FPM**，否则 worker 进程仍持有旧 mmap 的 `.so`。可通过 `xhjob_diag()` 返回的 JSON 字段确认实际加载的版本：
+
+```php
+$diag = json_decode(xhjob_diag('your-service', '/tmp/xhjob-your-service'), true);
+
+// 1. 检查 xhjob_so_info 字段是否存在
+//    - 若不存在 → 加载的是 v2 之前的旧 .so，需重新安装 + 重启 FPM
+if (!isset($diag['xhjob_so_info'])) {
+    echo "加载的是旧版 .so，请重新安装并重启 FPM\n";
+} else {
+    $so = $diag['xhjob_so_info'];
+    echo "实际加载的 .so 路径: " . ($so['path'] ?? '(null)') . "\n";
+    echo "文件大小: " . ($so['size_bytes'] ?? 0) . " bytes\n";
+    echo "mtime: " . date('Y-m-d H:i:s', $so['mtime_epoch'] ?? 0) . "\n";
+    // 比对 releases/xhjob-php8.2-linux-x86_64.so 的 size + mtime
+}
+
+// 2. 检查 php_binary_raw 字段是否存在
+//    - 若不存在 → 同样是旧版 .so
+//    - 若存在但 == php_binary → CLI 解析未触发替换（可能本就是 CLI 上下文）
+//    - 若存在且 != php_binary → FPM 上下文已正确替换为 CLI php
+echo "php_binary (resolved): " . $diag['php_binary'] . "\n";
+echo "php_binary_raw (current_exe): " . ($diag['php_binary_raw'] ?? '(字段不存在→旧版.so)') . "\n";
+
+// 3. 检查 php_binary_candidates 字段（v2 新增）
+//    列出所有探测过的 CLI php 候选 + 失败原因，便于定位为什么 resolved 是某路径
+if (isset($diag['php_binary_candidates'])) {
+    foreach ($diag['php_binary_candidates'] as $c) {
+        echo "  candidate: {$c['path']} valid=" . ($c['valid'] ? 'true' : 'false') . " reason={$c['reason']}\n";
+    }
+}
+```
+
+**如果 `xhjob_so_info` 或 `php_binary_raw` 字段不存在**，说明 PHP-FPM 加载的是 v2 之前的旧 `.so`。修复步骤：
+
+```bash
+# 1. 把新 .so 复制到 PHP 扩展目录（用 php-config --extension-dir 查路径）
+cp releases/xhjob-php8.2-linux-x86_64.so $(php-config --extension-dir)/xhjob.so
+
+# 2. 重启 PHP-FPM（宝塔环境）
+/etc/init.d/php-fpm-82 reload
+# 或 systemctl restart php-fpm
+
+# 3. 验证
+php -r 'echo xhjob_diag("test", "/tmp/xhjob-test");' | jq .xhjob_so_info
+```
+
 ## 两种任务执行池模式
 
 ### 术语澄清

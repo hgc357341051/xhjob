@@ -32,7 +32,7 @@ pub fn spawn_via_double_fork(
     // with status 64 (EX_USAGE). `resolve_php_binary()` returns the resolved
     // CLI binary (via env override / sibling lookup / PATH) plus the raw
     // `current_exe()` for diagnostics.
-    let (exe, _raw_exe) = super::resolve_php_binary();
+    let (exe, _raw_exe, _candidates) = super::resolve_php_binary();
 
     tracing::info!(
         ?exe,

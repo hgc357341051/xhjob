@@ -775,12 +775,24 @@ pub(crate) fn current_gid() -> u32 {
 // fallback), so the spawned daemon receives a binary that actually accepts
 // the `-r`/`-d` CLI flags.
 
+/// One probed PHP binary candidate during `resolve_php_binary`. Recorded so
+/// `xhjob_diag()` can expose the full probe history to operators (which
+/// candidates were tried, whether each validated, and the failure reason
+/// when it did not). This lets users see exactly why a particular binary
+/// was chosen (or why resolution fell back to `current_exe()`).
+#[derive(Debug, Clone)]
+pub(crate) struct PhpBinaryCandidate {
+    pub path: std::path::PathBuf,
+    pub valid: bool,
+    pub reason: String,
+}
+
 /// Resolve the CLI PHP binary to use for daemon spawn, accounting for the
 /// case where `current_exe()` returns the FPM/CGI/lsphp SAPI binary (which
 /// does not accept `-r`/`-d` CLI flags and causes daemon startup to fail
 /// with exit code 64 EX_USAGE).
 ///
-/// Returns `(resolved, raw)`:
+/// Returns `(resolved, raw, candidates)`:
 /// - `raw` = `std::env::current_exe()` result (or empty `PathBuf` on error).
 /// - `resolved` is computed by priority:
 ///   1. `XHJOB_PHP_BINARY` env var (if set, non-empty, points to an existing
@@ -794,13 +806,82 @@ pub(crate) fn current_gid() -> u32 {
 ///      pass `validate_php_binary()`:
 ///        - `<raw_dir>/php` (same directory as raw, e.g. `/www/server/php/82/sbin/php`)
 ///        - `<raw_dir>/../bin/php` (BT/aapanel convention, e.g. `/www/server/php/82/bin/php`)
+///        - `<raw_dir>/../sbin/php` (covers sbin/bin sibling layout)
 ///        - `which_php()` result (PATH lookup)
 ///   4. If all candidates fail (or raw itself failed step 2), fall back to
 ///      `raw` to preserve current behavior so diagnostics keep exposing the
 ///      problem rather than silently succeeding. A warning is logged listing
-///      every candidate tried.
-pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf) {
+///      every candidate tried with its failure reason.
+/// - `candidates` lists every probe attempted (env, sibling, which, ...) with
+///   its validation result and failure reason — used by `xhjob_diag()` so
+///   operators can see why a particular binary was resolved.
+///
+/// Candidate paths are deduplicated by `Path::canonicalize()` (or by raw path
+/// string when canonicalize fails) so layouts where `<raw_dir>/php` and
+/// `<raw_dir>/../bin/php` resolve to the same file do not produce duplicate
+/// entries in the candidates vec.
+pub(crate) fn resolve_php_binary() -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<PhpBinaryCandidate>,
+) {
     let raw = std::env::current_exe().unwrap_or_default();
+    let mut candidates: Vec<PhpBinaryCandidate> = Vec::new();
+
+    // Helper: canonical key for dedup. Uses canonicalize() when possible,
+    // falls back to the raw path string for non-existent paths (so two
+    // distinct non-existent paths still produce distinct keys).
+    let canonical_key = |p: &std::path::Path| -> String {
+        p.canonicalize()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+    };
+    // Helper: compute the inline failure reason for a candidate path using
+    // the same static checks as `validate_php_binary`. Returns "ok" if the
+    // path validates, "not a file" / "not executable" otherwise.
+    let reason_for = |cand: &std::path::Path| -> String {
+        if !cand.is_file() {
+            return "not a file".to_string();
+        }
+        if !validate_php_binary(cand) {
+            return "not executable".to_string();
+        }
+        "ok".to_string()
+    };
+    // Helper: record a candidate (with dedup) and return true if it validated.
+    // `reason_override` is used when the caller already knows the reason
+    // (e.g. env override failure has a different reason string).
+    let mut record = |cand: std::path::PathBuf,
+                      reason_override: Option<String>,
+                      source: &str| -> bool {
+        let key = canonical_key(&cand);
+        if candidates.iter().any(|c| canonical_key(&c.path) == key) {
+            // Dedup: skip if we already probed the same canonical path.
+            return false;
+        }
+        let reason = reason_override
+            .unwrap_or_else(|| reason_for(&cand));
+        // `valid` is true iff the candidate actually passed validation.
+        // "ok" is the success reason from `reason_for`; the only other
+        // success case is the `current_exe is CLI php` override (which
+        // marks raw as a known-good CLI binary). All other override
+        // strings (e.g. "XHJOB_PHP_BINARY env var; validation failed")
+        // are failure reasons.
+        let valid = reason == "ok" || reason == "current_exe is CLI php";
+        tracing::debug!(
+            candidate = %cand.display(),
+            source = %source,
+            valid = valid,
+            reason = %reason,
+            "probed PHP binary candidate"
+        );
+        candidates.push(PhpBinaryCandidate {
+            path: cand,
+            valid,
+            reason,
+        });
+        valid
+    };
 
     // Step 1: env override.
     if let Ok(env_path) = std::env::var("XHJOB_PHP_BINARY") {
@@ -811,12 +892,21 @@ pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf) {
                 source = "XHJOB_PHP_BINARY",
                 "trying PHP binary candidate"
             );
-            if validate_php_binary(&candidate) {
+            // For env override, use a custom failure reason so the operator
+            // can see the env var was the source.
+            let inline_reason = reason_for(&candidate);
+            let reason_override = if inline_reason == "ok" {
+                None
+            } else {
+                Some("XHJOB_PHP_BINARY env var; validation failed".to_string())
+            };
+            let validated = record(candidate.clone(), reason_override, "XHJOB_PHP_BINARY");
+            if validated {
                 tracing::debug!(
                     candidate = %candidate.display(),
                     "XHJOB_PHP_BINARY validated; using it"
                 );
-                return (candidate, raw);
+                return (candidate, raw, candidates);
             }
             tracing::warn!(
                 candidate = %candidate.display(),
@@ -826,62 +916,69 @@ pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf) {
     }
 
     // Step 2: if raw's filename is itself a CLI php binary, use it directly.
+    // Do NOT record raw as a candidate when it's NOT a CLI php binary (it's
+    // the fallback, not a probe).
     if is_cli_php_binary(&raw) {
         tracing::debug!(
             candidate = %raw.display(),
             source = "current_exe",
             "raw exe is a CLI php binary; using it directly"
         );
-        return (raw.clone(), raw);
+        // Record raw as a valid candidate with a dedicated reason so the
+        // diag JSON shows why we picked it.
+        record(
+            raw.clone(),
+            Some("current_exe is CLI php".to_string()),
+            "current_exe",
+        );
+        return (raw.clone(), raw, candidates);
     }
 
     // Step 3: try sibling/substitution candidates.
-    let mut tried: Vec<String> = Vec::new();
     if let Some(raw_dir) = raw.parent() {
-        let candidates = [
+        let sibling_candidates = [
             raw_dir.join("php"),
             raw_dir.join("..").join("bin").join("php"),
+            raw_dir.join("..").join("sbin").join("php"),
         ];
-        for cand in candidates {
-            tracing::debug!(
-                candidate = %cand.display(),
-                "trying PHP binary candidate"
-            );
-            tried.push(cand.display().to_string());
-            if validate_php_binary(&cand) {
+        for cand in sibling_candidates {
+            let validated = record(cand.clone(), None, "sibling");
+            if validated {
                 tracing::debug!(
                     candidate = %cand.display(),
                     "candidate validated; using it"
                 );
-                return (cand, raw);
+                return (cand, raw, candidates);
             }
         }
     }
     if let Some(cand) = which_php() {
-        tracing::debug!(
-            candidate = %cand.display(),
-            source = "which",
-            "trying PHP binary candidate"
-        );
-        tried.push(cand.display().to_string());
-        if validate_php_binary(&cand) {
+        let validated = record(cand.clone(), None, "which");
+        if validated {
             tracing::debug!(
                 candidate = %cand.display(),
                 "which php validated; using it"
             );
-            return (cand, raw);
+            return (cand, raw, candidates);
         }
     }
 
     // Step 4: fall back to raw so diagnostics keep exposing the problem
-    // (rather than silently succeeding with a wrong binary).
+    // (rather than silently succeeding with a wrong binary). Do NOT push raw
+    // as a candidate (it's the fallback, not a probe) — but DO log a warn
+    // listing every candidate tried + its failure reason so the operator
+    // can see why we fell back.
+    let candidates_summary: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("{} -> {}", c.path.display(), c.reason))
+        .collect();
     tracing::warn!(
         raw = %raw.display(),
-        candidates_tried = ?tried,
+        candidates_tried = ?candidates_summary,
         "no CLI php binary candidate validated; falling back to current_exe() \
          (daemon spawn may fail with exit code 64 if this is php-fpm/php-cgi)"
     );
-    (raw.clone(), raw)
+    (raw.clone(), raw, candidates)
 }
 
 /// Heuristic: does the filename of `path` look like a CLI PHP binary?
@@ -901,11 +998,42 @@ fn is_cli_php_binary(path: &std::path::Path) -> bool {
     lower.starts_with("php") && !lower.contains("fpm") && !lower.contains("cgi")
 }
 
-/// Validate a candidate PHP binary by spawning `<path> -n -v` and checking
-/// it exits 0 within 1 second.
+/// Validate a candidate PHP binary using STATIC checks only.
 ///
-/// The `-n` flag skips php.ini loading (avoids triggering "Module already
-/// loaded" warnings during validation); `-v` prints the version and exits 0.
+/// Static check only (is_file + executable bit on Unix). Does NOT spawn a
+/// child process — spawning in PHP-FPM context is unreliable (PATH reset,
+/// SELinux, disable_functions may block spawn), and a successful spawn here
+/// wouldn't guarantee daemon spawn succeeds anyway. Let the daemon spawn
+/// itself surface real failures via `check_child_alive` + exit-64 hint.
+///
+/// Returns `false` on:
+///   - missing path / not a regular file
+///   - (Unix only) file is not executable (`mode & 0o111 == 0`)
+///
+/// On Windows, existence is sufficient (no executable-bit concept).
+fn validate_php_binary(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let is_exec = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if !is_exec {
+            return false;
+        }
+    }
+    true
+}
+
+/// Spawn-based validation (kept for unit-test coverage of the old logic; NOT
+/// used in production path because spawn is unreliable in FPM context).
+///
+/// Spawns `<path> -n -v` and checks it exits 0 within 1 second. The `-n`
+/// flag skips php.ini loading (avoids triggering "Module already loaded"
+/// warnings during validation); `-v` prints the version and exits 0.
 /// Returns `false` on:
 ///   - missing path / not a regular file
 ///   - any `io::Error` during spawn / wait
@@ -915,7 +1043,8 @@ fn is_cli_php_binary(path: &std::path::Path) -> bool {
 ///
 /// Polls `try_wait()` every 100ms for up to 1s (10 iterations) — no extra
 /// dependency on `wait_timeout` (which is Unix-only anyway).
-fn validate_php_binary(path: &std::path::Path) -> bool {
+#[allow(dead_code)]
+fn validate_php_binary_spawn(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -1910,6 +2039,58 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_php_binary_returns_true_for_executable_file() {
+        // Create a temp file, mark it executable (Unix), and verify the
+        // static validator returns true. We use a unique subdir so parallel
+        // test runs cannot collide.
+        let dir = unique_test_dir("validate_exec");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let path = dir.join("fake_php");
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write fake php");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod 0o755");
+        }
+        assert!(
+            validate_php_binary(&path),
+            "an existing executable file must pass static validation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_php_binary_returns_false_for_non_executable() {
+        // A non-executable regular file must fail the static validator on
+        // Unix (mode 0o644 has no execute bit).
+        let dir = unique_test_dir("validate_noexec");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let path = dir.join("fake_php_noexec");
+        std::fs::write(&path, b"not executable").expect("write fake php");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0o644");
+        assert!(
+            !validate_php_binary(&path),
+            "a non-executable file must fail static validation on Unix"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_php_binary_spawn_returns_false_for_missing() {
+        // Keep coverage of the old spawn-based validator (now renamed to
+        // `validate_php_binary_spawn` and kept only for unit-test coverage
+        // of the old logic). A missing path must short-circuit to false
+        // before spawn is even attempted.
+        assert!(!validate_php_binary_spawn(std::path::Path::new(
+            "/nonexistent/php"
+        )));
+    }
+
+    #[test]
     fn test_resolve_php_binary_respects_env_override() {
         // When XHJOB_PHP_BINARY points at a nonexistent path, validation
         // fails and resolution falls through. In the test runner the test
@@ -1920,7 +2101,7 @@ mod tests {
         std::env::set_var("XHJOB_PHP_BINARY", "/nonexistent/php");
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", "/bin:/usr/bin");
-        let (resolved, _raw) = resolve_php_binary();
+        let (resolved, _raw, _candidates) = resolve_php_binary();
         // Restore env ASAP so parallel tests depending on PATH are unaffected.
         std::env::remove_var("XHJOB_PHP_BINARY");
         match saved_path {
@@ -1950,7 +2131,7 @@ mod tests {
         std::env::remove_var("XHJOB_PHP_BINARY");
         let saved_path = std::env::var("PATH").ok();
         std::env::set_var("PATH", "/bin:/usr/bin");
-        let (resolved, raw) = resolve_php_binary();
+        let (resolved, raw, _candidates) = resolve_php_binary();
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
             None => std::env::remove_var("PATH"),
@@ -1961,6 +2142,80 @@ mod tests {
             "test binary is not `php` and PATH is constrained, so resolved must fall back to raw"
         );
         assert_eq!(raw, cur, "raw must equal current_exe()");
+    }
+
+    #[test]
+    fn test_resolve_php_binary_records_candidates() {
+        // Verify the new 3-tuple return value: candidates vec must be
+        // non-empty and every element must have a non-empty path, a bool
+        // valid flag, and a non-empty reason string. We do NOT assert
+        // specific paths (non-portable); only the structural contract.
+        //
+        // Environment setup mirrors `test_resolve_php_binary_falls_back_to_raw`:
+        // remove XHJOB_PHP_BINARY and constrain PATH to /bin:/usr/bin so the
+        // result is deterministic regardless of the dev/CI environment.
+        std::env::remove_var("XHJOB_PHP_BINARY");
+        let saved_path = std::env::var("PATH").ok();
+        std::env::set_var("PATH", "/bin:/usr/bin");
+        let (resolved, raw, candidates) = resolve_php_binary();
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        // candidates must be a non-empty Vec.
+        assert!(
+            !candidates.is_empty(),
+            "resolve_php_binary must record at least one candidate probe \
+             (env/sibling/which), got empty vec"
+        );
+        // Every candidate must have a non-empty path, a bool valid flag, and
+        // a non-empty reason string.
+        for (i, c) in candidates.iter().enumerate() {
+            assert!(
+                !c.path.as_os_str().is_empty(),
+                "candidate[{}].path must be non-empty, got: {:?}",
+                i,
+                c.path
+            );
+            // valid is bool — always true (no extra assertion needed, the
+            // type system guarantees it). reason must be non-empty.
+            assert!(
+                !c.reason.is_empty(),
+                "candidate[{}].reason must be non-empty, got: {:?}",
+                i,
+                c.reason
+            );
+            // When valid is true, reason should be "ok" or "current_exe is
+            // CLI php"; when false, reason must describe the failure.
+            if c.valid {
+                assert!(
+                    c.reason == "ok" || c.reason == "current_exe is CLI php",
+                    "candidate[{}].valid=true but reason is {:?} (expected 'ok' or 'current_exe is CLI php')",
+                    i,
+                    c.reason
+                );
+            } else {
+                assert!(
+                    c.reason != "ok",
+                    "candidate[{}].valid=false but reason is 'ok' (contradiction)",
+                    i
+                );
+            }
+        }
+        // Either at least one candidate validated, OR resolution fell back
+        // to raw (both are acceptable — the test runner's current_exe is not
+        // `php` so fallback is the common path here).
+        let any_valid = candidates.iter().any(|c| c.valid);
+        let is_fallback = resolved == raw;
+        assert!(
+            any_valid || is_fallback,
+            "expected at least one valid candidate OR resolved == raw (fallback), \
+             got any_valid={}, resolved={:?}, raw={:?}",
+            any_valid,
+            resolved,
+            raw
+        );
     }
 
     // =====================================================================

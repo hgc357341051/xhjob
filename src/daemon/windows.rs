@@ -29,7 +29,7 @@ pub fn spawn_via_create_process(
     // Locate the PHP binary. In PHP-FPM context, `current_exe()` returns
     // `php-fpm` (not the CLI `php`), which rejects `-r`/`-d`. `resolve_php_binary()`
     // returns the resolved CLI binary plus the raw `current_exe()` for diagnostics.
-    let (exe, _raw_exe) = super::resolve_php_binary();
+    let (exe, _raw_exe, _candidates) = super::resolve_php_binary();
 
     // PHP single-quoted strings escape `'` as `\'` and `\` as `\\`. Service
     // names are validated to be `[a-zA-Z][a-zA-Z0-9_-]{0,31}` so neither

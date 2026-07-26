@@ -185,17 +185,27 @@ pub fn xhjob_last_start_error() -> Option<String> {
 ///
 /// Pass the same `name` and `data_dir` you would pass to `xhjob_start`
 /// to get paths resolved for that specific service. Returns a JSON object
-/// with the keys: `php_binary`, `php_binary_raw`, `sapi`,
-/// `extension_loaded_via_php_ini`, `service_name`, `data_dir`,
-/// `data_dir_writable`, `pid_file_path`, `log_file_path`,
-/// `ipc_socket_path`, `current_uid`, `current_gid`, `open_basedir`,
-/// `last_start_error`.
+/// with the keys: `php_binary`, `php_binary_raw`, `php_binary_candidates`,
+/// `xhjob_so_info`, `sapi`, `extension_loaded_via_php_ini`,
+/// `service_name`, `data_dir`, `data_dir_writable`, `pid_file_path`,
+/// `log_file_path`, `ipc_socket_path`, `current_uid`, `current_gid`,
+/// `open_basedir`, `last_start_error`.
 ///
 /// The `php_binary` field reflects the resolved CLI binary that will
 /// actually be used to spawn the daemon (which may differ from
 /// `current_exe()` in PHP-FPM context, where `current_exe()` returns
 /// `php-fpm`). To override the auto-detection, set the `XHJOB_PHP_BINARY`
 /// environment variable to the absolute path of the CLI `php` binary.
+///
+/// The `xhjob_so_info` field exposes the loaded xhjob.so file path + size +
+/// mtime so users can verify which .so version PHP-FPM actually loaded
+/// (compare size/mtime against `releases/xhjob-php8.2-linux-x86_64.so`).
+/// If `xhjob_so_info.path` is null or the field is absent, the loaded .so
+/// predates this feature and must be reinstalled + FPM restarted.
+///
+/// The `php_binary_candidates` field lists every CLI php candidate probed
+/// by `resolve_php_binary()` with its validation result and failure reason,
+/// so users can see why a particular binary was chosen.
 ///
 /// PHP: `xhjob_diag(?string $name = null, ?string $data_dir = null): string`
 /// (returns a JSON string — `json_decode` it on the PHP side).
@@ -207,9 +217,19 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
     let data_dir_writable =
         daemon::check_data_dir_writable(&service_name, data_dir.as_deref()).is_ok();
     let extension_loaded = daemon::xhjob_loaded_via_php_ini();
-    let (php_binary_resolved, php_binary_raw) = daemon::resolve_php_binary();
+    let (php_binary_resolved, php_binary_raw, php_binary_candidates) = daemon::resolve_php_binary();
     let php_binary = php_binary_resolved.to_string_lossy().into_owned();
     let php_binary_raw = php_binary_raw.to_string_lossy().into_owned();
+    let candidates_json: Vec<serde_json::Value> = php_binary_candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "path": c.path.to_string_lossy(),
+                "valid": c.valid,
+                "reason": c.reason,
+            })
+        })
+        .collect();
     let pid_file = daemon::pid_file_path(&service_name, data_dir.as_deref())
         .to_string_lossy()
         .into_owned();
@@ -236,6 +256,8 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
     let json = serde_json::json!({
         "php_binary": php_binary,
         "php_binary_raw": php_binary_raw,
+        "php_binary_candidates": candidates_json,
+        "xhjob_so_info": xhjob_so_info(),
         "sapi": sapi,
         "extension_loaded_via_php_ini": extension_loaded,
         "service_name": service_name,
@@ -254,6 +276,103 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
     // string and let the userland `json_decode()` it (matching the docstring
     // contract).
     json.to_string()
+}
+
+/// On Linux, scans `/proc/self/maps` to find the pathname of the loaded
+/// `xhjob.so`. Returns `None` on non-Linux or if not found. Used by
+/// `xhjob_diag` to help users verify which .so file is actually loaded by
+/// PHP-FPM.
+///
+/// Each line of `/proc/self/maps` has the format:
+/// `address perms offset dev inode pathname`
+/// The pathname is the last whitespace-separated field (and may be absent
+/// for anonymous mappings). We look for the first line whose pathname's
+/// file name component equals exactly `xhjob.so` (using `Path::file_name`
+/// for an exact match — avoids matching `xhjob.so.bak` or similar).
+fn resolve_xhjob_so_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            // The pathname is everything after the 5th whitespace-separated
+            // field (address perms offset dev inode). Split into at most 6
+            // parts so paths containing spaces are preserved.
+            let mut parts = line.splitn(6, ' ');
+            // Skip the first 5 fields (address, perms, offset, dev, inode).
+            for _ in 0..5 {
+                parts.next();
+            }
+            let pathname = match parts.next() {
+                Some(p) => p.trim(),
+                None => continue,
+            };
+            if pathname.is_empty() {
+                continue;
+            }
+            // Exact filename match against `xhjob.so` — avoids matching
+            // `xhjob.so.bak` or paths that merely contain `xhjob.so` as a
+            // substring.
+            if std::path::Path::new(pathname).file_name() == Some("xhjob.so".as_ref()) {
+                return Some(std::path::PathBuf::from(pathname));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Build the `xhjob_so_info` JSON value for `xhjob_diag`. Calls
+/// `resolve_xhjob_so_path()` and — when the path is found — reads
+/// `std::fs::metadata` to expose the file size and mtime so the operator
+/// can verify which .so version PHP-FPM actually loaded.
+///
+/// Returns one of:
+/// - `{ "path": "<abs path>", "size_bytes": <u64>, "mtime_epoch": <u64> }`
+///   on success (Linux + xhjob.so found + metadata readable)
+/// - `{ "path": "<abs path>", "error": "<io error msg>" }` when the path was
+///   resolved but metadata could not be read
+/// - `{ "path": null, "error": "could not resolve xhjob.so path from /proc/self/maps" }`
+///   on Linux when xhjob.so is not loaded (or /proc/self/maps unreadable)
+/// - `{ "path": null, "error": "xhjob.so path resolution not supported on this platform" }`
+///   on non-Linux platforms
+fn xhjob_so_info() -> serde_json::Value {
+    match resolve_xhjob_so_path() {
+        Some(path) => match std::fs::metadata(&path) {
+            Ok(metadata) => serde_json::json!({
+                "path": path.to_string_lossy(),
+                "size_bytes": metadata.len(),
+                "mtime_epoch": metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            }),
+            Err(e) => serde_json::json!({
+                "path": path.to_string_lossy(),
+                "error": format!("{}", e),
+            }),
+        },
+        None => {
+            #[cfg(target_os = "linux")]
+            {
+                serde_json::json!({
+                    "path": null,
+                    "error": "could not resolve xhjob.so path from /proc/self/maps",
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                serde_json::json!({
+                    "path": null,
+                    "error": "xhjob.so path resolution not supported on this platform",
+                })
+            }
+        }
+    }
 }
 
 #[php_function]
@@ -1977,6 +2096,8 @@ mod tests {
         let required_keys = [
             "php_binary",
             "php_binary_raw",
+            "php_binary_candidates",
+            "xhjob_so_info",
             "sapi",
             "extension_loaded_via_php_ini",
             "service_name",
@@ -2132,5 +2253,124 @@ mod tests {
             "php_binary must be a JSON string, got: {:?}",
             obj.get("php_binary")
         );
+    }
+
+    #[test]
+    fn test_diag_includes_php_binary_candidates() {
+        // The `php_binary_candidates` field must be present in the diag JSON
+        // and be an array. Every element must have `path` (string), `valid`
+        // (bool), and `reason` (string). The actual candidate set depends on
+        // the test runner's current_exe and PATH, so we only assert the
+        // structural contract here (mirroring the daemon-side
+        // `test_resolve_php_binary_records_candidates` test).
+        let json_str = xhjob_diag(Some("test".to_string()), None);
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("diag must return valid JSON");
+        let obj = json.as_object().expect("diag must return a JSON object");
+        assert!(
+            obj.contains_key("php_binary_candidates"),
+            "diag JSON must contain key 'php_binary_candidates', got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        let arr = obj
+            .get("php_binary_candidates")
+            .expect("php_binary_candidates present");
+        assert!(
+            arr.is_array(),
+            "php_binary_candidates must be a JSON array, got: {:?}",
+            arr
+        );
+        for (i, elem) in arr.as_array().unwrap().iter().enumerate() {
+            let elem_obj = elem.as_object().unwrap_or_else(|| {
+                panic!(
+                    "php_binary_candidates[{}] must be a JSON object, got: {:?}",
+                    i, elem
+                )
+            });
+            assert!(
+                elem_obj.get("path").map(|v| v.is_string()).unwrap_or(false),
+                "php_binary_candidates[{}].path must be a string, got: {:?}",
+                i,
+                elem_obj.get("path")
+            );
+            assert!(
+                elem_obj.get("valid").map(|v| v.is_boolean()).unwrap_or(false),
+                "php_binary_candidates[{}].valid must be a bool, got: {:?}",
+                i,
+                elem_obj.get("valid")
+            );
+            assert!(
+                elem_obj
+                    .get("reason")
+                    .map(|v| v.is_string())
+                    .unwrap_or(false),
+                "php_binary_candidates[{}].reason must be a string, got: {:?}",
+                i,
+                elem_obj.get("reason")
+            );
+        }
+    }
+
+    #[test]
+    fn test_diag_includes_xhjob_so_info() {
+        // The `xhjob_so_info` field must be present in the diag JSON and be
+        // an object. On the Linux test runner the test binary does NOT load
+        // xhjob.so, so `path` may be null — we only assert the key exists,
+        // is an object, and contains either `path` (string or null) or
+        // `error` (string).
+        let json_str = xhjob_diag(Some("test".to_string()), None);
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("diag must return valid JSON");
+        let obj = json.as_object().expect("diag must return a JSON object");
+        assert!(
+            obj.contains_key("xhjob_so_info"),
+            "diag JSON must contain key 'xhjob_so_info', got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        let info = obj.get("xhjob_so_info").expect("xhjob_so_info present");
+        assert!(
+            info.is_object(),
+            "xhjob_so_info must be a JSON object, got: {:?}",
+            info
+        );
+        let info_obj = info.as_object().unwrap();
+        // The object must contain either `path` (string or null) or `error`
+        // (string) — typically both in the "not found" case.
+        let has_path = info_obj.contains_key("path");
+        let has_error = info_obj.contains_key("error");
+        assert!(
+            has_path || has_error,
+            "xhjob_so_info must contain either 'path' or 'error', got: {:?}",
+            info_obj
+        );
+        if has_path {
+            let path_val = info_obj.get("path").unwrap();
+            assert!(
+                path_val.is_string() || path_val.is_null(),
+                "xhjob_so_info.path must be a string or null, got: {:?}",
+                path_val
+            );
+        }
+        if has_error {
+            let err_val = info_obj.get("error").unwrap();
+            assert!(
+                err_val.is_string(),
+                "xhjob_so_info.error must be a string, got: {:?}",
+                err_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_xhjob_so_path_returns_option_no_panic() {
+        // Smoke test: `resolve_xhjob_so_path` must not panic and must return
+        // an `Option<PathBuf>`. We do NOT assert `Some` because the test
+        // runner does not load xhjob.so (so the function legitimately
+        // returns `None` on Linux test runners). The point is to verify the
+        // function is safe to call from any context.
+        let result = resolve_xhjob_so_path();
+        // Just assert it returns an Option without panicking — the actual
+        // value depends on the platform and whether xhjob.so is loaded.
+        let _ = result;
     }
 }
