@@ -185,10 +185,17 @@ pub fn xhjob_last_start_error() -> Option<String> {
 ///
 /// Pass the same `name` and `data_dir` you would pass to `xhjob_start`
 /// to get paths resolved for that specific service. Returns a JSON object
-/// with the keys: `php_binary`, `sapi`, `extension_loaded_via_php_ini`,
-/// `service_name`, `data_dir`, `data_dir_writable`, `pid_file_path`,
-/// `log_file_path`, `ipc_socket_path`, `current_uid`, `current_gid`,
-/// `open_basedir`, `last_start_error`.
+/// with the keys: `php_binary`, `php_binary_raw`, `sapi`,
+/// `extension_loaded_via_php_ini`, `service_name`, `data_dir`,
+/// `data_dir_writable`, `pid_file_path`, `log_file_path`,
+/// `ipc_socket_path`, `current_uid`, `current_gid`, `open_basedir`,
+/// `last_start_error`.
+///
+/// The `php_binary` field reflects the resolved CLI binary that will
+/// actually be used to spawn the daemon (which may differ from
+/// `current_exe()` in PHP-FPM context, where `current_exe()` returns
+/// `php-fpm`). To override the auto-detection, set the `XHJOB_PHP_BINARY`
+/// environment variable to the absolute path of the CLI `php` binary.
 ///
 /// PHP: `xhjob_diag(?string $name = null, ?string $data_dir = null): string`
 /// (returns a JSON string — `json_decode` it on the PHP side).
@@ -200,10 +207,9 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
     let data_dir_writable =
         daemon::check_data_dir_writable(&service_name, data_dir.as_deref()).is_ok();
     let extension_loaded = daemon::xhjob_loaded_via_php_ini();
-    let php_binary = std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let (php_binary_resolved, php_binary_raw) = daemon::resolve_php_binary();
+    let php_binary = php_binary_resolved.to_string_lossy().into_owned();
+    let php_binary_raw = php_binary_raw.to_string_lossy().into_owned();
     let pid_file = daemon::pid_file_path(&service_name, data_dir.as_deref())
         .to_string_lossy()
         .into_owned();
@@ -229,6 +235,7 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
 
     let json = serde_json::json!({
         "php_binary": php_binary,
+        "php_binary_raw": php_binary_raw,
         "sapi": sapi,
         "extension_loaded_via_php_ini": extension_loaded,
         "service_name": service_name,
@@ -1969,6 +1976,7 @@ mod tests {
         // test binary which doesn't link against PHP).
         let required_keys = [
             "php_binary",
+            "php_binary_raw",
             "sapi",
             "extension_loaded_via_php_ini",
             "service_name",
@@ -2085,6 +2093,44 @@ mod tests {
             still_there,
             Some("diag-test error".to_string()),
             "xhjob_diag must NOT consume the last-start-error slot"
+        );
+    }
+
+    #[test]
+    fn test_diag_includes_php_binary_raw() {
+        // The new `php_binary_raw` field must be present in the diag JSON
+        // and be a string. It mirrors `std::env::current_exe()` (the raw
+        // binary that loaded the extension), whereas `php_binary` is the
+        // resolved CLI binary that will actually be spawned. In the test
+        // runner (no PHP runtime loaded, current_exe is the test binary)
+        // the two may legitimately coincide or differ — we only assert
+        // the field exists and is a string here.
+        //
+        // NOTE: we deliberately do NOT call `take_last_start_error()` here
+        // to avoid racing with `test_diag_embeds_last_start_error_without_consuming`
+        // (which sets + reads the global last-start-error slot) when cargo
+        // test runs tests in parallel — `xhjob_diag` only peeks the slot
+        // (does not consume it), so leaving it untouched is safe.
+        let json_str = xhjob_diag(Some("test".to_string()), None);
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("diag must return valid JSON");
+        let obj = json.as_object().expect("diag must return a JSON object");
+        assert!(
+            obj.contains_key("php_binary_raw"),
+            "diag JSON must contain key 'php_binary_raw', got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        let raw_val = obj.get("php_binary_raw").expect("php_binary_raw present");
+        assert!(
+            raw_val.is_string(),
+            "php_binary_raw must be a JSON string, got: {:?}",
+            raw_val
+        );
+        // `php_binary` must also still be present and a string.
+        assert!(
+            obj.get("php_binary").map(|v| v.is_string()).unwrap_or(false),
+            "php_binary must be a JSON string, got: {:?}",
+            obj.get("php_binary")
         );
     }
 }

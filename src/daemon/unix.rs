@@ -9,7 +9,6 @@
 use super::{remove_pid_file, write_pid};
 use crate::errors::{Result, XhjobError};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 /// Spawn the daemon by re-executing the PHP binary in a double-forked,
@@ -28,13 +27,12 @@ pub fn spawn_via_double_fork(
     service_name: &str,
     data_dir: Option<&str>,
 ) -> Result<()> {
-    // Locate the PHP binary that loaded us. We can't always read /proc/self/exe
-    // reliably across Unix variants, so prefer $_, then /proc/self/exe, then
-    // PATH lookup of `php`.
-    let exe = std::env::current_exe()
-        .or_else(|_| std::env::var("_").map(PathBuf::from))
-        .or_else(|_| std::env::current_exe())
-        .map_err(XhjobError::Io)?;
+    // Locate the PHP binary that loaded us. In PHP-FPM context, `current_exe()`
+    // returns `php-fpm` (not the CLI `php`), which rejects `-r`/`-d` and exits
+    // with status 64 (EX_USAGE). `resolve_php_binary()` returns the resolved
+    // CLI binary (via env override / sibling lookup / PATH) plus the raw
+    // `current_exe()` for diagnostics.
+    let (exe, _raw_exe) = super::resolve_php_binary();
 
     tracing::info!(
         ?exe,
