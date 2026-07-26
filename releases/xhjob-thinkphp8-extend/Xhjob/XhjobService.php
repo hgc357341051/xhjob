@@ -10,6 +10,7 @@ declare(strict_types=1);
 namespace Xhjob;
 
 use Xhjob\Exception\ServiceNotRunningException;
+use Xhjob\Exception\XhjobException;
 
 /**
  * Daemon 生命周期管理
@@ -77,9 +78,27 @@ class XhjobService
     {
         $ok = xhjob_start($this->name, $this->dataDir);
         if (!$ok) {
-            throw new ServiceNotRunningException(
-                "xhjob_start 返回 false，无法启动 daemon (name={$this->name})"
-            );
+            // 取回 Rust 侧记录的失败原因（data_dir 不可写 / spawn 失败 / 轮询超时等）
+            $reason = '';
+            if (function_exists('xhjob_last_start_error')) {
+                $err = xhjob_last_start_error();
+                if (is_string($err) && $err !== '') {
+                    $reason = $err;
+                }
+            }
+            // 取回环境诊断（路径、权限、SAPI 等），便于用户一眼定位
+            $diagJson = '';
+            if (function_exists('xhjob_diag')) {
+                $diagJson = xhjob_diag($this->name, $this->dataDir);
+            }
+            $msg = "xhjob_start 返回 false，无法启动 daemon (name={$this->name})";
+            if ($reason !== '') {
+                $msg .= "; reason: " . $reason;
+            }
+            if ($diagJson !== '') {
+                $msg .= "; diag: " . $diagJson;
+            }
+            throw new ServiceNotRunningException($msg);
         }
         // 等待 daemon 真正进入 running 状态
         $this->wait(10, true);
@@ -116,9 +135,27 @@ class XhjobService
     {
         $ok = xhjob_restart($this->name, $this->dataDir);
         if (!$ok) {
-            throw new ServiceNotRunningException(
-                "xhjob_restart 返回 false (name={$this->name})"
-            );
+            // 取回 Rust 侧记录的失败原因（data_dir 不可写 / spawn 失败 / 轮询超时等）
+            $reason = '';
+            if (function_exists('xhjob_last_start_error')) {
+                $err = xhjob_last_start_error();
+                if (is_string($err) && $err !== '') {
+                    $reason = $err;
+                }
+            }
+            // 取回环境诊断（路径、权限、SAPI 等），便于用户一眼定位
+            $diagJson = '';
+            if (function_exists('xhjob_diag')) {
+                $diagJson = xhjob_diag($this->name, $this->dataDir);
+            }
+            $msg = "xhjob_restart 返回 false (name={$this->name})";
+            if ($reason !== '') {
+                $msg .= "; reason: " . $reason;
+            }
+            if ($diagJson !== '') {
+                $msg .= "; diag: " . $diagJson;
+            }
+            throw new ServiceNotRunningException($msg);
         }
         $this->wait(10, true);
         $status = $this->status();
@@ -258,5 +295,33 @@ class XhjobService
             return $out;
         }
         return $raw;
+    }
+
+    /**
+     * 环境诊断
+     *
+     * 包装扩展函数 xhjob_diag()，返回诊断信息数组，便于排查 daemon 启动失败。
+     * 可在控制器中 `return json(XhjobService::diag($name, $dataDir));` 直接输出。
+     *
+     * @param string|null $name    服务名，默认 'default'
+     * @param string|null $dataDir 数据目录
+     *
+     * @return array 诊断数组（含 php_binary / sapi / data_dir / data_dir_writable /
+     *               pid_file_path / log_file_path / ipc_socket_path /
+     *               current_uid / current_gid / open_basedir / last_start_error 等）
+     *
+     * @throws XhjobException 如果扩展未加载或 xhjob_diag 不存在
+     */
+    public static function diag(?string $name = null, ?string $dataDir = null): array
+    {
+        if (!function_exists('xhjob_diag')) {
+            throw new XhjobException("xhjob_diag() not available; extension not loaded");
+        }
+        $json = xhjob_diag($name, $dataDir);
+        $arr = json_decode($json, true);
+        if (!is_array($arr)) {
+            return ['raw' => $json];
+        }
+        return $arr;
     }
 }

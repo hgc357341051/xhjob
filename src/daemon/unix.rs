@@ -64,7 +64,14 @@ pub fn spawn_via_double_fork(
     };
 
     let mut cmd = Command::new(&exe);
-    cmd.arg("-d").arg("extension=xhjob.so");
+    // Only inject `-d extension=xhjob.so` when the current process did NOT
+    // load xhjob via php.ini. When xhjob is already in php.ini (FPM/Apache,
+    // or CLI with ini-configured xhjob), the spawned daemon will auto-load
+    // it from the same php.ini — passing `-d extension=` again would trigger
+    // PHP's "Module already loaded" warning.
+    if super::should_inject_extension_arg() {
+        cmd.arg("-d").arg("extension=xhjob.so");
+    }
     cmd.arg("-r").arg(&code);
     // Env vars are kept as a backward-compatible fallback: if a caller spawns
     // the daemon through a path that does preserve env vars, the daemon will
@@ -127,8 +134,13 @@ pub fn spawn_via_double_fork(
 
     // Spawn the detached child. The child will write its own PID file when
     // daemon_main() runs.
-    let _child = cmd.spawn().map_err(XhjobError::Io)?;
-    Ok(())
+    let child = cmd.spawn().map_err(XhjobError::Io)?;
+    // Detect immediate-exit failures (setsid error, missing PHP binary,
+    // `-r` parse error, etc.) so the caller gets a useful error instead of
+    // waiting 10s for a PID file that will never appear. The helper polls
+    // try_wait() for 500ms; if the child is still running, it `mem::forget`s
+    // the handle (preserving the detached daemon) and returns Ok(()).
+    super::check_child_alive(child, &log_path, service_name)
 }
 
 extern "C" {

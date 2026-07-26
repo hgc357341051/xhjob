@@ -1,6 +1,7 @@
 #![cfg_attr(windows, feature(abi_vectorcall))]
 
 use ext_php_rs::prelude::*;
+use std::sync::Mutex;
 
 pub mod config;
 pub mod daemon;
@@ -18,6 +19,40 @@ pub mod task;
 pub mod utils;
 
 pub use service::ServiceName;
+
+// =========================================================================
+// Last-start-error global state (for xhjob_last_start_error() PHP function)
+// =========================================================================
+
+/// Global last-start-error string. Set by `xhjob_start` when daemon startup
+/// fails (data_dir precheck, spawn error, poll timeout); read by
+/// `xhjob_last_start_error()` PHP function so the PHP side can surface the
+/// failure reason in `ServiceNotRunningException` instead of a bare
+/// "xhjob_start returned false". `Mutex<Option<String>>` is sufficient — no
+/// async runtime needed, and the lock is held only briefly during set/take.
+static LAST_START_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record a daemon-start failure reason so PHP can query it via
+/// `xhjob_last_start_error()`. Called from `xhjob_start` in all three
+/// failure branches (data_dir precheck Err, daemon spawn Err, poll-timeout
+/// Ok(false)). Overwrites any previously recorded error so the most recent
+/// failure is what PHP observes.
+pub(crate) fn set_last_start_error(msg: impl Into<String>) {
+    if let Ok(mut guard) = LAST_START_ERROR.lock() {
+        *guard = Some(msg.into());
+    }
+}
+
+/// Take (read + clear) the last-start-error string. Used by
+/// `xhjob_last_start_error()` to return + clear the error in one call, and
+/// by `xhjob_diag()` to embed the error in the diagnostic JSON. Returns
+/// `None` when no start has been attempted or the last start succeeded.
+pub(crate) fn take_last_start_error() -> Option<String> {
+    LAST_START_ERROR
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
 
 // =========================================================================
 // PHP functions
@@ -74,7 +109,9 @@ pub fn xhjob_start(name: Option<String>, data_dir: Option<String>) -> bool {
     let service_name = match resolve_service_name(name) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("xhjob_start invalid service name: {}", e);
+            let msg = format!("xhjob_start invalid service name: {}", e);
+            tracing::error!("{}", msg);
+            set_last_start_error(msg);
             return false;
         }
     };
@@ -88,14 +125,128 @@ pub fn xhjob_start(name: Option<String>, data_dir: Option<String>) -> bool {
     match daemon::start(daemon_main::daemon_main, &service_name, data_dir.as_deref()) {
         Ok(true) => true,
         Ok(false) => {
-            // Failed to start within timeout
+            // Daemon did not become ready within the 10s poll timeout.
+            // Build a diagnostic message: read the daemon log file tail +
+            // check whether the PID file + IPC socket files exist. Record
+            // it via set_last_start_error so PHP can query it via
+            // xhjob_last_start_error() and surface it in
+            // ServiceNotRunningException instead of a bare "returned false".
+            let log_tail = daemon::read_daemon_log_tail(&service_name, data_dir.as_deref());
+            let pid_exists = daemon::pid_file_path(&service_name, data_dir.as_deref()).exists();
+            // IPC socket existence check: on Unix the socket lives in the
+            // filesystem; on Windows it is a kernel object (no file path).
+            // `ipc::ipc_path` returns the same string used to bind/connect,
+            // so .exists() works on Unix and always returns false on Windows
+            // (named pipe paths like \\.\pipe\... do not resolve via stat).
+            let sock_path = crate::ipc::ipc_path(&service_name, data_dir.as_deref());
+            let sock_exists = std::path::Path::new(&sock_path).exists();
+            let log_file_path = daemon::log_file_path(&service_name, data_dir.as_deref());
+            let msg = format!(
+                "daemon did not become ready within 10s; service={}; \
+                 pid_file_exists={}; ipc_socket_exists={}; \
+                 log file: {}; log tail (last 2KB):\n{}",
+                service_name,
+                pid_exists,
+                sock_exists,
+                log_file_path.display(),
+                log_tail,
+            );
+            tracing::error!("{}", msg);
+            set_last_start_error(msg);
             false
         }
         Err(e) => {
-            tracing::error!("xhjob_start failed: {}", e);
+            // daemon::start returned an Err — this is the data_dir precheck
+            // failure, the spawn error, or the spawn-after-wait diagnostic
+            // (child exited prematurely). Record the formatted error string
+            // so PHP can query it.
+            let msg = format!("xhjob_start failed: {}", e);
+            tracing::error!("{}", msg);
+            set_last_start_error(msg);
             false
         }
     }
+}
+
+/// Return the diagnostic string from the most recent `xhjob_start()` failure.
+/// Returns `null` if the last start succeeded or no start has been attempted.
+///
+/// The error is consumed (cleared) on read, so two consecutive calls return
+/// `null` for the second one — this matches the "show me what went wrong"
+/// UX of `error_get_last()` in PHP. To inspect without clearing, use
+/// `xhjob_diag()` (which embeds the error in the JSON without clearing).
+#[php_function]
+pub fn xhjob_last_start_error() -> Option<String> {
+    take_last_start_error()
+}
+
+/// Return diagnostic info about the current PHP process and the xhjob
+/// daemon environment, for troubleshooting `xhjob_start` failures.
+///
+/// Pass the same `name` and `data_dir` you would pass to `xhjob_start`
+/// to get paths resolved for that specific service. Returns a JSON object
+/// with the keys: `php_binary`, `sapi`, `extension_loaded_via_php_ini`,
+/// `service_name`, `data_dir`, `data_dir_writable`, `pid_file_path`,
+/// `log_file_path`, `ipc_socket_path`, `current_uid`, `current_gid`,
+/// `open_basedir`, `last_start_error`.
+///
+/// PHP: `xhjob_diag(?string $name = null, ?string $data_dir = null): string`
+/// (returns a JSON string — `json_decode` it on the PHP side).
+#[php_function]
+pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
+    let service_name = resolve_service_name(name).unwrap_or_else(|_| "default".to_string());
+    let data_dir = normalize_data_dir(data_dir);
+    let data_dir_resolved = daemon::resolve_data_dir(data_dir.as_deref());
+    let data_dir_writable =
+        daemon::check_data_dir_writable(&service_name, data_dir.as_deref()).is_ok();
+    let extension_loaded = daemon::xhjob_loaded_via_php_ini();
+    let php_binary = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let pid_file = daemon::pid_file_path(&service_name, data_dir.as_deref())
+        .to_string_lossy()
+        .into_owned();
+    let log_file = daemon::log_file_path(&service_name, data_dir.as_deref())
+        .to_string_lossy()
+        .into_owned();
+    let ipc_socket = crate::ipc::ipc_path(&service_name, data_dir.as_deref());
+    let sapi = daemon::read_sapi_name().unwrap_or_default();
+    let open_basedir = daemon::read_open_basedir().unwrap_or_default();
+
+    #[cfg(unix)]
+    let (uid, gid) = (daemon::current_uid(), daemon::current_gid());
+    #[cfg(not(unix))]
+    let (uid, gid) = (0u32, 0u32);
+
+    // Embed the last-start-error WITHOUT consuming it (so a subsequent
+    // xhjob_last_start_error() call still returns the error). We peek by
+    // cloning the lock guard.
+    let last_err = LAST_START_ERROR
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
+
+    let json = serde_json::json!({
+        "php_binary": php_binary,
+        "sapi": sapi,
+        "extension_loaded_via_php_ini": extension_loaded,
+        "service_name": service_name,
+        "data_dir": data_dir_resolved,
+        "data_dir_writable": data_dir_writable,
+        "pid_file_path": pid_file,
+        "log_file_path": log_file,
+        "ipc_socket_path": ipc_socket,
+        "current_uid": uid,
+        "current_gid": gid,
+        "open_basedir": open_basedir,
+        "last_start_error": last_err,
+    });
+    // Serialize to a JSON string for the PHP return value: ext-php-rs'
+    // IntoZval is not implemented for serde_json::Value, so we hand PHP a
+    // string and let the userland `json_decode()` it (matching the docstring
+    // contract).
+    json.to_string()
 }
 
 #[php_function]
@@ -1706,6 +1857,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
         .class::<Xhjob>()
         .function(wrap_function!(xhjob_start))
+        .function(wrap_function!(xhjob_last_start_error))
+        .function(wrap_function!(xhjob_diag))
         .function(wrap_function!(xhjob_stop))
         .function(wrap_function!(xhjob_restart))
         .function(wrap_function!(xhjob_status))
@@ -1732,4 +1885,206 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(xhjob_report_progress))
         .function(wrap_function!(xhjob_pull_events))
         .function(wrap_function!(xhjob_inspect))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =====================================================================
+    // Task 4 tests: LAST_START_ERROR global
+    // =====================================================================
+
+    #[test]
+    fn test_last_start_error_set_on_failure() {
+        // Take any pre-existing error to start from a clean state.
+        let _ = take_last_start_error();
+        set_last_start_error("test error");
+        let err = take_last_start_error();
+        assert_eq!(
+            err,
+            Some("test error".to_string()),
+            "take_last_start_error must return the string set by set_last_start_error"
+        );
+        // Subsequent take must return None (the error was consumed).
+        let again = take_last_start_error();
+        assert_eq!(
+            again, None,
+            "take_last_start_error must clear the slot on read"
+        );
+    }
+
+    #[test]
+    fn test_last_start_error_none_when_not_set() {
+        // Clear any prior state.
+        let _ = take_last_start_error();
+        assert_eq!(
+            take_last_start_error(),
+            None,
+            "take_last_start_error must return None when no error has been set"
+        );
+    }
+
+    #[test]
+    fn test_last_start_error_overwrites_previous() {
+        let _ = take_last_start_error();
+        set_last_start_error("first error");
+        set_last_start_error("second error");
+        let err = take_last_start_error();
+        assert_eq!(
+            err,
+            Some("second error".to_string()),
+            "set_last_start_error must overwrite the previously recorded error"
+        );
+    }
+
+    // =====================================================================
+    // Task 5 tests: xhjob_diag()
+    // =====================================================================
+
+    #[test]
+    fn test_diag_returns_required_fields() {
+        // Clear any prior last-start-error so the field is deterministic.
+        let _ = take_last_start_error();
+        let dir = std::env::temp_dir().join(format!(
+            "xhjob_diag_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let json_str = xhjob_diag(
+            Some("test".to_string()),
+            Some(dir_str.clone()),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("diag must return valid JSON");
+        let obj = json.as_object().expect("diag must return a JSON object");
+
+        // All required keys must be present (we don't assert specific values
+        // since FFI fields like `sapi` / `open_basedir` are empty in the
+        // test binary which doesn't link against PHP).
+        let required_keys = [
+            "php_binary",
+            "sapi",
+            "extension_loaded_via_php_ini",
+            "service_name",
+            "data_dir",
+            "data_dir_writable",
+            "pid_file_path",
+            "log_file_path",
+            "ipc_socket_path",
+            "current_uid",
+            "current_gid",
+            "open_basedir",
+            "last_start_error",
+        ];
+        for key in &required_keys {
+            assert!(
+                obj.contains_key(*key),
+                "diag JSON must contain key {:?}, got: {:?}",
+                key,
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // service_name must echo back the validated input.
+        assert_eq!(
+            obj.get("service_name").and_then(|v| v.as_str()),
+            Some("test"),
+            "service_name must echo back the validated input"
+        );
+
+        // data_dir must be the resolved directory we passed.
+        assert_eq!(
+            obj.get("data_dir").and_then(|v| v.as_str()),
+            Some(dir_str.as_str()),
+            "data_dir must be the resolved directory we passed"
+        );
+
+        // data_dir_writable must be true — we just created the dir.
+        assert_eq!(
+            obj.get("data_dir_writable").and_then(|v| v.as_bool()),
+            Some(true),
+            "freshly-created temp dir must be writable"
+        );
+
+        // extension_loaded_via_php_ini must be a bool (in the test binary
+        // without PHP runtime, it returns false).
+        assert!(
+            obj.get("extension_loaded_via_php_ini")
+                .and_then(|v| v.as_bool())
+                .is_some(),
+            "extension_loaded_via_php_ini must be a bool"
+        );
+
+        // uid/gid must be u32 (0 on Windows, real uid/gid on Unix).
+        assert!(
+            obj.get("current_uid").and_then(|v| v.as_u64()).is_some(),
+            "current_uid must be a number"
+        );
+        assert!(
+            obj.get("current_gid").and_then(|v| v.as_u64()).is_some(),
+            "current_gid must be a number"
+        );
+
+        // last_start_error must be null (we cleared it above).
+        assert!(
+            obj.get("last_start_error").map(|v| v.is_null()).unwrap_or(true),
+            "last_start_error must be null when no error has been set"
+        );
+
+        // pid_file_path / log_file_path / ipc_socket_path must contain the
+        // service name so the operator can correlate them to the service.
+        let pid_file = obj
+            .get("pid_file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let log_file = obj
+            .get("log_file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            pid_file.contains("test"),
+            "pid_file_path must contain the service name, got: {}",
+            pid_file
+        );
+        assert!(
+            log_file.contains("test"),
+            "log_file_path must contain the service name, got: {}",
+            log_file
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_diag_embeds_last_start_error_without_consuming() {
+        // xhjob_diag must embed the last-start-error in the JSON WITHOUT
+        // consuming it — a subsequent xhjob_last_start_error() call must
+        // still return the error.
+        let _ = take_last_start_error();
+        set_last_start_error("diag-test error");
+
+        let json_str = xhjob_diag(None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("diag must return valid JSON");
+        let obj = json.as_object().expect("diag must return a JSON object");
+        assert_eq!(
+            obj.get("last_start_error").and_then(|v| v.as_str()),
+            Some("diag-test error"),
+            "diag must embed the last-start-error"
+        );
+
+        // The error must NOT have been consumed by diag.
+        let still_there = take_last_start_error();
+        assert_eq!(
+            still_there,
+            Some("diag-test error".to_string()),
+            "xhjob_diag must NOT consume the last-start-error slot"
+        );
+    }
 }

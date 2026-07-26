@@ -24,6 +24,7 @@ Route::get('hello/:name', 'index/hello');
 // +----------------------------------------------------------------------
 Route::group('xhjob', function () {
     Route::get('index', 'XhjobTask/index');
+    Route::get('diag', 'XhjobTask/diag');
     Route::post('start', 'XhjobTask/start');
     Route::post('stop', 'XhjobTask/stop');
     Route::post('restart', 'XhjobTask/restart');
