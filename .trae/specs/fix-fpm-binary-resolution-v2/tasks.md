@@ -47,11 +47,11 @@
 
 ## Phase 5: Git 提交推送
 
-- [ ] Task 6: 创建分支 + 提交 + 推送
-  - [ ] SubTask 6.1: `git checkout -b fix-fpm-binary-resolution-v2`（基于当前 main HEAD）
-  - [ ] SubTask 6.2: `git add` 仅目标文件（src/daemon/mod.rs、src/lib.rs、releases/xhjob-php8.2-linux-x86_64.so、README.md、.trae/specs/fix-fpm-binary-resolution-v2/）
-  - [ ] SubTask 6.3: `git commit` 用 trae-agent 身份，message 说明根因 A（旧 .so）+ 根因 B（validate spawn 不可靠）+ 修复（静态检查 + 候选扩展 + 诊断字段）
-  - [ ] SubTask 6.4: `git push -u origin fix-fpm-binary-resolution-v2`，返回 PR 链接给用户
+- [x] Task 6: 创建分支 + 提交 + 推送
+  - [x] SubTask 6.1: `git checkout -b fix-fpm-binary-resolution-v2`（基于当前 main HEAD `acc5676`）
+  - [x] SubTask 6.2: `git add` 仅 9 个目标文件（3 spec 文档 + src/daemon/mod.rs + src/daemon/unix.rs + src/daemon/windows.rs + src/lib.rs + releases/xhjob-php8.2-linux-x86_64.so + README.md，未使用 `-A`）
+  - [x] SubTask 6.3: `git commit` 用 `git -c user.name=trae-agent -c user.email=trae-agent@users.noreply.github.com` 创建 commit `5eb5e26`（9 files, +864/-42），message 说明根因 A（旧 .so）+ 根因 B（validate spawn 不可靠）+ 修复（静态检查 + 候选扩展 + 诊断字段 + record 闭包 bug 修复）
+  - [x] SubTask 6.4: `git push -u origin fix-fpm-binary-resolution-v2` 成功推送，PR 链接：https://github.com/hgc357341051/xhjob/pull/new/fix-fpm-binary-resolution-v2
 
 # Task Dependencies
 
