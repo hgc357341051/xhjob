@@ -44,6 +44,58 @@ class XhjobTask extends BaseController
         return Response::create($data, 'json', $code);
     }
 
+    /**
+     * 从 config('xhjob.*') 读取统一的服务名。
+     *
+     * 默认 'default'，可通过 config/xhjob.php 或 .env 的 XHJOB_SERVICE 覆盖。
+     *
+     * @return string
+     */
+    protected function xhjobServiceName(): string
+    {
+        $name = $this->app->config->get('xhjob.service_name', 'default');
+        return is_string($name) && $name !== '' ? $name : 'default';
+    }
+
+    /**
+     * 从 config('xhjob.*') 读取统一的数据目录。
+     *
+     * 优先用 config('xhjob.data_dir')；为 null/空字符串时回退到
+     * runtime_path() . 'xhjob'，确保 www / nginx 等 web 用户可写
+     * （runtime_path 是项目自己的运行时目录，继承项目文件权限）。
+     *
+     * @return string|null 返回 null 仅当用户显式配置为 null（透传给 Rust 扩展内部回退 /tmp）
+     */
+    protected function xhjobDataDir(): ?string
+    {
+        $dir = $this->app->config->get('xhjob.data_dir');
+        if (is_string($dir) && $dir !== '') {
+            return $dir;
+        }
+        // 回退到 runtime_path/xhjob（web 用户必然可写）
+        return runtime_path() . 'xhjob';
+    }
+
+    /**
+     * 构造 XhjobService，使用统一的服务名 + 数据目录。
+     *
+     * @return XhjobService
+     */
+    protected function xhjobService(): XhjobService
+    {
+        return new XhjobService($this->xhjobServiceName(), $this->xhjobDataDir());
+    }
+
+    /**
+     * 构造 TaskManager，使用统一的服务名 + 数据目录。
+     *
+     * @return TaskManager
+     */
+    protected function xhjobManager(): TaskManager
+    {
+        return new TaskManager($this->xhjobServiceName(), $this->xhjobDataDir());
+    }
+
     // -----------------------------------------------------------------
     // daemon 生命周期
     // -----------------------------------------------------------------
@@ -55,7 +107,7 @@ class XhjobTask extends BaseController
      */
     public function index()
     {
-        $svc = new XhjobService();
+        $svc = $this->xhjobService();
         return $this->json([
             'status' => $svc->status(),
             'health' => $svc->healthCheck(),
@@ -92,7 +144,7 @@ class XhjobTask extends BaseController
     public function start()
     {
         try {
-            $svc = new XhjobService();
+            $svc = $this->xhjobService();
             $pid = $svc->start();
             return $this->json(['pid' => $pid, 'started' => true]);
         } catch (\think\exception\HttpException $e) {
@@ -116,7 +168,7 @@ class XhjobTask extends BaseController
             $scope = $this->request->param('scope', 'task');
             $id    = $this->request->param('id');
             if ($scope === 'daemon') {
-                $svc = new XhjobService();
+                $svc = $this->xhjobService();
                 $ok  = $svc->stop();
                 if (!$ok) {
                     return $this->json(['ok' => false, 'error' => 'Failed to stop daemon'], 500);
@@ -127,7 +179,7 @@ class XhjobTask extends BaseController
             if (empty($id)) {
                 throw new \think\exception\HttpException(400, 'Missing required param: id (or pass scope=daemon for daemon-level operation)');
             }
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $ok  = $mgr->stop((string) $id);
             if (!$ok) {
                 return $this->json(['ok' => false, 'error' => 'Failed to stop task (id=' . $id . ')'], 500);
@@ -154,7 +206,7 @@ class XhjobTask extends BaseController
             $scope = $this->request->param('scope', 'task');
             $id    = $this->request->param('id');
             if ($scope === 'daemon') {
-                $svc = new XhjobService();
+                $svc = $this->xhjobService();
                 $pid = $svc->restart();
                 return $this->json(['pid' => $pid, 'restarted' => true]);
             }
@@ -162,7 +214,7 @@ class XhjobTask extends BaseController
             if (empty($id)) {
                 throw new \think\exception\HttpException(400, 'Missing required param: id (or pass scope=daemon for daemon-level operation)');
             }
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $ok  = $mgr->restart((string) $id);
             if (!$ok) {
                 return $this->json(['ok' => false, 'error' => 'Failed to restart task (id=' . $id . ')'], 500);
@@ -182,7 +234,7 @@ class XhjobTask extends BaseController
      */
     public function status()
     {
-        $svc = new XhjobService();
+        $svc = $this->xhjobService();
         return $this->json($svc->status());
     }
 
@@ -193,7 +245,7 @@ class XhjobTask extends BaseController
      */
     public function health()
     {
-        $svc = new XhjobService();
+        $svc = $this->xhjobService();
         return $this->json($svc->healthCheck());
     }
 
@@ -210,7 +262,7 @@ class XhjobTask extends BaseController
     {
         $state = $this->request->param('state');
         $tag   = $this->request->param('tag');
-        $mgr   = new TaskManager();
+        $mgr   = $this->xhjobManager();
         return $this->json($mgr->list($state, $tag));
     }
 
@@ -222,7 +274,7 @@ class XhjobTask extends BaseController
     public function get()
     {
         $id  = $this->request->param('id');
-        $mgr = new TaskManager();
+        $mgr = $this->xhjobManager();
         return $this->json($mgr->get((string) $id));
     }
 
@@ -234,7 +286,7 @@ class XhjobTask extends BaseController
     public function state()
     {
         $id  = $this->request->param('id');
-        $mgr = new TaskManager();
+        $mgr = $this->xhjobManager();
         return $this->json($mgr->state((string) $id));
     }
 
@@ -246,7 +298,7 @@ class XhjobTask extends BaseController
     public function result()
     {
         $id  = $this->request->param('id');
-        $mgr = new TaskManager();
+        $mgr = $this->xhjobManager();
         return $this->json($mgr->result((string) $id));
     }
 
@@ -259,7 +311,7 @@ class XhjobTask extends BaseController
     {
         $id       = $this->request->param('id');
         $sinceTs  = intval($this->request->param('since_ts', 0));
-        $mgr      = new TaskManager();
+        $mgr      = $this->xhjobManager();
         return $this->json($mgr->logs((string) $id, $sinceTs));
     }
 
@@ -275,7 +327,7 @@ class XhjobTask extends BaseController
     public function create()
     {
         $json = $this->request->getContent();
-        $mgr  = new TaskManager();
+        $mgr  = $this->xhjobManager();
         $id   = $mgr->create(TaskBuilder::fromJson((string) $json));
         return $this->json(['task_id' => $id], 201);
     }
@@ -290,7 +342,7 @@ class XhjobTask extends BaseController
         try {
             $cmd  = $this->request->param('cmd', 'echo hello-xhjob');
             $cron = $this->request->param('cron');
-            $mgr  = new TaskManager();
+            $mgr  = $this->xhjobManager();
             $b    = TaskBuilder::shell((string) $cmd);
             if ($cron) {
                 $b->cron((string) $cron);
@@ -331,7 +383,7 @@ class XhjobTask extends BaseController
             if (!in_array($method, ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'], true)) {
                 throw new \think\exception\HttpException(400, 'Invalid method');
             }
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $b   = TaskBuilder::http((string) $method, (string) $url);
             if ($body) {
                 $b->withBody((string) $body);
@@ -356,7 +408,7 @@ class XhjobTask extends BaseController
             $cmd     = $this->request->param('cmd', 'echo cron-tick');
             $cron    = $this->request->param('cron', '* * * * *');
             $maxExec = intval($this->request->param('max_executions', 0));
-            $mgr     = new TaskManager();
+            $mgr     = $this->xhjobManager();
             $id      = $mgr->create(
                 TaskBuilder::shell((string) $cmd)
                     ->cron((string) $cron)
@@ -382,7 +434,7 @@ class XhjobTask extends BaseController
             $builders = array_map(function ($cmd) {
                 return TaskBuilder::shell((string) $cmd);
             }, (array) $steps);
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $id  = $mgr->createChain($builders);
             return $this->json(['chain_id' => $id]);
         } catch (\think\exception\HttpException $e) {
@@ -404,7 +456,7 @@ class XhjobTask extends BaseController
             $builders = array_map(function ($cmd) {
                 return TaskBuilder::shell((string) $cmd);
             }, (array) $tasks);
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $id  = $mgr->createGroup($builders);
             return $this->json(['group_id' => $id]);
         } catch (\think\exception\HttpException $e) {
@@ -429,7 +481,7 @@ class XhjobTask extends BaseController
             $id    = $this->request->param('id');
             $cmd   = $this->request->param('cmd', 'echo updated');
             $cron  = $this->request->param('cron', '*/5 * * * *');
-            $mgr   = new TaskManager();
+            $mgr   = $this->xhjobManager();
             $newId = $mgr->update((string) $id, TaskBuilder::shell((string) $cmd)->cron((string) $cron));
             return $this->json(['task_id' => $newId, 'updated' => true]);
         } catch (\think\exception\HttpException $e) {
@@ -448,7 +500,7 @@ class XhjobTask extends BaseController
     {
         try {
             $id  = $this->request->param('id');
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $ok  = $mgr->pause((string) $id);
             if (!$ok) {
                 return $this->json(['ok' => false, 'error' => 'Failed to pause task (id=' . $id . ')'], 500);
@@ -470,7 +522,7 @@ class XhjobTask extends BaseController
     {
         try {
             $id  = $this->request->param('id');
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $ok  = $mgr->resume((string) $id);
             if (!$ok) {
                 return $this->json(['ok' => false, 'error' => 'Failed to resume task (id=' . $id . ')'], 500);
@@ -493,7 +545,7 @@ class XhjobTask extends BaseController
         try {
             $id   = $this->request->param('id');
             $cron = $this->request->param('cron');
-            $mgr  = new TaskManager();
+            $mgr  = $this->xhjobManager();
             $ok   = $mgr->reschedule((string) $id, (string) $cron);
             if (!$ok) {
                 return $this->json(['ok' => false, 'error' => 'Failed to reschedule task (id=' . $id . ')'], 500);
@@ -515,7 +567,7 @@ class XhjobTask extends BaseController
     {
         try {
             $id  = $this->request->param('id');
-            $mgr = new TaskManager();
+            $mgr = $this->xhjobManager();
             $mgr->remove((string) $id);
             return $this->json(['removed' => true]);
         } catch (\think\exception\HttpException $e) {
@@ -537,7 +589,7 @@ class XhjobTask extends BaseController
     public function chainState()
     {
         $id  = $this->request->param('id');
-        $mgr = new TaskManager();
+        $mgr = $this->xhjobManager();
         return $this->json($mgr->chainState((string) $id));
     }
 
@@ -549,7 +601,7 @@ class XhjobTask extends BaseController
     public function groupState()
     {
         $id  = $this->request->param('id');
-        $mgr = new TaskManager();
+        $mgr = $this->xhjobManager();
         return $this->json($mgr->groupState((string) $id));
     }
 
@@ -560,7 +612,7 @@ class XhjobTask extends BaseController
     /**
      * POST /xhjob/demo — 完整演示（一次性跑完所有功能）
      *
-     * 使用独立的 'tp-demo' 服务实例，避免污染默认服务。
+     * 使用 config('xhjob.*') 统一配置的服务实例；如需隔离 demo 数据，请通过 .env 设置 XHJOB_SERVICE + XHJOB_DATA_DIR。
      * 改为 POST 路由：demo 会起停 daemon + 派发任务，属状态变更操作，
      * 不应暴露为 GET（避免爬虫 / 预取 / 预检触发 daemon 生命周期）。
      * 方法体用 try/finally 包裹，确保即使中间步骤抛异常也始终停止 daemon。
@@ -570,8 +622,8 @@ class XhjobTask extends BaseController
     public function demo()
     {
         $results = [];
-        $svc     = new XhjobService('tp-demo', '/tmp/xhjob-tp-demo');
-        $mgr     = new TaskManager('tp-demo', '/tmp/xhjob-tp-demo');
+        $svc     = $this->xhjobService();
+        $mgr     = $this->xhjobManager();
 
         try {
             // 1. 启动 daemon
@@ -620,7 +672,7 @@ class XhjobTask extends BaseController
             // $fid = Xhjob::create(TaskBuilder::shell('echo facade-demo'));
         } finally {
             // 9. 停止 daemon（try/finally 确保中间步骤抛异常时也始终停止 daemon，
-            //    避免 demo 失败残留 tp-demo daemon 占用资源）
+            //    避免 demo 失败残留 demo daemon 占用资源）
             $svc->stop();
             $results['stop'] = ['stopped' => true];
         }

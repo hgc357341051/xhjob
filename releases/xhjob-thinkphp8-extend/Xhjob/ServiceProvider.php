@@ -38,16 +38,37 @@ class ServiceProvider extends Service
         // 注册 daemon 服务实例（XhjobService）
         // 注意：闭包参数必须类型注解 \think\App，容器才能自动解析
         $this->app->bind('xhjob.service', function (\think\App $app) {
-            $name    = $app->config->get('xhjob.service_name', 'default');
-            $dataDir = $app->config->get('xhjob.data_dir', null);
+            [$name, $dataDir] = self::resolveConfig($app);
             return new XhjobService($name, $dataDir);
         });
 
         // 注册任务管理器（TaskManager）
         $this->app->bind('xhjob.manager', function (\think\App $app) {
-            $name    = $app->config->get('xhjob.service_name', 'default');
-            $dataDir = $app->config->get('xhjob.data_dir', null);
+            [$name, $dataDir] = self::resolveConfig($app);
             return new TaskManager($name, $dataDir);
         });
+    }
+
+    /**
+     * 解析 xhjob 配置：service_name 与 data_dir
+     *
+     * data_dir 未配置时回退到 runtime_path/xhjob，
+     * 确保 web 用户（如宝塔 www）必然可写，避免 Rust 扩展回退到 /tmp。
+     *
+     * @param \think\App $app
+     * @return array{0:string,1:string} [$name, $dataDir]
+     */
+    private static function resolveConfig(\think\App $app): array
+    {
+        $name = $app->config->get('xhjob.service_name', 'default');
+        $name = is_string($name) && $name !== '' ? $name : 'default';
+
+        $dataDir = $app->config->get('xhjob.data_dir');
+        if (!is_string($dataDir) || $dataDir === '') {
+            // 回退到 runtime_path/xhjob（web 用户必然可写）
+            $dataDir = $app->getRuntimePath() . 'xhjob';
+        }
+
+        return [$name, $dataDir];
     }
 }

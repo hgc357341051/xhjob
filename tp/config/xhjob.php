@@ -8,7 +8,8 @@
 return [
     // 服务名（多实例时通过该值区分 daemon 与 sock 文件）
     'service_name' => env('XHJOB_SERVICE', 'default'),
-    // 数据目录（默认 null 由扩展内置）
+    // 数据目录（默认 null 由控制器 / ServiceProvider 回退到 runtime_path/xhjob，
+    // 确保 www / nginx 等 web 用户可写；显式设置可覆盖）
     'data_dir'     => env('XHJOB_DATA_DIR', null),
     // API Token（必填：/xhjob/* HTTP 网关鉴权用；未配置时 XhjobAuth 中间件 fail closed 拒绝所有请求）
     'api_token'    => env('XHJOB_API_TOKEN', null),
