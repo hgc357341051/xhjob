@@ -57,33 +57,60 @@ pub fn ipc_path(service_name: &str, data_dir: Option<&str>) -> String {
 }
 
 /// Fallback sock directory when no explicit dir is provided (Unix only).
-/// P0 fix: changed from `/tmp` to `/run/xhjob` (or `/var/run/xhjob` on
-/// systems without `/run`). `/tmp` is world-writable and sticky-bitted,
-/// making the socket path vulnerable to symlink attacks / name squatting
-/// by other local users. `/run/xhjob` is root-owned (daemon runs as root
-/// or a dedicated user) with 0o755 perms, which combined with the
-/// per-directory 0o700 set in bind() makes the socket path non-accessible
-/// to other users. Falls back to `/tmp` only if `/run` does not exist.
+///
+/// Resolution order:
+///   1. `/run/xhjob` (preferred — systemd tmpfs, root-owned, more secure
+///      than `/tmp` because it's not world-writable + sticky-bitted, so
+///      less vulnerable to symlink attacks / name squatting)
+///   2. `/var/run/xhjob` (legacy systemd path, same security properties)
+///   3. `/tmp` (last resort — always writable by non-root daemons, but
+///      less secure)
+///
+/// CRITICAL: each candidate is probed for writability before being returned.
+/// A previous version returned `/run/xhjob` unconditionally when `/run`
+/// existed, but `create_dir_all("/run/xhjob")` fails for non-root daemons
+/// (e.g. PHP-FPM workers as uid=1001) because `/run` is typically root:root
+/// 0755. Returning an unwritable path caused the subsequent `bind()` to fail
+/// with EACCES, crashing the daemon. Now we create a probe file to verify
+/// writability and fall through to `/tmp` if the candidate is not usable.
 #[cfg(unix)]
 fn fallback_sock_dir() -> String {
-    if std::path::Path::new("/run").exists() {
-        // /run is typically a tmpfs mounted by systemd; create xhjob subdir.
-        let candidate = "/run/xhjob";
-        let _ = std::fs::create_dir_all(candidate);
-        // Set 0o700 on the directory we created.
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    // Try /run/xhjob first (systemd tmpfs, root-owned, more secure than /tmp).
+    // CRITICAL: only return /run/xhjob if we can actually create+write to it.
+    // Non-root daemons (e.g. PHP-FPM workers running as uid=1001) cannot write
+    // to /run/ (typically root:root 0755). Returning /run/xhjob when
+    // create_dir_all failed would cause the subsequent bind() to fail with
+    // EACCES, crashing the daemon. So we probe writability and fall back to
+    // /tmp if /run/xhjob is not usable.
+    for candidate in ["/run/xhjob", "/var/run/xhjob"] {
+        if !std::path::Path::new(candidate).exists() {
+            // Try to create it. If create_dir_all fails (non-root), skip.
+            if std::fs::create_dir_all(candidate).is_err() {
+                continue;
+            }
+        }
+        // Ensure 0o700 perms (if we have permission to set them).
         let _ = std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700));
-        candidate.to_string()
-    } else if std::path::Path::new("/var/run").exists() {
-        let candidate = "/var/run/xhjob";
-        let _ = std::fs::create_dir_all(candidate);
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o700));
-        candidate.to_string()
-    } else {
-        // Last resort: /tmp (less secure, but better than failing to start).
-        "/tmp".to_string()
+        // Probe writability by creating a temp file. If this fails, the dir
+        // exists but we can't write to it (e.g. root-owned /run/xhjob from a
+        // previous root daemon start) — skip to next candidate.
+        let probe = std::path::Path::new(candidate).join(".xhjob_write_probe");
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&probe)
+            .is_ok()
+        {
+            let _ = std::fs::remove_file(&probe);
+            return candidate.to_string();
+        }
     }
+    // Last resort: /tmp (world-writable + sticky bit; less secure but always
+    // usable by non-root daemons). This matches the behavior of pid_file_path
+    // / log_file_path which also fall back to /tmp.
+    "/tmp".to_string()
 }
 
 /// Frame protocol: length-prefixed JSON.

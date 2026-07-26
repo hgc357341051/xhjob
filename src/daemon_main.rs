@@ -28,6 +28,39 @@ fn new_id() -> String {
     format!("{:016x}{:08x}", nanos, n as u32)
 }
 
+/// Resolve the daemon's log directory, with graceful fallback.
+///
+/// Resolution order (MUST match `xhjob_diag`/`xhjob_start` for consistency):
+///   1. `service::current_data_dir()` — set by `xhjob_run_daemon(_, Some(dir))`
+///      via the `-r` code string argument
+///   2. Falls through to `daemon::resolve_data_dir(None)` which checks
+///      `XHJOB_DATA_DIR` env var, then `XHJOB_LOG_DIR`, then platform default
+///      (`/tmp` on Unix, `%TEMP%` on Windows)
+///
+/// If `create_dir_all` fails on the resolved directory (e.g. user-specified
+/// `XHJOB_DATA_DIR` points to a path not writable by the daemon's uid), fall
+/// back to `std::env::temp_dir()` so the daemon can still start and write logs
+/// somewhere. This avoids a panic in `tracing_appender::rolling::daily` which
+/// calls `create_dir_all(parent)` internally and panics on failure.
+///
+/// The previous fallback `/var/log/xhjob` was removed because:
+///   - It was inconsistent with `xhjob_diag`/`xhjob_start` (which use `/tmp`)
+///   - FPM workers (uid=1001) cannot write to `/var/log/` → panic
+fn resolve_log_dir() -> String {
+    let dir = crate::daemon::resolve_data_dir(
+        crate::service::current_data_dir().as_deref(),
+    );
+    if std::fs::create_dir_all(&dir).is_ok() {
+        return dir;
+    }
+    let fallback = std::env::temp_dir().to_string_lossy().into_owned();
+    eprintln!(
+        "xhjob: WARNING could not create log dir '{}', falling back to '{}'",
+        dir, fallback
+    );
+    fallback
+}
+
 /// The daemon entry point. Called by daemon::spawn_daemon(daemon_main) after fork.
 pub fn daemon_main() {
     // P0-13: Load the config file (if any) into the process environment
@@ -63,9 +96,13 @@ pub fn daemon_main() {
     // file. This creates files like `xhjob.default.log.2026-07-22` and
     // rotates once per day, preventing unbounded log growth. The stderr
     // redirect in daemon/unix.rs is kept for panic/crash output only.
-    let log_dir =
-        crate::service::current_data_dir().unwrap_or_else(|| "/var/log/xhjob".to_string());
-    let _ = std::fs::create_dir_all(&log_dir);
+    //
+    // Log directory resolution is delegated to `resolve_log_dir()` which
+    // matches `xhjob_diag`/`xhjob_start` semantics (data_dir → env var →
+    // `/tmp`) and falls back to `std::env::temp_dir()` if `create_dir_all`
+    // fails, avoiding the panic that occurred when the old `/var/log/xhjob`
+    // fallback was not writable by FPM workers.
+    let log_dir = resolve_log_dir();
     let service_name = crate::service::current();
     let file_appender =
         tracing_appender::rolling::daily(&log_dir, format!("xhjob.{}.log", service_name));
@@ -1447,4 +1484,60 @@ fn install_unix_signal_handler() -> tokio::sync::mpsc::Receiver<i32> {
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_log_dir;
+
+    /// When `XHJOB_DATA_DIR` env var is set, `resolve_log_dir` should honor it
+    /// (because `current_data_dir()` returns None in test context — OnceLock
+    /// not set — and `resolve_data_dir(None)` reads the env var).
+    #[test]
+    fn test_resolve_log_dir_uses_env_var_when_set() {
+        // Save and restore env var
+        let saved = std::env::var("XHJOB_DATA_DIR").ok();
+        // Use a tempdir we can actually create so create_dir_all succeeds
+        let tmp = std::env::temp_dir().join("xhjob_test_resolve_log_dir_env");
+        std::env::set_var("XHJOB_DATA_DIR", &tmp);
+        let result = resolve_log_dir();
+        // The result should be the tmp path (canonicalized comparison is tricky,
+        // so just check the env var value appears in the result or they're equal
+        // after canonicalize).
+        let result_canon = std::fs::canonicalize(&result).ok();
+        let tmp_canon = std::fs::canonicalize(&tmp).ok();
+        assert_eq!(result_canon, tmp_canon,
+            "resolve_log_dir() = {:?}, expected {:?} (from XHJOB_DATA_DIR)", result, tmp);
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Some(s) = saved {
+            std::env::set_var("XHJOB_DATA_DIR", s);
+        } else {
+            std::env::remove_var("XHJOB_DATA_DIR");
+        }
+    }
+
+    /// When no `XHJOB_DATA_DIR` is set and `current_data_dir()` is None
+    /// (test binary doesn't call `set_current_data_dir`), `resolve_log_dir`
+    /// should fall back to `resolve_data_dir(None)` which returns `/tmp` on
+    /// Unix (or `%TEMP%` on Windows). The result must be a writable directory
+    /// (create_dir_all succeeds, so no fallback to temp_dir triggered).
+    #[test]
+    fn test_resolve_log_dir_falls_back_to_tmp_when_unset() {
+        let saved = std::env::var("XHJOB_DATA_DIR").ok();
+        std::env::remove_var("XHJOB_DATA_DIR");
+        let saved_log = std::env::var("XHJOB_LOG_DIR").ok();
+        std::env::remove_var("XHJOB_LOG_DIR");
+        let result = resolve_log_dir();
+        // On Unix the default is /tmp; on Windows it's %TEMP%. Either way it
+        // must be a path that exists and is writable (create_dir_all succeeded
+        // because we didn't hit the fallback branch).
+        assert!(!result.is_empty(), "resolve_log_dir returned empty string");
+        // The path should exist (resolve_data_dir's default /tmp exists)
+        assert!(std::path::Path::new(&result).exists(),
+            "resolve_log_dir() = {:?} does not exist", result);
+        // Restore
+        if let Some(s) = saved { std::env::set_var("XHJOB_DATA_DIR", s); }
+        if let Some(s) = saved_log { std::env::set_var("XHJOB_LOG_DIR", s); }
+    }
 }
