@@ -41,7 +41,7 @@ pub fn log_file_path(service_name: &str, data_dir: Option<&str>) -> PathBuf {
 ///   2. Fine-grained env var `fine_grained_var` (if set and non-empty)
 ///   3. Unified `XHJOB_DATA_DIR` env var (if set and non-empty)
 ///   4. Platform default (`/tmp` on Unix, `%TEMP%` on Windows)
-fn resolve_dir_path(data_dir: Option<&str>, fine_grained_var: &str) -> PathBuf {
+pub(crate) fn resolve_dir_path(data_dir: Option<&str>, fine_grained_var: &str) -> PathBuf {
     if let Some(d) = data_dir {
         if !d.is_empty() {
             return PathBuf::from(d);
@@ -231,6 +231,575 @@ extern "C" {
 #[cfg(unix)]
 unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
     kill(pid, sig)
+}
+
+// =========================================================================
+// PHP runtime symbol lookup (for extension-load dedup)
+// =========================================================================
+//
+// PHP exposes the SAPI name and loaded ini paths as GLOBAL VARIABLES (not
+// linkable C functions): `sapi_module.name`, `php_ini_opened_path`, and
+// `php_ini_scanned_files`. The userland `php_sapi_name()` / `php_ini_loaded_file()`
+// functions are `static inline` wrappers in PHP headers, so they have no
+// linkable symbol entry — we must read the underlying globals directly.
+//
+// To keep the unit-test binary linkable (it does NOT link against the PHP
+// runtime), we resolve these symbols at RUNTIME via `dlsym(RTLD_DEFAULT, ...)`
+// on Unix and `GetModuleHandleA(NULL)` + `GetProcAddress(...)` on Windows.
+// When the symbols are unavailable (test binary, or a non-PHP host), every
+// lookup returns null and `xhjob_loaded_via_php_ini()` conservatively
+// returns false (caller keeps `-d extension=xhjob.so`).
+
+/// Minimal `repr(C)` view of PHP's `sapi_module_struct`. We only read the
+/// first field (`name: *mut c_char`), so the remaining fields are omitted —
+/// the struct layout is irrelevant for a single-field prefix read.
+#[repr(C)]
+struct SapiModuleStruct {
+    name: *mut std::os::raw::c_char,
+}
+
+/// `RTLD_DEFAULT` for `dlsym`. The libc crate does not expose this constant
+/// on every Unix target (notably Linux glibc and macOS), so define it here.
+/// Values: glibc/Linux = `NULL`; macOS/BSD = `(void*)-2`.
+#[cfg(unix)]
+const RTLD_DEFAULT: *mut std::ffi::c_void = {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+    ))]
+    {
+        -2isize as *mut std::ffi::c_void
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+    )))]
+    {
+        std::ptr::null_mut()
+    }
+};
+
+/// Look up a PHP runtime symbol at runtime (not link-time). Returns null if
+/// the symbol isn't available (e.g., in the unit-test binary which doesn't
+/// link against PHP).
+///
+/// # Safety
+///
+/// `name` MUST be a NUL-terminated C string (e.g. `b"php_ini_opened_path\0"`).
+unsafe fn lookup_php_symbol(name: &[u8]) -> *mut std::ffi::c_void {
+    debug_assert!(
+        name.ends_with(b"\0"),
+        "lookup_php_symbol: name must be NUL-terminated"
+    );
+    #[cfg(unix)]
+    {
+        // SAFETY: `dlsym` with `RTLD_DEFAULT` searches the global symbol
+        // table of the current process. The `name` is a NUL-terminated C
+        // string. The lookup is read-only and has no side effects. When the
+        // symbol is not found, `dlsym` returns NULL and sets `dlerror`.
+        libc::dlsym(RTLD_DEFAULT, name.as_ptr() as *const _)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: `GetModuleHandleA(NULL)` returns a borrowed handle to the
+        // main executable (php.exe / php-fpm.exe) without incrementing its
+        // refcount. Read-only, no side effects. Returns 0 (NULL) on failure.
+        let hmod = GetModuleHandleA(std::ptr::null());
+        if hmod == 0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `name` is a NUL-terminated C string. `GetProcAddress` does
+        // not mutate it. Returns `None` when the symbol is not exported by
+        // the module.
+        let proc = GetProcAddress(hmod, name.as_ptr() as *const u8);
+        match proc {
+            Some(f) => f as *mut std::ffi::c_void,
+            None => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Read the SAPI name (e.g. `"cli"`, `"fpm-fcgi"`, `"apache2handler"`) from
+/// the PHP `sapi_module` global. Returns `None` on any FFI/error (e.g., when
+/// the PHP runtime is not loaded, as in unit tests).
+///
+/// Exposed as `pub(crate)` so `xhjob_diag()` can include the SAPI name in
+/// the diagnostic JSON. The function is safe to call from any context: all
+/// FFI pointer dereferences are guarded by null checks, and the underlying
+/// PHP globals are read-only (populated once at SAPI startup, kept valid for
+/// the process lifetime).
+pub(crate) fn read_sapi_name() -> Option<String> {
+    // SAFETY: `lookup_php_symbol` is read-only and returns null gracefully
+    // when the symbol is unavailable (test binary, non-PHP host). The
+    // returned pointer is null-checked before dereferencing; PHP guarantees
+    // the `sapi_module.name` field is a stable NUL-terminated C string for
+    // the process lifetime once SAPI startup completes.
+    unsafe {
+        let sym = lookup_php_symbol(b"sapi_module\0");
+        if sym.is_null() {
+            return None;
+        }
+        let sapi_module_ptr = sym as *mut SapiModuleStruct;
+        let name_ptr = (*sapi_module_ptr).name;
+        if name_ptr.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(name_ptr);
+        Some(cstr.to_string_lossy().into_owned())
+    }
+}
+
+/// Read a PHP global `char *` variable (e.g. `php_ini_opened_path`,
+/// `php_ini_scanned_files`). Returns `None` on any FFI/error or when the
+/// variable itself is NULL (e.g. no ini file loaded).
+///
+/// # Safety
+///
+/// The function dereferences raw FFI pointers obtained via `lookup_php_symbol`.
+unsafe fn read_php_cstring_global(symbol: &[u8]) -> Option<String> {
+    let sym = lookup_php_symbol(symbol);
+    if sym.is_null() {
+        return None;
+    }
+    // SAFETY: `sym` is the address of a `char *` global variable. We
+    // dereference once to read the `char *` value, then read the C string it
+    // points to. PHP owns the string memory and keeps it alive for the
+    // process lifetime.
+    let char_ptr_ptr = sym as *mut *mut std::os::raw::c_char;
+    let char_ptr = *char_ptr_ptr;
+    if char_ptr.is_null() {
+        return None;
+    }
+    let cstr = std::ffi::CStr::from_ptr(char_ptr);
+    Some(cstr.to_string_lossy().into_owned())
+}
+
+/// Detect whether the xhjob extension is loaded via php.ini (vs. via `-d
+/// extension=` on the CLI). When loaded via php.ini, the spawned daemon PHP
+/// process will automatically load xhjob by reading the same php.ini, so we
+/// must NOT pass `-d extension=xhjob.so` again (would trigger PHP's
+/// "Module already loaded" warning).
+///
+/// Heuristic:
+///   1. FPM (`fpm-fcgi`) and Apache (`apache2handler`, `apache2filter`)
+///      SAPIs always read php.ini and scan conf.d directories, so xhjob is
+///      loaded via ini — return true.
+///   2. CLI (`cli`) SAPI may or may not have xhjob in php.ini — fall back to
+///      reading the loaded php.ini path + scanned files and grepping their
+///      contents for `extension=...xhjob`.
+///   3. On any FFI/error: return false (conservative — keep `-d extension=`).
+pub fn xhjob_loaded_via_php_ini() -> bool {
+    let sapi = read_sapi_name().unwrap_or_default();
+    // FPM / Apache SAPIs always read php.ini + scan conf.d, and the
+    // "Module already loaded" warning in production proves xhjob is in there.
+    if sapi.starts_with("fpm") || sapi.contains("apache") {
+        return true;
+    }
+    // For CLI (and any other SAPI, conservatively) — read the loaded ini
+    // file path + scanned files and grep their contents for an
+    // `extension=...xhjob` directive.
+    let opened = unsafe { read_php_cstring_global(b"php_ini_opened_path\0") }.unwrap_or_default();
+    let scanned = unsafe { read_php_cstring_global(b"php_ini_scanned_files\0") }.unwrap_or_default();
+    ini_references_xhjob_extension(&opened, &scanned)
+}
+
+/// Strip a trailing PHP ini inline comment from a directive value. PHP
+/// treats ` ;` (whitespace + semicolon) as the start of an inline comment
+/// within a value, but NOT a leading `;` (which is part of the value). We
+/// also handle ` #` for robustness, since PHP 8+ accepts `#` as a comment
+/// marker in some contexts.
+fn strip_ini_inline_comment(value: &str) -> &str {
+    let cut = value
+        .find(" ;")
+        .or_else(|| value.find(" #"))
+        .unwrap_or(value.len());
+    value[..cut].trim_end()
+}
+
+/// Grep the loaded php.ini file (and scanned ini files) for an
+/// `extension=...xhjob` (or `zend_extension=...xhjob`) directive.
+///
+/// `opened` is the path returned by PHP's `php_ini_opened_path` global
+/// (the primary php.ini file). `scanned` is the comma-and-newline-separated
+/// list of paths returned by `php_ini_scanned_files` (the conf.d scan
+/// result). Both are read best-effort; missing/unreadable files are skipped.
+fn ini_references_xhjob_extension(opened: &str, scanned: &str) -> bool {
+    let mut haystack = String::new();
+    // Best-effort: read the primary loaded php.ini file.
+    if !opened.is_empty() {
+        if let Ok(contents) = std::fs::read_to_string(opened) {
+            haystack.push_str(&contents);
+            haystack.push('\n');
+        }
+    }
+    // Best-effort: read each scanned ini file. The `php_ini_scanned_files`
+    // format is "path1,\npath2,\npath3\n" (comma + newline separator).
+    for entry in scanned.split([',', '\n']) {
+        let path = entry.trim();
+        if !path.is_empty() {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                haystack.push_str(&contents);
+                haystack.push('\n');
+            }
+        }
+    }
+    // Grep for `extension=...xhjob` directives. PHP ini directive names are
+    // case-insensitive; we match the extension basename case-insensitively
+    // for cross-platform robustness (Unix is case-sensitive, Windows isn't).
+    // PHP's ini parser also tolerates whitespace around the `=` separator, so
+    // `extension = xhjob.so` is equivalent to `extension=xhjob.so`.
+    for line in haystack.lines() {
+        let trimmed = line.trim();
+        // Skip comments and blank lines.
+        if trimmed.starts_with(';') || trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // Split on the first `=` — the key is everything before, the value
+        // everything after (PHP does not allow `=` in directive names).
+        let (key, value) = match lower.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+        if key != "extension" && key != "zend_extension" {
+            continue;
+        }
+        // Strip trailing inline comments. PHP ini treats ` ;` (space-semicolon)
+        // as a comment start within a value, but NOT a leading `;` (which is
+        // part of the value). For robustness, strip from the first ` ;` and
+        // also handle ` #`.
+        let value = strip_ini_inline_comment(value);
+        // Match `xhjob`, `xhjob.so`, or any path ending in `xhjob.so`.
+        // (PHP normalizes `extension=xhjob` and `extension=xhjob.so` to the
+        // same load on Unix; absolute paths are also valid.)
+        if value == "xhjob"
+            || value == "xhjob.so"
+            || value.ends_with("/xhjob.so")
+            || value.ends_with("\\xhjob.so")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Test-friendly helper: returns the inverse of `xhjob_loaded_via_php_ini()`,
+/// i.e. whether the caller SHOULD inject `-d extension=xhjob.so`. Extracted
+/// as a named function so the spawn paths (`unix.rs` / `windows.rs`) and the
+/// unit tests share a single decision point — no risk of the two diverging.
+pub(crate) fn should_inject_extension_arg() -> bool {
+    !xhjob_loaded_via_php_ini()
+}
+
+// =========================================================================
+// spawn-after-wait diagnostic
+// =========================================================================
+
+/// Read the last 2KB of a file as a UTF-8-lossy `String`. Used to capture
+/// the daemon log file tail when the spawned daemon child exits prematurely
+/// (setsid error, missing PHP binary, `-r` parse error, etc.), so the
+/// diagnostic error returned to the caller carries the actual failure cause
+/// instead of a generic "spawn ok but daemon never came up".
+///
+/// On any error (file missing, permission denied, seek past start, ...) the
+/// function returns the placeholder `"<no log file or empty>"` so the caller
+/// can unconditionally format the result into an error message without an
+/// extra branch.
+pub(crate) fn read_log_tail(path: &std::path::Path) -> String {
+    const TAIL_BYTES: u64 = 2048;
+    // Open the file read-only. If it doesn't exist (daemon never got far
+    // enough to create it) or cannot be read, return the placeholder.
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return "<no log file or empty>".to_string(),
+    };
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return "<no log file or empty>".to_string(),
+    };
+    // If the file is smaller than TAIL_BYTES, just read the whole thing.
+    let offset = len.saturating_sub(TAIL_BYTES);
+    use std::io::{Read, Seek, SeekFrom};
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return "<no log file or empty>".to_string();
+    }
+    let mut buf = Vec::with_capacity(TAIL_BYTES as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return "<no log file or empty>".to_string();
+    }
+    if buf.is_empty() {
+        return "<no log file or empty>".to_string();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the last 2KB of the daemon log file for `service_name` + optional
+/// `data_dir`, resolving the log path via the same priority chain as
+/// `log_file_path`. Returns the placeholder string when the log file does
+/// not exist or cannot be read.
+///
+/// Wraps `log_file_path` + `read_log_tail` so `xhjob_start` can build a
+/// diagnostic message in one call without re-deriving the path.
+pub(crate) fn read_daemon_log_tail(service_name: &str, data_dir: Option<&str>) -> String {
+    let path = log_file_path(service_name, data_dir);
+    read_log_tail(&path)
+}
+
+/// Resolve the final data directory for `data_dir` (using the same priority
+/// chain as `pid_file_path` / `log_file_path`) and return it as a string.
+/// Used by `xhjob_diag()` so the diagnostic JSON shows the user the actual
+/// resolved directory instead of just the raw `data_dir` argument.
+pub(crate) fn resolve_data_dir(data_dir: Option<&str>) -> String {
+    resolve_dir_path(data_dir, "XHJOB_PID_DIR")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Read the PHP `open_basedir` ini entry at runtime via the
+/// `zend_ini_string_ex` FFI symbol. Returns `None` on any failure (test
+/// binary not linked against PHP, symbol missing, ini not set, ...).
+///
+/// The function looks up `zend_ini_string_ex` via dlsym/GetProcAddress and
+/// calls it with `"open_basedir"`. The returned `zend_string*` is read via
+/// a `#[repr(C)]` mirror of PHP's struct layout; the `val` field is at
+/// offset `sizeof(gc) + sizeof(h) + sizeof(len)`.
+///
+/// Used by `xhjob_diag()` so the diagnostic JSON reports the active
+/// `open_basedir` restriction (a common cause of daemon spawn failures in
+/// PHP-FPM contexts where the worker is sandboxed to specific paths).
+pub(crate) fn read_open_basedir() -> Option<String> {
+    // SAFETY: the FFI lookup is read-only and returns null gracefully when
+    // the symbol is unavailable. The returned zend_string* is null-checked
+    // before reading. PHP ini entries are stable for the process lifetime
+    // after MINIT, so reading the value at any point after startup is safe.
+    unsafe {
+        let sym = lookup_php_symbol(b"zend_ini_string_ex\0");
+        if sym.is_null() {
+            return None;
+        }
+        // Signature: zend_string* zend_ini_string_ex(const char* name,
+        //                                           size_t name_length,
+        //                                           zend_bool orig,
+        //                                           zend_bool *exists);
+        // Pass exists=NULL so the function does not try to write the
+        // "found" flag back through our (uninitialized) pointer.
+        let func: extern "C" fn(
+            *const std::os::raw::c_char,
+            usize,
+            std::os::raw::c_int,
+            *mut std::os::raw::c_uchar,
+        ) -> *mut ZendString = std::mem::transmute(sym);
+        let name = b"open_basedir\0";
+        let zs_ptr = func(name.as_ptr() as *const _, 12, 0, std::ptr::null_mut());
+        if zs_ptr.is_null() {
+            return None;
+        }
+        // Read the `len` field at the repr(C) offset, then read `len` bytes
+        // from `val` (which immediately follows `len` in the layout).
+        let len = (*zs_ptr).len as usize;
+        if len == 0 {
+            return Some(String::new());
+        }
+        // Cap the read at 4KB to guard against a corrupt len field causing
+        // an outsized allocation. The real `open_basedir` value is always a
+        // short path list well under 4KB.
+        let cap = len.min(4096);
+        let val_ptr = (&(*zs_ptr).val) as *const std::os::raw::c_char;
+        let slice = std::slice::from_raw_parts(val_ptr as *const u8, cap);
+        Some(String::from_utf8_lossy(slice).into_owned())
+    }
+}
+
+/// `#[repr(C)]` mirror of PHP's `zend_string` struct used by
+/// `read_open_basedir`. Only the fields we read (`len`, `val`) are
+/// declared; the layout is determined by `repr(C)` so the compiler matches
+/// PHP's C-side layout.
+///
+/// Layout (PHP 8.x on 64-bit):
+///   - `gc`: zend_refcounted_h = { uint32_t refcount; union { uint32_t
+///     type_info; } u; } = 8 bytes
+///   - `h`: zend_ulong = size_t = 8 bytes
+///   - `len`: size_t = 8 bytes
+///   - `val`: char[1] flexible array member — accessed via pointer
+///     arithmetic from the address of `val[0]`
+///
+/// `usize` is used for `h` and `len` so the layout is correct on both
+/// 32-bit and 64-bit targets (matching PHP's `size_t`).
+#[repr(C)]
+struct ZendString {
+    _gc: [u32; 2], // zend_refcounted_h (8 bytes on all platforms)
+    _h: usize,     // zend_ulong (= size_t)
+    len: usize,    // size_t
+    val: std::os::raw::c_char, // flexible array member — address taken only
+}
+
+/// Wait briefly (500ms, polled every 50ms) for `child` to exit. Used by the
+/// daemon spawn paths (`unix::spawn_via_double_fork` /
+/// `windows::spawn_via_create_process`) right after `cmd.spawn()`: if the
+/// child PHP process exits immediately (setsid failure, missing PHP binary,
+/// `-r` parse error), we surface the failure as an `Err` carrying the exit
+/// status + daemon log tail — instead of letting the parent time out after
+/// 10s returning `Ok(false)` with no diagnostic.
+///
+/// Returns:
+/// - `Ok(())` if the child is still running after 500ms (normal detach path).
+///   The child handle is `mem::forget`-en so the detached process is NOT
+///   killed when the `Child` drop runs in the parent — we explicitly want
+///   the daemon to keep running.
+/// - `Err(XhjobError::Io(...))` if the child exited within 500ms. The error
+///   message includes the exit status, service name, log file path, and the
+///   last 2KB of the log file for diagnostics.
+/// - `Err(...)` if `try_wait` itself fails.
+///
+/// Extracted as a `pub(crate)` helper so unit tests can exercise the
+/// "child-exits-immediately" branch directly by spawning `/bin/false` (Unix)
+/// or `cmd /c exit 1` (Windows) without mocking the entire daemon spawn.
+pub(crate) fn check_child_alive(
+    mut child: std::process::Child,
+    log_path: &std::path::Path,
+    service_name: &str,
+) -> Result<()> {
+    // Poll try_wait() every 50ms for 500ms (10 polls). If the child has not
+    // exited by then, treat it as the normal detach path. try_wait() is in
+    // std (unlike wait_timeout which is Unix-only); this approach works
+    // cross-platform with no extra dependencies.
+    let poll_interval = Duration::from_millis(50);
+    let poll_count = 10u32;
+    for _ in 0..poll_count {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Child already exited — definitely failed. Read the log tail
+                // for diagnostics and return a structured error.
+                let log_tail = read_log_tail(log_path);
+                return Err(XhjobError::Io(std::io::Error::other(format!(
+                    "daemon child exited prematurely with status {:?}; service={}; \
+                     log file: {}; log tail (last 2KB):\n{}",
+                    status,
+                    service_name,
+                    log_path.display(),
+                    log_tail,
+                ))));
+            }
+            Ok(None) => {
+                // Child still running — keep polling until the deadline.
+                std::thread::sleep(poll_interval);
+            }
+            Err(e) => {
+                // try_wait itself failed — propagate.
+                return Err(XhjobError::Io(e));
+            }
+        }
+    }
+    // 500ms elapsed and the child is still running — normal detach path.
+    // Drop the handle WITHOUT killing the child: std::process::Child does
+    // not auto-kill on drop in std (only some platform-specific Drop
+    // implementations do, and we explicitly want the daemon to survive).
+    // `mem::forget` ensures the platform Drop (which on some Rust versions
+    // attempts to close handles / reap the child) does not run, leaving the
+    // daemon fully detached.
+    std::mem::forget(child);
+    Ok(())
+}
+
+// =========================================================================
+// data_dir writability pre-check
+// =========================================================================
+
+/// Current real user ID (Unix). On Windows returns 0 (no concept of uid).
+#[cfg(unix)]
+pub(crate) fn current_uid() -> u32 {
+    // SAFETY: `getuid()` is always safe to call and has no side effects.
+    unsafe { libc::getuid() }
+}
+
+/// Current real group ID (Unix). On Windows returns 0 (no concept of gid).
+#[cfg(unix)]
+pub(crate) fn current_gid() -> u32 {
+    // SAFETY: `getgid()` is always safe to call and has no side effects.
+    unsafe { libc::getgid() }
+}
+
+/// Stub on non-Unix (Windows) — no uid concept. Kept for cross-platform
+/// diagnostic formatting.
+#[cfg(not(unix))]
+pub(crate) fn current_uid() -> u32 {
+    0
+}
+
+/// Stub on non-Unix (Windows) — no gid concept. Kept for cross-platform
+/// diagnostic formatting.
+#[cfg(not(unix))]
+pub(crate) fn current_gid() -> u32 {
+    0
+}
+
+/// Pre-flight check: ensure the resolved `data_dir` is writable by the
+/// current user. Returns `Ok(())` if writable, `Err(XhjobError::Io(...))`
+/// with a detailed message including the path, current uid/gid, PHP binary
+/// path, and log file path — so the user can fix permissions without
+/// grepping logs.
+///
+/// Resolution follows the same priority chain as `resolve_dir_path`:
+///   1. Explicit `data_dir` argument
+///   2. `XHJOB_PID_DIR` env var (Unix only)
+///   3. `XHJOB_DATA_DIR` env var
+///   4. Platform default (`/tmp` on Unix, `%TEMP%` on Windows)
+pub(crate) fn check_data_dir_writable(service_name: &str, data_dir: Option<&str>) -> Result<()> {
+    // Resolve the final dir using the same priority chain as pid_file_path /
+    // log_file_path so the pre-check reflects exactly where the daemon will
+    // try to write its PID file + IPC socket + log.
+    let dir = resolve_dir_path(data_dir, "XHJOB_PID_DIR");
+
+    // Ensure the directory exists (create_dir_all). If that fails, return
+    // an error with the path + uid/gid + PHP binary path so the operator
+    // can fix permissions without grepping logs.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(XhjobError::Io(std::io::Error::other(format!(
+            "data_dir '{}' is not writable by current user (uid={}, gid={}); \
+             failed to create_dir_all: {}; PHP binary: {:?}; log file: {}",
+            dir.display(),
+            current_uid(),
+            current_gid(),
+            e,
+            std::env::current_exe(),
+            log_file_path(service_name, data_dir).display(),
+        ))));
+    }
+
+    // Write a probe file to confirm write permission. create_dir_all
+    // succeeding does not guarantee writability (e.g. on read-only
+    // filesystems, or when the dir was created by a more-privileged
+    // pre-existing path component).
+    let probe = dir.join(".xhjob_write_test");
+    if let Err(e) = std::fs::write(&probe, b"test") {
+        return Err(XhjobError::Io(std::io::Error::other(format!(
+            "data_dir '{}' is not writable by current user (uid={}, gid={}); \
+             write probe failed: {}; PHP binary: {:?}; log file: {}",
+            dir.display(),
+            current_uid(),
+            current_gid(),
+            e,
+            std::env::current_exe(),
+            log_file_path(service_name, data_dir).display(),
+        ))));
+    }
+    // Clean up the probe file. Best-effort: ignore errors (the file is tiny
+    // and named uniquely enough not to collide with real daemon files).
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Daemon status info returned to PHP.
@@ -455,6 +1024,12 @@ pub fn spawn_daemon(
 ///
 /// Returns true if daemon is now running (either already running, or just started).
 pub fn start(daemon_main: fn() -> (), service_name: &str, data_dir: Option<&str>) -> Result<bool> {
+    // Pre-flight: verify data_dir is writable before spawning, so we can
+    // return a clear, actionable error (with path/uid/gid/PHP binary/log
+    // file) instead of a silent daemon spawn failure that the PHP side can
+    // only observe as a false return.
+    check_data_dir_writable(service_name, data_dir)?;
+
     // Fast path: a daemon is already running. Check BOTH PID liveness AND IPC
     // socket readiness — checking only PID is racy when the previous daemon is
     // shutting down (PID still alive, socket already closed). Without the
@@ -653,5 +1228,418 @@ mod tests {
             should_sigkill(Some(123_456_789)),
             "modern PID with starttime may SIGKILL after validation"
         );
+    }
+
+    // =====================================================================
+    // Task 1 tests: dedup `-d extension=xhjob.so` loading
+    // =====================================================================
+
+    #[test]
+    fn test_xhjob_loaded_via_php_ini_returns_bool() {
+        // In the unit-test binary the PHP runtime is NOT loaded, so all FFI
+        // symbol lookups return null and `xhjob_loaded_via_php_ini` must
+        // conservatively return false (do not skip `-d extension=`). We can't
+        // fully mock the FFI here, so this is a smoke test that the function
+        // does not panic and returns a bool.
+        let loaded = xhjob_loaded_via_php_ini();
+        assert!(
+            !loaded,
+            "in test binary (no PHP runtime) the detector must return false so \
+             the daemon spawn path keeps `-d extension=xhjob.so` (fail-safe)"
+        );
+    }
+
+    #[test]
+    fn test_dedup_logic_in_command_args() {
+        // Smoke test the extracted decision helper. In the test binary the
+        // helper returns true (inject `-d extension=`), since the FFI lookup
+        // fails and `xhjob_loaded_via_php_ini` returns false.
+        let should_inject = should_inject_extension_arg();
+        // Just assert it returns a bool without panicking; the actual value
+        // depends on whether the PHP runtime is loaded (it isn't in tests).
+        let _ = should_inject;
+        assert!(
+            should_inject,
+            "in test binary (no PHP runtime) the helper must return true so \
+             `-d extension=xhjob.so` is injected (fail-safe)"
+        );
+    }
+
+    #[test]
+    fn test_ini_references_xhjob_extension_detects_directive() {
+        // Pure-logic test of the ini-content grep. We write a temp ini file
+        // containing `extension=xhjob.so` and verify the helper detects it.
+        let dir = unique_test_dir("ini_detect");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let ini = dir.join("xhjob.ini");
+        std::fs::write(
+            &ini,
+            "; comment line\n\
+             extension=grpc.so\n\
+             extension=xhjob.so\n\
+             zend_extension=opcache.so\n",
+        )
+        .expect("write test ini");
+        let ini_str = ini.to_string_lossy().into_owned();
+        assert!(
+            ini_references_xhjob_extension(&ini_str, ""),
+            "extension=xhjob.so in loaded php.ini must be detected"
+        );
+
+        // Variants — case-insensitive, basename-only, full path.
+        assert!(
+            ini_references_xhjob_extension("", &format!("{},\n", ini_str)),
+            "extension=xhjob.so in scanned ini files must be detected"
+        );
+
+        // Negative: ini without xhjob.
+        let other_ini = dir.join("other.ini");
+        std::fs::write(&other_ini, "extension=grpc.so\nextension=opcache.so\n")
+            .expect("write other ini");
+        let other_str = other_ini.to_string_lossy().into_owned();
+        assert!(
+            !ini_references_xhjob_extension(&other_str, ""),
+            "ini without xhjob must NOT be reported as containing xhjob"
+        );
+
+        // Empty inputs.
+        assert!(
+            !ini_references_xhjob_extension("", ""),
+            "empty ini inputs must not be reported as containing xhjob"
+        );
+
+        // Various forms of the directive (lowercase, .so omitted, full path).
+        let variants = [
+            "extension=xhjob",
+            "EXTENSION=XHJOB.SO",
+            "zend_extension=/usr/lib/php/xhjob.so",
+            "extension = xhjob.so",
+            "extension=xhjob.so ; trailing comment",
+        ];
+        for v in variants {
+            let v_ini = dir.join(format!("v_{}.ini", hash_str(v)));
+            std::fs::write(&v_ini, format!("{}\n", v)).expect("write variant ini");
+            let v_str = v_ini.to_string_lossy().into_owned();
+            assert!(
+                ini_references_xhjob_extension(&v_str, ""),
+                "directive form {:?} must be detected as xhjob",
+                v
+            );
+        }
+
+        // Commented-out directives must NOT be detected.
+        let commented = dir.join("commented.ini");
+        std::fs::write(&commented, "; extension=xhjob.so\n# extension=xhjob\n")
+            .expect("write commented ini");
+        let commented_str = commented.to_string_lossy().into_owned();
+        assert!(
+            !ini_references_xhjob_extension(&commented_str, ""),
+            "commented-out extension=xhjob must NOT be detected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tiny deterministic string hasher for generating unique filenames in
+    /// tests (avoids pulling in a hashing crate). Not cryptographically
+    /// secure — just a collision-resistant-enough mixing for test labels.
+    fn hash_str(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    // =====================================================================
+    // Task 2 tests: data_dir writability pre-check
+    // =====================================================================
+
+    #[test]
+    fn test_check_data_dir_writable_ok() {
+        // A freshly-created temp dir must pass the writability check.
+        let dir = unique_test_dir("writable");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = check_data_dir_writable("test_writable", Some(&dir_str));
+        assert!(
+            result.is_ok(),
+            "freshly created temp dir must pass writability check, got: {:?}",
+            result
+        );
+        // The probe file must have been cleaned up.
+        let probe = dir.join(".xhjob_write_test");
+        assert!(
+            !probe.exists(),
+            "check_data_dir_writable must clean up its .xhjob_write_test probe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_data_dir_writable_fails_on_unwritable() {
+        // Skip when running as root: root bypasses Unix permission checks,
+        // so a 0o555 dir remains writable and the test cannot exercise the
+        // failure path. This is the standard pattern for permission tests.
+        if current_uid() == 0 {
+            eprintln!(
+                "skipping test_check_data_dir_writable_fails_on_unwritable: \
+                 running as root (uid=0) bypasses Unix permission checks"
+            );
+            return;
+        }
+
+        let dir = unique_test_dir("unwritable");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        // Strip write permission from the dir (read+execute only).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0o555");
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = check_data_dir_writable("test_unwritable", Some(&dir_str));
+        assert!(
+            result.is_err(),
+            "read-only (0o555) data_dir must fail writability check, got: {:?}",
+            result
+        );
+        // Verify the error message is actionable (contains path + uid).
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not writable"),
+            "error message must explain the failure, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("uid="),
+            "error message must include uid for diagnostics, got: {}",
+            err_msg
+        );
+
+        // Restore write permission so cleanup can succeed.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_check_data_dir_writable_fails_on_path_under_file() {
+        // Robust unwritable-path test that works even when running as root
+        // (root bypasses Unix permission checks). We create a regular FILE
+        // and try to use a path UNDER it as data_dir — create_dir_all fails
+        // with ENOTDIR regardless of user privileges.
+        let parent = unique_test_dir("file_blocker_parent");
+        std::fs::create_dir_all(&parent).expect("mkdir parent");
+        let blocker = parent.join("blocker_file");
+        std::fs::write(&blocker, b"i am a file, not a dir").expect("write blocker");
+        // data_dir = <parent>/blocker_file/sub — parent path component is a
+        // file, so create_dir_all cannot create this.
+        let bad_dir = blocker.join("sub");
+        let bad_dir_str = bad_dir.to_string_lossy().into_owned();
+        let result = check_data_dir_writable("test_file_blocker", Some(&bad_dir_str));
+        assert!(
+            result.is_err(),
+            "data_dir path under a regular file must fail writability check, got: {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("not writable"),
+            "error message must explain the failure, got: {}",
+            err_msg
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // =====================================================================
+    // Task 3 tests: spawn-after-wait diagnostic
+    // =====================================================================
+
+    #[test]
+    fn test_read_log_tail_returns_placeholder_when_file_missing() {
+        // Non-existent path must yield the placeholder, not a panic.
+        let path = unique_test_dir("no_log").join("missing.log");
+        let tail = read_log_tail(&path);
+        assert_eq!(
+            tail, "<no log file or empty>",
+            "missing log file must yield the placeholder"
+        );
+    }
+
+    #[test]
+    fn test_read_log_tail_reads_last_2kb() {
+        // Write a file larger than 2KB and verify read_log_tail returns
+        // exactly the last 2KB (UTF-8 lossy). We write a deterministic
+        // 4KB file where the last 2KB is uniquely identifiable.
+        let dir = unique_test_dir("log_tail");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let path = dir.join("daemon.log");
+        // Build a 4KB payload: first 2KB = 'A' * 2048, last 2KB = 'B' * 2048.
+        let mut payload = Vec::with_capacity(4096);
+        payload.extend(std::iter::repeat_n(b'A', 2048));
+        payload.extend(std::iter::repeat_n(b'B', 2048));
+        std::fs::write(&path, &payload).expect("write log file");
+        let tail = read_log_tail(&path);
+        assert_eq!(
+            tail.len(),
+            2048,
+            "read_log_tail must return exactly the last 2KB, got {} bytes",
+            tail.len()
+        );
+        assert!(
+            tail.chars().all(|c| c == 'B'),
+            "tail must contain only 'B' chars (last 2KB), got: {:?}",
+            &tail[..tail.len().min(64)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_log_tail_reads_whole_small_file() {
+        // A file smaller than 2KB must be returned in full (not padded).
+        let dir = unique_test_dir("log_small");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let path = dir.join("small.log");
+        let body = "short log line\n";
+        std::fs::write(&path, body).expect("write log file");
+        let tail = read_log_tail(&path);
+        assert_eq!(tail, body, "small log file must be returned in full");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawn a child process that exits immediately with a non-zero status
+    /// (`/bin/false` on Unix, `cmd /c exit 1` on Windows). The
+    /// `check_child_alive` helper must catch the immediate exit and return
+    /// an `Err` carrying the exit status + the (placeholder) log tail.
+    ///
+    /// This exercises the same code path that fires when the real daemon
+    /// spawn fails because the spawned PHP process exited prematurely
+    /// (setsid error, missing PHP binary, `-r` parse error, etc.).
+    #[test]
+    fn test_spawn_returns_err_when_child_exits_immediately() {
+        let dir = unique_test_dir("child_exits");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let log_path = dir.join("daemon.log");
+
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("/bin/false");
+            // /bin/false exits with status 1 immediately.
+            c.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/c").arg("exit").arg("1");
+            c.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            c
+        };
+
+        let child = cmd.spawn().expect("spawn test child");
+        let result = check_child_alive(child, &log_path, "test_child_exits");
+        assert!(
+            result.is_err(),
+            "check_child_alive must return Err when the child exits within 500ms, got: {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("exited prematurely"),
+            "error message must mention premature exit, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("service=test_child_exits"),
+            "error message must include service name, got: {}",
+            err_msg
+        );
+        // The log file does not exist, so the placeholder must appear.
+        assert!(
+            err_msg.contains("<no log file or empty>"),
+            "error message must include the placeholder when log file is missing, got: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawn a long-running child (`sleep 5` on Unix, `ping -n 5 127.0.0.1`
+    /// on Windows) and verify `check_child_alive` returns `Ok(())` without
+    /// killing the child. This is the normal-detach path.
+    ///
+    /// IMPORTANT: the child is `mem::forget`-en inside the helper, so it
+    /// survives the test. We explicitly kill + wait it afterwards to avoid
+    /// leaking a stray process into the test runner.
+    #[test]
+    fn test_check_child_alive_returns_ok_for_long_running_child() {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("5");
+            c.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            // ping on Windows waits 1s between pings; `-n 5` ≈ 4s.
+            let mut c = std::process::Command::new("ping");
+            c.arg("-n").arg("5").arg("127.0.0.1");
+            c.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            c
+        };
+
+        // We need the Child handle for cleanup, but check_child_alive
+        // consumes + forgets it. So we capture the PID before calling the
+        // helper, and kill the process directly via the OS afterwards.
+        // (mem::forget inside the helper means the handle is gone — we cannot
+        // wait() on it normally.)
+        let child = cmd.spawn().expect("spawn long-running child");
+        let pid = child.id();
+        let dir = unique_test_dir("child_alive");
+        std::fs::create_dir_all(&dir).expect("mkdir test dir");
+        let log_path = dir.join("daemon.log");
+
+        let result = check_child_alive(child, &log_path, "test_long_running");
+        assert!(
+            result.is_ok(),
+            "check_child_alive must return Ok for a long-running child, got: {:?}",
+            result
+        );
+
+        // Cleanup the leaked (forgotten) child so the test runner does not
+        // accumulate stray processes. Best-effort: ignore kill errors.
+        #[cfg(unix)]
+        {
+            // SAFETY: kill(pid, SIGTERM) is a standard libc call. The pid is
+            // the freshly-spawned sleep child, well within i32::MAX.
+            unsafe {
+                libc::kill(pid as i32, 15 /* SIGTERM */);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+            };
+            unsafe {
+                let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !h.is_null() {
+                    TerminateProcess(h, 1);
+                    CloseHandle(h);
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

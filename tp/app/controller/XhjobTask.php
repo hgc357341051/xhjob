@@ -63,6 +63,28 @@ class XhjobTask extends BaseController
     }
 
     /**
+     * GET /xhjob/diag — 环境诊断
+     *
+     * 返回 daemon 启动相关的关键路径与权限状态，用于排查启动失败。
+     * 可选 query 参数：?name=aaaa&data_dir=/path
+     *
+     * @return Response
+     */
+    public function diag()
+    {
+        try {
+            $name     = $this->request->get('name', 'default');
+            $dataDir  = $this->request->get('data_dir');
+            $dataDir  = ($dataDir === '' || $dataDir === null) ? null : (string) $dataDir;
+            return $this->json(XhjobService::diag((string) $name, $dataDir));
+        } catch (\think\exception\HttpException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            return $this->json(['ok' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
      * POST /xhjob/start — 启动 daemon
      *
      * @return Response
