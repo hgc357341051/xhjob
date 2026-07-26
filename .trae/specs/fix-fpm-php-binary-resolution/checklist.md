@@ -45,3 +45,336 @@
 - [ ] commit message 说明根因（php-fpm 不接受 -r/-d）与修复（resolve_php_binary）
 - [ ] `git push -u origin fix-fpm-php-binary-resolution` 成功
 - [ ] 返回远程分支链接给用户
+# Checklist — fix-fpm# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 95# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x]# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 +# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 + 新增 6 个）
+- [x] `cargo clippy --all-targets --features persist -- -D warnings` 无 warning (exit# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 + 新增 6 个）
+- [x] `cargo clippy --all-targets --features persist -- -D warnings` 无 warning (exit 0)
+- [x] 新增单# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 + 新增 6 个）
+- [x] `cargo clippy --all-targets --features persist -- -D warnings` 无 warning (exit 0)
+- [x] 新增单测覆盖：`test_is_cli_php_binary_rejects_fpm`、`test_validate_php_binary_returns_false_for_missing`、`test_resolve# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 + 新增 6 个）
+- [x] `cargo clippy --all-targets --features persist -- -D warnings` 无 warning (exit 0)
+- [x] 新增单测覆盖：`test_is_cli_php_binary_rejects_fpm`、`test_validate_php_binary_returns_false_for_missing`、`test_resolve_php_binary_respects_env_override`、`test_resolve_php_binary_falls_back_to_raw`、`test_diag_includes_php_binary_raw`、`test_check_child_alive_hint_on_exit_64`（注：spec 列出的 `test_resolve_php_binary_returns_cli_directly` 与 `# Checklist — fix-fpm-php-binary-resolution
+
+## Rust 核心二进制解析
+- [x] `src/daemon/mod.rs` 新增 `pub(crate) fn resolve_php_binary() -> (PathBuf, PathBuf)` (line 802)
+- [x] 优先级：`XHJOB_PHP_BINARY` env → `current_exe()`（若 CLI）→ 同目录 `php` → `../bin/php` → `which php` → 回退 `raw` (lines 805-884)
+- [x] `is_cli_php_binary()` 正确识别 CLI php（`php`/`php8.2` 等），排除 `php-fpm`/`php-cgi`/`lsphp` (line 896, test line 1891)
+- [x] `validate_php_binary()` 用 `<candidate> -n -v` 1s 超时验证，退出码 0 才采用 (line 918, test line 1905)
+- [x] `which_php()` 跨平台遍历 `PATH`（Unix 无后缀，Windows 加 `.exe`）(line 953)
+
+## spawn 接入
+- [x] `src/daemon/unix.rs` `spawn_via_double_fork` 用 `resolve_php_binary().0` 替换 `current_exe()`
+- [x] `src/daemon/windows.rs` `spawn_via_create_process` 同步替换
+- [x] `src/daemon/mod.rs` `check_data_dir_writable` 错误消息中的 PHP binary 路径用 `resolve_php_binary().0` (lines 1008, 1026)
+
+## 诊断字段
+- [x] `src/lib.rs` `xhjob_diag` 返回 JSON 新增 `php_binary_raw` 字段 (line 238)
+- [x] `php_binary` 字段值为 `resolve_php_binary().0`（resolved 路径）(line 237, 211)
+- [x] docstring 列出 `php_binary_raw` 并提及 `XHJOB_PHP_BINARY` 覆盖 (lines 188-194)
+
+## exit 64 hint
+- [x] `src/daemon/mod.rs` `check_child_alive` 在 exit code = 64 时追加 hint (line 700-705)
+- [x] hint 含 `"EX_USAGE"` 与 `"XHJOB_PHP_BINARY"` 关键字 (lines 702-704)
+
+## 编译与单测
+- [x] `cargo build --release --features persist` 无 warning (3m09s, exit 0)
+- [x] `cargo test --features persist` 100% 通过（193 passed; 0 failed; 0 ignored — 前序 187 + 新增 6 个）
+- [x] `cargo clippy --all-targets --features persist -- -D warnings` 无 warning (exit 0)
+- [x] 新增单测覆盖：`test_is_cli_php_binary_rejects_fpm`、`test_validate_php_binary_returns_false_for_missing`、`test_resolve_php_binary_respects_env_override`、`test_resolve_php_binary_falls_back_to_raw`、`test_diag_includes_php_binary_raw`、`test_check_child_alive_hint_on_exit_64`（注：spec 列出的 `test_resolve_php_binary_returns_cli_directly` 与 `test_resolve_php_binary_substitutes_fpm` 因不可移植按 spec 指示跳过）
+
+## 编译产物
+- [x]

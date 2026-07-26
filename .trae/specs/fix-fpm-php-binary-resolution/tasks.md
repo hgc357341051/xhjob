@@ -51,12 +51,12 @@
 
 ## Phase 5: Git 提交推送
 
-- [ ] Task 7: 创建分支 + 提交 + 推送
-  - [ ] SubTask 7.1: `git checkout -b fix-fpm-php-binary-resolution`（基于当前 HEAD）
-  - [ ] SubTask 7.2: `git status` 确认改动文件列表（src/daemon/mod.rs、src/daemon/unix.rs、src/daemon/windows.rs、src/lib.rs、releases/xhjob-php8.2-linux-x86_64.so）
-  - [ ] SubTask 7.3: `git add` 上述文件（不要 `git add -A`，避免误带未跟踪文件）
-  - [ ] SubTask 7.4: `git commit -m "fix(daemon): resolve CLI php binary in FPM context (php-fpm → php)` + 详细 body 说明根因与修复
-  - [ ] SubTask 7.5: `git push -u origin fix-fpm-php-binary-resolution`，返回 PR/分支链接给用户
+- [x] Task 7: 创建分支 + 提交 + 推送
+  - [x] SubTask 7.1: `git checkout -b fix-fpm-php-binary-resolution`（基于当前 main HEAD `79e0de8`）
+  - [x] SubTask 7.2: `git status` 确认改动文件列表（5 修改 + 3 新 spec 文档）
+  - [x] SubTask 7.3: `git add` 仅 8 个目标文件（5 代码/产物 + 3 spec 文档，未使用 `-A`）
+  - [x] SubTask 7.4: `git commit` 用 `git -c user.name=trae-agent -c user.email=trae-agent@users.noreply.github.com`（不修改 global/local config）创建 commit `9610568`，message 含根因、修复、验证详情
+  - [x] SubTask 7.5: `git push -u origin fix-fpm-php-binary-resolution` 成功推送（用 fine-grained PAT with Contents:Write 认证 `gh auth`），PR 链接：https://github.com/hgc357341051/xhjob/pull/new/fix-fpm-php-binary-resolution
 
 # Task Dependencies
 
