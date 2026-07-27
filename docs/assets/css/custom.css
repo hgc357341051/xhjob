@@ -477,13 +477,25 @@ section.cover {
   background: linear-gradient(135deg, #3B82F6 0%, #6366F1 50%, #8B5CF6 100%) !important;
   background-size: cover !important;
   min-height: 100vh;
-  display: flex;
+  /* 默认隐藏，由 docsify 的 show 类控制显示（仅在主页路由 #/ 时显示） */
+  display: none;
   align-items: center;
   justify-content: center;
   text-align: center;
   padding: 40px 24px;
-  position: relative;
+  /* 覆盖层定位，不挤占正文文档流空间 */
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 10;
   overflow: hidden;
+}
+
+/* 仅在主页路由时 docsify 添加 show 类，此时显示封面 */
+section.cover.show {
+  display: flex;
 }
 section.cover::before {
   content: "";
