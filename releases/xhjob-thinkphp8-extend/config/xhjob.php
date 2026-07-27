@@ -4,6 +4,33 @@
 // +----------------------------------------------------------------------
 // | 通过 env() 覆盖默认值，避免硬编码
 // +----------------------------------------------------------------------
+// | 支持两种配置模式（自动识别）：
+// |
+// | 模式 A：单实例模式（默认，向后兼容）
+// |   顶层 service_name + data_dir，老用户配置不动也能工作。
+// |
+// | 模式 B：多实例模式（同一项目跑多套独立 daemon）
+// |   配置 'default' 指定默认实例名，'instances' 字典定义每个实例的
+// |   service_name + data_dir。控制器通过 ?instance=xxx 查询参数选择实例。
+// |   示例：
+// |   return [
+// |       'default' => 'data1',
+// |       'instances' => [
+// |           'data1' => [
+// |               'service_name' => env('XHJOB_SERVICE_DATA1', 'default'),
+// |               'data_dir'     => env('XHJOB_DATA_DIR_DATA1', null),
+// |           ],
+// |           'data2' => [
+// |               'service_name' => env('XHJOB_SERVICE_DATA2', 'data2'),
+// |               'data_dir'     => env('XHJOB_DATA_DIR_DATA2', null),
+// |           ],
+// |       ],
+// |       'api_token' => env('XHJOB_API_TOKEN', null),
+// |       'pool_mode' => env('XHJOB_POOL_MODE', 'async'),
+// |   ];
+// |   未显式配置 data_dir 时，非 default 实例会按实例名在 runtime_path/xhjob/
+// |   下分子目录（如 runtime_path/xhjob/data1），避免多实例 SQLite/sock/pid 互踩。
+// +----------------------------------------------------------------------
 
 return [
     // 服务名（多实例时通过该值区分 daemon 与 sock 文件）

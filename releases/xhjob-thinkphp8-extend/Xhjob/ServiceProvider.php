@@ -52,23 +52,65 @@ class ServiceProvider extends Service
     /**
      * 解析 xhjob 配置：service_name 与 data_dir
      *
-     * data_dir 未配置时回退到 runtime_path/xhjob，
-     * 确保 web 用户（如宝塔 www）必然可写，避免 Rust 扩展回退到 /tmp。
+     * 支持多实例配置：
+     *   - config('xhjob.instances.{instance}.service_name') / .data_dir
+     *   - 单实例模式回退到 config('xhjob.service_name') / .data_dir
+     *   - data_dir 都未配置时回退到 runtime_path/xhjob[/{instance}]
      *
      * @param \think\App $app
+     * @param string|null $instance 实例名，null 用默认实例
      * @return array{0:string,1:string} [$name, $dataDir]
      */
-    private static function resolveConfig(\think\App $app): array
+    private static function resolveConfig(\think\App $app, ?string $instance = null): array
     {
-        $name = $app->config->get('xhjob.service_name', 'default');
+        // 默认实例解析
+        if ($instance === null) {
+            $instance = self::resolveDefaultInstance($app);
+        }
+
+        // 多实例模式：instances.{instance}.service_name
+        $name = $app->config->get("xhjob.instances.{$instance}.service_name");
+        // 单实例模式回退
+        if ($name === null) {
+            $name = $app->config->get('xhjob.service_name', 'default');
+        }
         $name = is_string($name) && $name !== '' ? $name : 'default';
 
-        $dataDir = $app->config->get('xhjob.data_dir');
+        // 多实例模式：instances.{instance}.data_dir
+        $dataDir = $app->config->get("xhjob.instances.{$instance}.data_dir");
+        // 单实例模式回退
+        if ($dataDir === null) {
+            $dataDir = $app->config->get('xhjob.data_dir');
+        }
         if (!is_string($dataDir) || $dataDir === '') {
-            // 回退到 runtime_path/xhjob（web 用户必然可写）
-            $dataDir = $app->getRuntimePath() . 'xhjob';
+            // 回退到 runtime_path/xhjob[/{instance}]（非 default 实例按实例名分子目录）
+            $base = $app->getRuntimePath() . 'xhjob';
+            $dataDir = $instance !== 'default' ? $base . DIRECTORY_SEPARATOR . $instance : $base;
         }
 
         return [$name, $dataDir];
+    }
+
+    /**
+     * 解析默认实例名
+     *
+     * 优先 config('xhjob.default')；未配置时：
+     *   - 多实例模式：取 instances 第一个 key
+     *   - 单实例模式：返回 'default'
+     *
+     * @param \think\App $app
+     * @return string
+     */
+    private static function resolveDefaultInstance(\think\App $app): string
+    {
+        $default = $app->config->get('xhjob.default');
+        if (is_string($default) && $default !== '') {
+            return $default;
+        }
+        $instances = $app->config->get('xhjob.instances');
+        if (is_array($instances) && !empty($instances)) {
+            return (string) array_key_first($instances);
+        }
+        return 'default';
     }
 }
