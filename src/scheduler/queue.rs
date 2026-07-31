@@ -137,7 +137,7 @@ impl TaskQueue {
         }
         g.push((priority, task_id.to_string()));
         // Sort by priority descending (higher priority first)
-        g.sort_by(|a, b| b.0.cmp(&a.0));
+        g.sort_by_key(|b| std::cmp::Reverse(b.0));
         Ok(())
     }
 

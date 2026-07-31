@@ -64,7 +64,7 @@ fn resolve_service_name(name: Option<String>) -> Result<String, String> {
 
 /// Normalize a PHP-supplied data_dir: empty string becomes None.
 fn normalize_data_dir(dir: Option<String>) -> Option<String> {
-    dir.and_then(|d| if d.is_empty() { None } else { Some(d) })
+    dir.filter(|d| !d.is_empty())
 }
 
 /// P0 fix: wrap `ipc::request` in `tokio::time::timeout` at the call site.

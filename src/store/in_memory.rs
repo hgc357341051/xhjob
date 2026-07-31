@@ -314,7 +314,7 @@ impl TaskStore for InMemoryStore {
             };
             let mut results = self.results.write().await;
             let mut to_remove = Vec::new();
-            for (id, _result) in results.iter() {
+            for id in results.keys() {
                 if let Some((ttl, finished_at)) = task_info.get(id) {
                     if *ttl > 0 {
                         if let Some(fa) = finished_at {
@@ -358,7 +358,7 @@ impl TaskStore for InMemoryStore {
                 result.push(TaskSummary::from(task));
             }
             // Stable: order by created_at ASC for deterministic output.
-            result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            result.sort_by_key(|a| a.created_at);
             Ok(result)
         })
     }
@@ -568,7 +568,7 @@ impl TaskStore for InMemoryStore {
                 })
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| a.ts.cmp(&b.ts));
+            out.sort_by_key(|a| a.ts);
             Ok(out)
         })
     }
@@ -660,7 +660,7 @@ impl TaskStore for InMemoryStore {
                 .filter(|c| c.state == state)
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out.sort_by_key(|a| a.created_at);
             Ok(out)
         })
     }
@@ -734,7 +734,7 @@ impl TaskStore for InMemoryStore {
                 .filter(|g| g.state == state)
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out.sort_by_key(|a| a.created_at);
             Ok(out)
         })
     }
@@ -834,7 +834,7 @@ impl TaskStore for InMemoryStore {
                 .filter(|t| t.state == TaskState::Running)
                 .map(TaskSummary::from)
                 .collect();
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out.sort_by_key(|a| a.created_at);
             Ok(out)
         })
     }
@@ -850,7 +850,7 @@ impl TaskStore for InMemoryStore {
                 .filter(|t| t.cron.is_some() || t.interval.is_some())
                 .map(TaskSummary::from)
                 .collect();
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out.sort_by_key(|a| a.created_at);
             Ok(out)
         })
     }
@@ -867,7 +867,7 @@ impl TaskStore for InMemoryStore {
                 .filter(|t| t.next_fire.map(|nf| nf > now).unwrap_or(false))
                 .map(TaskSummary::from)
                 .collect();
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out.sort_by_key(|a| a.created_at);
             Ok(out)
         })
     }

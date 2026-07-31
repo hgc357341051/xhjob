@@ -844,7 +844,7 @@ impl TaskBuilder {
                     .filter(|s| !s.is_empty()),
             )
             .collect();
-        if task.run_at.is_some() {
+        if let Some(run_at) = task.run_at {
             if !cron_exprs.is_empty() {
                 tracing::warn!(
                     "both runAt and cron are set; runAt takes priority, cron will be ignored"
@@ -860,7 +860,7 @@ impl TaskBuilder {
                     "jitter is set on a runAt task; jitter is ignored for one-shot triggers"
                 );
             }
-            task.next_fire = Some(task.run_at.unwrap() as u64);
+            task.next_fire = Some(run_at as u64);
         } else if !cron_exprs.is_empty() {
             if task.interval.is_some() {
                 tracing::warn!(

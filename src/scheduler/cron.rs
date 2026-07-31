@@ -264,24 +264,23 @@ impl CronScheduler {
         let active = self.store.load_active_tasks().await?;
         let mut rearmed: u64 = 0;
         for task in active {
-            if task.run_at.is_some()
-                && task.state == TaskState::Pending
-                && task.next_fire == Some(u64::MAX)
-            {
-                if let Err(e) = self.store.update_next_fire(&task.id, Some(now)).await {
-                    tracing::warn!(
+            if let Some(run_at) = task.run_at {
+                if task.state == TaskState::Pending && task.next_fire == Some(u64::MAX) {
+                    if let Err(e) = self.store.update_next_fire(&task.id, Some(now)).await {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = %e,
+                            "rearm_stuck_run_at_tasks: update_next_fire failed"
+                        );
+                        continue;
+                    }
+                    rearmed += 1;
+                    tracing::info!(
                         task_id = %task.id,
-                        error = %e,
-                        "rearm_stuck_run_at_tasks: update_next_fire failed"
+                        run_at = run_at,
+                        "rearm_stuck_run_at_tasks: re-armed stuck run_at task (was next_fire=u64::MAX, Pending)"
                     );
-                    continue;
                 }
-                rearmed += 1;
-                tracing::info!(
-                    task_id = %task.id,
-                    run_at = task.run_at.unwrap(),
-                    "rearm_stuck_run_at_tasks: re-armed stuck run_at task (was next_fire=u64::MAX, Pending)"
-                );
             }
         }
         if rearmed > 0 {
