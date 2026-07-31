@@ -2092,62 +2092,77 @@ mod tests {
     #[test]
     fn test_resolve_php_binary_respects_env_override() {
         // When XHJOB_PHP_BINARY points at a nonexistent path, validation
-        // fails and resolution falls through. In the test runner the test
-        // binary's filename does not start with `php`, so step 2 also fails;
-        // we set PATH to a nonexistent directory so `which_php()` returns
-        // None (no `php` can be found anywhere) — forcing the function to
-        // fall back to `raw` == `current_exe()`.
+        // fails and resolution falls through to auto-detection.
         //
-        // Note: previously PATH was set to /bin:/usr/bin, but on GitHub
-        // Actions runners `setup-php` installs `php` to /bin/php, which
-        // caused `which_php()` to find it and break the "no php on PATH"
-        // assumption. A nonexistent dir guarantees no `php` is found on any
-        // CI/development environment.
+        // IMPORTANT: we do NOT modify PATH. std::env::set_var("PATH", ...) is
+        // process-global and races with parallel tests that spawn shell
+        // commands (executor::shell, scheduler::queue), causing them to fail
+        // with "No such file or directory". Instead we accept whatever PHP
+        // is (or isn't) on PATH and assert the correct fall-through behavior:
+        //   - if a valid php is found via which_php(), resolved == that php
+        //   - if no php on PATH, resolved falls back to raw current_exe()
         std::env::set_var("XHJOB_PHP_BINARY", "/nonexistent/php");
-        let saved_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/nonexistent-test-path-no-php");
-        let (resolved, _raw, _candidates) = resolve_php_binary();
-        // Restore env ASAP so parallel tests depending on PATH are unaffected.
+        let (resolved, raw, _candidates) = resolve_php_binary();
         std::env::remove_var("XHJOB_PHP_BINARY");
-        match saved_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
+
+        match which_php() {
+            Some(php) => {
+                // env override failed → fall through → which_php found a php.
+                // resolved is either the validated php, or raw if validate
+                // rejected it. Both are correct fall-through outcomes.
+                assert!(
+                    resolved == php || resolved == raw,
+                    "env override failed; resolved ({:?}) should be either \
+                     which_php result ({:?}) or raw ({:?})",
+                    resolved,
+                    php,
+                    raw
+                );
+            }
+            None => {
+                assert_eq!(
+                    resolved, raw,
+                    "env override failed and no php on PATH; \
+                     resolved must fall back to raw current_exe()"
+                );
+            }
         }
-        let raw = std::env::current_exe().unwrap();
-        assert_eq!(
-            resolved, raw,
-            "when XHJOB_PHP_BINARY points to a nonexistent path and no php is on PATH, \
-             resolved must fall back to raw current_exe()"
-        );
     }
 
     #[test]
     fn test_resolve_php_binary_falls_back_to_raw() {
-        // No env override; the test runner's `current_exe()` is the test
-        // binary (e.g. `target/debug/deps/xhjob-<hash>`), whose filename
-        // does not start with `php`, so `is_cli_php_binary()` returns false
-        // → no candidates resolve → falls back to raw.
+        // No env override. Behavior depends on whether a valid php is on PATH:
+        //   - if found via which_php(), resolved == that php (auto-detection)
+        //   - if not found, resolved == raw current_exe() (fallback)
         //
-        // We temporarily set PATH to a nonexistent directory so `which_php()`
-        // does not pick up a real `php` from the test environment (e.g.
-        // phpenv shims at /root/.phpenv/shims/php, or /bin/php installed by
-        // `setup-php` on GitHub Actions runners), which would otherwise cause
-        // this test to spuriously fail. A nonexistent dir guarantees no `php`
-        // is found on any CI/development environment.
+        // We do NOT modify PATH to avoid racing with parallel tests that
+        // spawn shell commands (see test_resolve_php_binary_respects_env_override).
         std::env::remove_var("XHJOB_PHP_BINARY");
-        let saved_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/nonexistent-test-path-no-php");
         let (resolved, raw, _candidates) = resolve_php_binary();
-        match saved_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
+
+        match which_php() {
+            Some(php) => {
+                assert!(
+                    resolved == php || resolved == raw,
+                    "php found on PATH; resolved ({:?}) should be either \
+                     the detected php ({:?}) or raw ({:?})",
+                    resolved,
+                    php,
+                    raw
+                );
+            }
+            None => {
+                assert_eq!(
+                    resolved, raw,
+                    "no php on PATH; resolved should fall back to raw current_exe()"
+                );
+                assert_eq!(
+                    raw,
+                    std::env::current_exe().unwrap(),
+                    "raw must equal current_exe()"
+                );
+            }
         }
-        let cur = std::env::current_exe().unwrap();
-        assert_eq!(
-            resolved, cur,
-            "test binary is not `php` and PATH is constrained, so resolved must fall back to raw"
-        );
-        assert_eq!(raw, cur, "raw must equal current_exe()");
     }
 
     #[test]
