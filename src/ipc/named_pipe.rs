@@ -2,7 +2,9 @@
 
 use super::{ipc_path, IpcListener, IpcStream};
 use crate::errors::{Result, XhjobError};
-use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 use tokio::sync::Mutex;
 
 pub struct NamedPipeListenerWrapper {
@@ -12,7 +14,7 @@ pub struct NamedPipeListenerWrapper {
 
 impl NamedPipeListenerWrapper {
     pub fn bind(service_name: &str) -> Result<Self> {
-        let pipe_name = ipc_path(service_name);
+        let pipe_name = ipc_path(service_name, None);
         let first = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&pipe_name)
@@ -54,8 +56,9 @@ pub struct NamedPipeClientWrapper;
 
 impl NamedPipeClientWrapper {
     pub fn connect(service_name: &str) -> Result<Box<dyn IpcStream>> {
-        let pipe_name = ipc_path(service_name);
-        let client = NamedPipeClient::connect(&pipe_name)
+        let pipe_name = ipc_path(service_name, None);
+        let client = ClientOptions::new()
+            .open(&pipe_name)
             .map_err(|e| XhjobError::ipc(format!("client connect {}: {}", pipe_name, e)))?;
         Ok(Box::new(client))
     }

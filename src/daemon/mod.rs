@@ -214,7 +214,7 @@ pub fn is_process_alive_with_starttime(pid: u32, expected_starttime: Option<u64>
         };
         unsafe {
             let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h.is_null() {
+            if h == 0 {
                 return false;
             }
             CloseHandle(h);
@@ -1328,7 +1328,7 @@ pub fn send_terminate(
         };
         unsafe {
             let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if h.is_null() {
+            if h == 0 {
                 return Err(XhjobError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("OpenProcess failed for pid {}", pid),
@@ -1428,9 +1428,11 @@ fn ipc_socket_ready(service_name: &str, data_dir: Option<&str>) -> bool {
     }
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::NamedPipeClient;
-        // Blocking connect; named pipe Client::connect is sync on Windows.
-        NamedPipeClient::connect(&path)
+        use tokio::net::windows::named_pipe::ClientOptions;
+        // tokio's NamedPipeClient has no sync `connect`; use ClientOptions::open
+        // (a blocking open of an existing pipe instance).
+        ClientOptions::new()
+            .open(&path)
             .map(|_| true)
             .unwrap_or(false)
     }

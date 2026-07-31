@@ -404,7 +404,7 @@ pub(crate) fn decode_bytes(bytes: &[u8], encoding: &str) -> Result<String> {
 fn detect_encoding() -> &'static str {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::WindowsProgramming::GetOEMCP;
+        use windows_sys::Win32::Globalization::GetOEMCP;
         let cp = unsafe { GetOEMCP() };
         match cp {
             936 => "GBK",

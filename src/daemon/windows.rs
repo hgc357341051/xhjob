@@ -96,7 +96,7 @@ pub fn spawn_via_create_process(
 pub fn daemon_started() -> Result<()> {
     let service_name = crate::service::current();
     let data_dir = crate::service::current_data_dir();
-    write_pid(std::process::id(), &service_name, data_dir.as_deref())
+    write_pid(std::process::id(), None, &service_name, data_dir.as_deref())
 }
 
 /// Called by daemon_main on exit.
