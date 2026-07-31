@@ -172,7 +172,7 @@ jobs:
           # 验证 libclang 可用
           ls -la "$LIBCLANG_PATH/libclang.so" || { echo "::error::libclang.so 未找到"; exit 1; }
 
-          # 编译 Rust PHP 扩展（启用 php feature）
+          # 编译 Rust PHP 扩展（ext-php-rs 始终启用，无需 --features）
           cargo build --release
 
           echo "=== 编译成功 ==="
@@ -616,7 +616,7 @@ jobs:
 
       # -----------------------------------------------------------------
       # 步骤 6: Clippy 静态分析
-      # 启用 php feature（已在步骤 5.5 安装 PHP 开发头文件）
+      # ext-php-rs 需要 PHP 开发头文件（已在步骤 5.5 安装）
       # -----------------------------------------------------------------
       - name: Run Clippy
         run: |
@@ -625,7 +625,7 @@ jobs:
 
       # -----------------------------------------------------------------
       # 步骤 7: 运行测试
-      # 启用 php feature（已在步骤 5.5 安装 PHP 开发头文件）
+      # ext-php-rs 需要 PHP 开发头文件（已在步骤 5.5 安装）
       # -----------------------------------------------------------------
       - name: Run tests
         run: |
