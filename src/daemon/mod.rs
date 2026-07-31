@@ -2094,12 +2094,18 @@ mod tests {
         // When XHJOB_PHP_BINARY points at a nonexistent path, validation
         // fails and resolution falls through. In the test runner the test
         // binary's filename does not start with `php`, so step 2 also fails;
-        // we set PATH to a minimal value (/bin:/usr/bin) that excludes the
-        // phpenv `php` shim so `which_php()` returns None — forcing the
-        // function to fall back to `raw` == `current_exe()`.
+        // we set PATH to a nonexistent directory so `which_php()` returns
+        // None (no `php` can be found anywhere) — forcing the function to
+        // fall back to `raw` == `current_exe()`.
+        //
+        // Note: previously PATH was set to /bin:/usr/bin, but on GitHub
+        // Actions runners `setup-php` installs `php` to /bin/php, which
+        // caused `which_php()` to find it and break the "no php on PATH"
+        // assumption. A nonexistent dir guarantees no `php` is found on any
+        // CI/development environment.
         std::env::set_var("XHJOB_PHP_BINARY", "/nonexistent/php");
         let saved_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/bin:/usr/bin");
+        std::env::set_var("PATH", "/nonexistent-test-path-no-php");
         let (resolved, _raw, _candidates) = resolve_php_binary();
         // Restore env ASAP so parallel tests depending on PATH are unaffected.
         std::env::remove_var("XHJOB_PHP_BINARY");
@@ -2122,14 +2128,15 @@ mod tests {
         // does not start with `php`, so `is_cli_php_binary()` returns false
         // → no candidates resolve → falls back to raw.
         //
-        // We temporarily set PATH to /bin:/usr/bin so `which_php()` does not
-        // pick up a real `php` from the test environment (e.g. phpenv shims
-        // at /root/.phpenv/shims/php), which would otherwise cause this test
-        // to spuriously fail. /bin and /usr/bin still cover `sleep`, `sh`,
-        // and other binaries used by parallel tests.
+        // We temporarily set PATH to a nonexistent directory so `which_php()`
+        // does not pick up a real `php` from the test environment (e.g.
+        // phpenv shims at /root/.phpenv/shims/php, or /bin/php installed by
+        // `setup-php` on GitHub Actions runners), which would otherwise cause
+        // this test to spuriously fail. A nonexistent dir guarantees no `php`
+        // is found on any CI/development environment.
         std::env::remove_var("XHJOB_PHP_BINARY");
         let saved_path = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/bin:/usr/bin");
+        std::env::set_var("PATH", "/nonexistent-test-path-no-php");
         let (resolved, raw, _candidates) = resolve_php_binary();
         match saved_path {
             Some(p) => std::env::set_var("PATH", p),
