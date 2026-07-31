@@ -48,10 +48,7 @@ pub(crate) fn set_last_start_error(msg: impl Into<String>) {
 /// by `xhjob_diag()` to embed the error in the diagnostic JSON. Returns
 /// `None` when no start has been attempted or the last start succeeded.
 pub(crate) fn take_last_start_error() -> Option<String> {
-    LAST_START_ERROR
-        .lock()
-        .ok()
-        .and_then(|mut g| g.take())
+    LAST_START_ERROR.lock().ok().and_then(|mut g| g.take())
 }
 
 // =========================================================================
@@ -248,10 +245,7 @@ pub fn xhjob_diag(name: Option<String>, data_dir: Option<String>) -> String {
     // Embed the last-start-error WITHOUT consuming it (so a subsequent
     // xhjob_last_start_error() call still returns the error). We peek by
     // cloning the lock guard.
-    let last_err = LAST_START_ERROR
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let last_err = LAST_START_ERROR.lock().ok().and_then(|g| g.clone());
 
     let json = serde_json::json!({
         "php_binary": php_binary,
@@ -2082,10 +2076,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mkdir test dir");
         let dir_str = dir.to_string_lossy().into_owned();
-        let json_str = xhjob_diag(
-            Some("test".to_string()),
-            Some(dir_str.clone()),
-        );
+        let json_str = xhjob_diag(Some("test".to_string()), Some(dir_str.clone()));
         let json: serde_json::Value =
             serde_json::from_str(&json_str).expect("diag must return valid JSON");
         let obj = json.as_object().expect("diag must return a JSON object");
@@ -2162,7 +2153,9 @@ mod tests {
 
         // last_start_error must be null (we cleared it above).
         assert!(
-            obj.get("last_start_error").map(|v| v.is_null()).unwrap_or(true),
+            obj.get("last_start_error")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
             "last_start_error must be null when no error has been set"
         );
 
@@ -2249,7 +2242,9 @@ mod tests {
         );
         // `php_binary` must also still be present and a string.
         assert!(
-            obj.get("php_binary").map(|v| v.is_string()).unwrap_or(false),
+            obj.get("php_binary")
+                .map(|v| v.is_string())
+                .unwrap_or(false),
             "php_binary must be a JSON string, got: {:?}",
             obj.get("php_binary")
         );
@@ -2294,7 +2289,10 @@ mod tests {
                 elem_obj.get("path")
             );
             assert!(
-                elem_obj.get("valid").map(|v| v.is_boolean()).unwrap_or(false),
+                elem_obj
+                    .get("valid")
+                    .map(|v| v.is_boolean())
+                    .unwrap_or(false),
                 "php_binary_candidates[{}].valid must be a bool, got: {:?}",
                 i,
                 elem_obj.get("valid")

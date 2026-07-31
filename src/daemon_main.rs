@@ -47,9 +47,7 @@ fn new_id() -> String {
 ///   - It was inconsistent with `xhjob_diag`/`xhjob_start` (which use `/tmp`)
 ///   - FPM workers (uid=1001) cannot write to `/var/log/` → panic
 fn resolve_log_dir() -> String {
-    let dir = crate::daemon::resolve_data_dir(
-        crate::service::current_data_dir().as_deref(),
-    );
+    let dir = crate::daemon::resolve_data_dir(crate::service::current_data_dir().as_deref());
     if std::fs::create_dir_all(&dir).is_ok() {
         return dir;
     }
@@ -1506,8 +1504,11 @@ mod tests {
         // after canonicalize).
         let result_canon = std::fs::canonicalize(&result).ok();
         let tmp_canon = std::fs::canonicalize(&tmp).ok();
-        assert_eq!(result_canon, tmp_canon,
-            "resolve_log_dir() = {:?}, expected {:?} (from XHJOB_DATA_DIR)", result, tmp);
+        assert_eq!(
+            result_canon, tmp_canon,
+            "resolve_log_dir() = {:?}, expected {:?} (from XHJOB_DATA_DIR)",
+            result, tmp
+        );
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
         if let Some(s) = saved {
@@ -1534,10 +1535,17 @@ mod tests {
         // because we didn't hit the fallback branch).
         assert!(!result.is_empty(), "resolve_log_dir returned empty string");
         // The path should exist (resolve_data_dir's default /tmp exists)
-        assert!(std::path::Path::new(&result).exists(),
-            "resolve_log_dir() = {:?} does not exist", result);
+        assert!(
+            std::path::Path::new(&result).exists(),
+            "resolve_log_dir() = {:?} does not exist",
+            result
+        );
         // Restore
-        if let Some(s) = saved { std::env::set_var("XHJOB_DATA_DIR", s); }
-        if let Some(s) = saved_log { std::env::set_var("XHJOB_LOG_DIR", s); }
+        if let Some(s) = saved {
+            std::env::set_var("XHJOB_DATA_DIR", s);
+        }
+        if let Some(s) = saved_log {
+            std::env::set_var("XHJOB_LOG_DIR", s);
+        }
     }
 }

@@ -412,7 +412,8 @@ pub fn xhjob_loaded_via_php_ini() -> bool {
     // file path + scanned files and grep their contents for an
     // `extension=...xhjob` directive.
     let opened = unsafe { read_php_cstring_global(b"php_ini_opened_path\0") }.unwrap_or_default();
-    let scanned = unsafe { read_php_cstring_global(b"php_ini_scanned_files\0") }.unwrap_or_default();
+    let scanned =
+        unsafe { read_php_cstring_global(b"php_ini_scanned_files\0") }.unwrap_or_default();
     ini_references_xhjob_extension(&opened, &scanned)
 }
 
@@ -640,9 +641,9 @@ pub(crate) fn read_open_basedir() -> Option<String> {
 /// 32-bit and 64-bit targets (matching PHP's `size_t`).
 #[repr(C)]
 struct ZendString {
-    _gc: [u32; 2], // zend_refcounted_h (8 bytes on all platforms)
-    _h: usize,     // zend_ulong (= size_t)
-    len: usize,    // size_t
+    _gc: [u32; 2],             // zend_refcounted_h (8 bytes on all platforms)
+    _h: usize,                 // zend_ulong (= size_t)
+    len: usize,                // size_t
     val: std::os::raw::c_char, // flexible array member — address taken only
 }
 
@@ -701,7 +702,7 @@ pub(crate) fn check_child_alive(
                     msg.push_str(
                         "; hint: exit code 64 (EX_USAGE) typically means the spawned \
                          binary rejected CLI flags (-r/-d); if php_binary_raw is \
-                         php-fpm/php-cgi, set XHJOB_PHP_BINARY to the CLI php binary"
+                         php-fpm/php-cgi, set XHJOB_PHP_BINARY to the CLI php binary",
                     );
                 }
                 return Err(XhjobError::Io(std::io::Error::other(msg)));
@@ -851,37 +852,35 @@ pub(crate) fn resolve_php_binary() -> (
     // Helper: record a candidate (with dedup) and return true if it validated.
     // `reason_override` is used when the caller already knows the reason
     // (e.g. env override failure has a different reason string).
-    let mut record = |cand: std::path::PathBuf,
-                      reason_override: Option<String>,
-                      source: &str| -> bool {
-        let key = canonical_key(&cand);
-        if candidates.iter().any(|c| canonical_key(&c.path) == key) {
-            // Dedup: skip if we already probed the same canonical path.
-            return false;
-        }
-        let reason = reason_override
-            .unwrap_or_else(|| reason_for(&cand));
-        // `valid` is true iff the candidate actually passed validation.
-        // "ok" is the success reason from `reason_for`; the only other
-        // success case is the `current_exe is CLI php` override (which
-        // marks raw as a known-good CLI binary). All other override
-        // strings (e.g. "XHJOB_PHP_BINARY env var; validation failed")
-        // are failure reasons.
-        let valid = reason == "ok" || reason == "current_exe is CLI php";
-        tracing::debug!(
-            candidate = %cand.display(),
-            source = %source,
-            valid = valid,
-            reason = %reason,
-            "probed PHP binary candidate"
-        );
-        candidates.push(PhpBinaryCandidate {
-            path: cand,
-            valid,
-            reason,
-        });
-        valid
-    };
+    let mut record =
+        |cand: std::path::PathBuf, reason_override: Option<String>, source: &str| -> bool {
+            let key = canonical_key(&cand);
+            if candidates.iter().any(|c| canonical_key(&c.path) == key) {
+                // Dedup: skip if we already probed the same canonical path.
+                return false;
+            }
+            let reason = reason_override.unwrap_or_else(|| reason_for(&cand));
+            // `valid` is true iff the candidate actually passed validation.
+            // "ok" is the success reason from `reason_for`; the only other
+            // success case is the `current_exe is CLI php` override (which
+            // marks raw as a known-good CLI binary). All other override
+            // strings (e.g. "XHJOB_PHP_BINARY env var; validation failed")
+            // are failure reasons.
+            let valid = reason == "ok" || reason == "current_exe is CLI php";
+            tracing::debug!(
+                candidate = %cand.display(),
+                source = %source,
+                valid = valid,
+                reason = %reason,
+                "probed PHP binary candidate"
+            );
+            candidates.push(PhpBinaryCandidate {
+                path: cand,
+                valid,
+                reason,
+            });
+            valid
+        };
 
     // Step 1: env override.
     if let Ok(env_path) = std::env::var("XHJOB_PHP_BINARY") {
