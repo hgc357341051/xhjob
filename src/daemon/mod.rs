@@ -2096,75 +2096,52 @@ mod tests {
         // When XHJOB_PHP_BINARY points at a nonexistent path, validation
         // fails and resolution falls through to auto-detection.
         //
-        // IMPORTANT: we do NOT modify PATH. std::env::set_var("PATH", ...) is
-        // process-global and races with parallel tests that spawn shell
-        // commands (executor::shell, scheduler::queue), causing them to fail
-        // with "No such file or directory". Instead we accept whatever PHP
-        // is (or isn't) on PATH and assert the correct fall-through behavior:
-        //   - if a valid php is found via which_php(), resolved == that php
-        //   - if no php on PATH, resolved falls back to raw current_exe()
+        // We do NOT modify PATH (process-global; races with parallel tests
+        // that spawn shell commands). We also do NOT compare resolved to
+        // which_php()'s return value, because which_php() can return
+        // different paths across two calls if a parallel test mutates PATH
+        // (/bin/php vs /usr/bin/php on CI runners where /bin is a symlink).
+        // Instead we check structurally: resolved is either raw (fallback)
+        // or an existing file (a php found via auto-detection).
         std::env::set_var("XHJOB_PHP_BINARY", "/nonexistent/php");
         let (resolved, raw, _candidates) = resolve_php_binary();
         std::env::remove_var("XHJOB_PHP_BINARY");
 
-        match which_php() {
-            Some(php) => {
-                // env override failed → fall through → which_php found a php.
-                // resolved is either the validated php, or raw if validate
-                // rejected it. Both are correct fall-through outcomes.
-                assert!(
-                    resolved == php || resolved == raw,
-                    "env override failed; resolved ({:?}) should be either \
-                     which_php result ({:?}) or raw ({:?})",
-                    resolved,
-                    php,
-                    raw
-                );
-            }
-            None => {
-                assert_eq!(
-                    resolved, raw,
-                    "env override failed and no php on PATH; \
-                     resolved must fall back to raw current_exe()"
-                );
-            }
+        if resolved != raw {
+            assert!(
+                resolved.is_file(),
+                "env override failed; resolved ({:?}) is neither raw ({:?}) \
+                 nor an existing file (auto-detected php)",
+                resolved,
+                raw
+            );
         }
     }
 
     #[test]
     fn test_resolve_php_binary_falls_back_to_raw() {
-        // No env override. Behavior depends on whether a valid php is on PATH:
-        //   - if found via which_php(), resolved == that php (auto-detection)
-        //   - if not found, resolved == raw current_exe() (fallback)
+        // No env override. resolved is either a php found via auto-detection
+        // (an existing file) or raw (fallback when no valid php on PATH).
         //
-        // We do NOT modify PATH to avoid racing with parallel tests that
-        // spawn shell commands (see test_resolve_php_binary_respects_env_override).
+        // We do NOT modify PATH or compare to which_php() directly (see
+        // test_resolve_php_binary_respects_env_override for rationale).
         std::env::remove_var("XHJOB_PHP_BINARY");
         let (resolved, raw, _candidates) = resolve_php_binary();
 
-        match which_php() {
-            Some(php) => {
-                assert!(
-                    resolved == php || resolved == raw,
-                    "php found on PATH; resolved ({:?}) should be either \
-                     the detected php ({:?}) or raw ({:?})",
-                    resolved,
-                    php,
-                    raw
-                );
-            }
-            None => {
-                assert_eq!(
-                    resolved, raw,
-                    "no php on PATH; resolved should fall back to raw current_exe()"
-                );
-                assert_eq!(
-                    raw,
-                    std::env::current_exe().unwrap(),
-                    "raw must equal current_exe()"
-                );
-            }
+        if resolved != raw {
+            assert!(
+                resolved.is_file(),
+                "resolved ({:?}) is neither raw ({:?}) nor an existing file \
+                 (auto-detected php)",
+                resolved,
+                raw
+            );
         }
+        assert_eq!(
+            raw,
+            std::env::current_exe().unwrap(),
+            "raw must equal current_exe()"
+        );
     }
 
     #[test]
